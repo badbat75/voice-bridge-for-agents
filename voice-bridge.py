@@ -103,10 +103,11 @@ def load_config() -> dict:
     cfg["elevenlabs_voice_settings"] = _camel_to_snake_keys(el.get("voiceSettings")) or None
     cfg["elevenlabs_text_normalization"] = el.get("applyTextNormalization")
 
-    cfg["voice_model"] = gw.get("agents", {}).get("defaults", {}).get("voiceBridgeModel", "openclaw:voice")
+    cfg["voice_model"] = gw.get("agents", {}).get("defaults", {}).get("voiceBridgeModel", "openclaw")
 
-    # Session key for the voice bridge
-    cfg["session_key"] = gw.get("voice", {}).get("sessionKey", "voice-bridge")
+    # Session key for the voice bridge: local voice-bridge.json wins,
+    # then gateway config, then a literal fallback.
+    cfg["session_key"] = cfg.get("session_key") or gw.get("voice", {}).get("sessionKey") or "voice-bridge"
 
     # Provider selection lives in voice-bridge.json itself
     # (`stt_provider`, `tts_provider`). Missing keys → default to
@@ -202,7 +203,7 @@ def play_beep(device: str, sample_rate: int) -> None:
 # ---------------------------------------------------------------------------
 # Gateway — send transcript, get response
 # ---------------------------------------------------------------------------
-def gateway_chat(base_url: str, token: str, text: str, voice_model: str) -> str:
+def gateway_chat(base_url: str, token: str, text: str, voice_model: str, session_key: str = "voice-bridge") -> str:
     """Send user transcript to OpenClaw gateway and get response text."""
     import urllib.request
 
@@ -214,13 +215,17 @@ def gateway_chat(base_url: str, token: str, text: str, voice_model: str) -> str:
         "stream": False,
     }).encode()
 
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    if session_key:
+        headers["X-OpenClaw-Session-Key"] = session_key
+
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -315,15 +320,13 @@ def main() -> None:
     stt = _build_voice_provider("stt", cfg)
     tts = _build_voice_provider("tts", cfg)
 
-    # Start HID mute monitor. If the Jabra is absent at startup, exit
-    # cleanly (status 0 → systemd's Restart=on-failure does NOT respawn;
-    # the udev `add` rule will start the unit again when the device
-    # reappears).
+    # Start HID mute monitor. The monitor's poll thread owns the device
+    # lifecycle: it parks (zero CPU) until the Jabra is plugged in, and
+    # transparently reconnects across unplug/replug. The bridge stays
+    # up indefinitely; only SIGTERM/SIGINT exits.
     hid = HidMuteMonitor()
     if cfg.get("hid_mute_enabled"):
-        if not hid.start():
-            log.info("Jabra not present — voice-bridge has nothing to do, exiting cleanly")
-            sys.exit(0)
+        hid.start()
 
     # Graceful shutdown
     shutdown_event = threading.Event()
@@ -337,9 +340,9 @@ def main() -> None:
 
     log.info("Ready — waiting for unmute...")
 
-    # Main loop — edge-triggered on mute→unmute transitions. Exits on
-    # SIGTERM/SIGINT or when the HID monitor reports the device gone.
-    while not shutdown_event.is_set() and not hid.device_lost():
+    # Main loop — edge-triggered on mute→unmute transitions. Exits only
+    # on SIGTERM/SIGINT; device unplug is handled inside the HID monitor.
+    while not shutdown_event.is_set():
         if not hid.consume_unmute_event():
             time.sleep(0.2)
             continue
@@ -396,7 +399,7 @@ def main() -> None:
 
         # Gateway chat
         log.info("Getting response...")
-        reply = gateway_chat(cfg["gateway_base_url"], cfg["gateway_token"], text, cfg["voice_model"])
+        reply = gateway_chat(cfg["gateway_base_url"], cfg["gateway_token"], text, cfg["voice_model"], cfg.get("session_key", "voice-bridge"))
         log.info("Binary: %s", reply[:100])
 
         # TTS
@@ -407,8 +410,6 @@ def main() -> None:
             play_audio(cfg["output_device"], audio, cfg["tts_sample_rate"])
             log.info("Playback done")
 
-    if hid.device_lost():
-        log.info("Jabra disconnected — shutting down (udev will restart on replug)")
     hid.stop()
     log.info("Stopped")
 

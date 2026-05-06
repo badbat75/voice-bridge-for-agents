@@ -54,15 +54,17 @@ class HidMuteMonitorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.r, self.w = os.pipe()
         self.mon = HidMuteMonitor()
+        # Inject the pipe as the already-open device fd. The poll loop
+        # checks `if self._fd is None` and skips _open_device() when it's
+        # already set, so the read logic runs against our pipe directly.
         self.mon._fd = self.r
         self.mon._device = "<test-pipe>"
-        self.mon._running = True
         self.mon._thread = threading.Thread(target=self.mon._poll_loop, daemon=True)
         self.mon._thread.start()
 
     def tearDown(self) -> None:
-        self.mon._running = False
-        # Wake the blocked os.read so the loop re-checks _running.
+        self.mon._shutdown.set()
+        # Wake the blocked os.read so the loop re-checks _shutdown.
         try:
             os.write(self.w, bytes([0xFF]) + b"\x00" * 63)
         except OSError:
@@ -149,75 +151,150 @@ class HidMuteMonitorTest(unittest.TestCase):
         self.assertTrue(_wait(self.mon.consume_unmute_event))
 
 
-class HidMuteMonitorDeviceLostTest(unittest.TestCase):
-    """When the Jabra disappears mid-poll, the monitor sets `device_lost`
-    and exits its thread cleanly. The bridge's main loop polls
-    `device_lost()` and shuts down the whole process."""
+class HidMuteMonitorReconnectTest(unittest.TestCase):
+    """When the Jabra disappears mid-poll, the monitor closes the fd and
+    keeps trying to reopen — the thread does NOT exit. The bridge sees
+    one continuous monitor across plug cycles. `stop()` must wake the
+    backoff sleep immediately (Event-based wait, not time.sleep)."""
 
-    def test_initial_device_lost_is_false(self) -> None:
-        mon = HidMuteMonitor()
-        self.assertFalse(mon.device_lost())
+    def _patch_open_to_fail(self, mon: HidMuteMonitor) -> list[int]:
+        """Replace _open_device on the instance so reconnect attempts
+        fail without touching real /dev/hidraw* (which on the Pi might
+        belong to a Jabra owned by the running production service).
+        Returns a list whose length grows with every attempt."""
+        attempts: list[int] = []
 
-    def test_eof_on_read_sets_device_lost(self) -> None:
-        """Closing the writer side of the pipe makes os.read return b''
-        — the disconnect signal. _poll_loop sets device_lost and exits."""
+        def fake_open() -> bool:
+            attempts.append(1)
+            return False
+
+        mon._open_device = fake_open  # type: ignore[method-assign]
+        return attempts
+
+    def test_eof_on_read_does_not_kill_thread(self) -> None:
+        """Closing the writer side makes os.read return b'' — the
+        disconnect signal. The loop closes the fd and re-enters the
+        reconnect backoff; the thread stays alive."""
         r, w = os.pipe()
         mon = HidMuteMonitor()
         mon._fd = r
-        mon._running = True
+        attempts = self._patch_open_to_fail(mon)
 
         thread = threading.Thread(target=mon._poll_loop, daemon=True)
         thread.start()
 
-        os.close(w)
-        thread.join(timeout=2.0)
-        self.assertFalse(thread.is_alive(), "_poll_loop didn't exit on EOF")
-        self.assertTrue(mon.device_lost(), "device_lost flag not set on EOF")
+        os.close(w)  # signals EOF to the reader
+        # Give the loop time to notice EOF and call _open_device once.
+        self.assertTrue(
+            _wait(lambda: len(attempts) >= 1, timeout=2.0),
+            "loop didn't attempt reconnect after EOF",
+        )
+        self.assertTrue(thread.is_alive(), "thread exited on EOF — should reconnect")
 
-        try:
-            os.close(r)
-        except OSError:
-            pass
+        # Stop() must wake the backoff Event-wait immediately.
+        t0 = time.monotonic()
+        mon._shutdown.set()
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive(), "stop() did not wake the backoff")
+        self.assertLess(
+            time.monotonic() - t0, 0.5,
+            "stop() took >0.5s — backoff is sleeping instead of waiting on Event",
+        )
 
-    def test_oserror_on_read_sets_device_lost(self) -> None:
+    def test_oserror_on_read_does_not_kill_thread(self) -> None:
         """A real I/O error (closed fd → EBADF) is treated the same as
-        a USB unplug — set device_lost and exit, don't keep retrying."""
+        a USB unplug — close the fd and try to reconnect, do not exit."""
         r, w = os.pipe()
         mon = HidMuteMonitor()
         mon._fd = r
-        mon._running = True
+        attempts = self._patch_open_to_fail(mon)
 
         thread = threading.Thread(target=mon._poll_loop, daemon=True)
         thread.start()
         os.close(r)
         os.close(w)
-        thread.join(timeout=2.0)
-        self.assertFalse(thread.is_alive())
-        self.assertTrue(mon.device_lost())
 
-    def test_blocking_io_error_does_not_set_device_lost(self) -> None:
+        self.assertTrue(
+            _wait(lambda: len(attempts) >= 1, timeout=2.0),
+            "loop didn't attempt reconnect after OSError",
+        )
+        self.assertTrue(thread.is_alive(), "thread exited on OSError — should reconnect")
+
+        mon._shutdown.set()
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+
+    def test_blocking_io_error_does_not_kill_thread(self) -> None:
         """EAGAIN / BlockingIOError is normal idle on a non-blocking fd
-        and must NOT trip device_lost (otherwise an idle bridge would
-        kill itself)."""
+        and must NOT trigger reconnect (otherwise an idle bridge would
+        churn fds in a tight loop)."""
         r, w = os.pipe()
-        # Make the read end non-blocking so empty reads raise BlockingIOError.
         os.set_blocking(r, False)
         mon = HidMuteMonitor()
         mon._fd = r
-        mon._running = True
+        attempts = self._patch_open_to_fail(mon)
 
         thread = threading.Thread(target=mon._poll_loop, daemon=True)
         thread.start()
         time.sleep(0.2)  # plenty of EAGAIN spins
-        self.assertFalse(mon.device_lost())
+        self.assertEqual(attempts, [], "BlockingIOError must not trigger reconnect")
         self.assertTrue(thread.is_alive())
 
-        # Clean shutdown.
-        mon._running = False
-        os.close(w)  # unblock the next read so the thread sees _running=False
+        mon._shutdown.set()
+        os.close(w)
         thread.join(timeout=1.0)
         try:
             os.close(r)
+        except OSError:
+            pass
+
+    def test_reconnect_succeeds_when_open_eventually_works(self) -> None:
+        """After a disconnect, once _open_device() succeeds the read
+        loop resumes processing button presses normally."""
+        r1, w1 = os.pipe()
+        r2, w2 = os.pipe()
+        mon = HidMuteMonitor()
+        mon._fd = r1
+
+        # _open_device fails N times, then attaches r2 as the new fd —
+        # simulates the device coming back after a couple of polls.
+        attempts = []
+
+        def fake_open() -> bool:
+            attempts.append(1)
+            if len(attempts) >= 2:
+                mon._fd = r2
+                mon._device = "<test-pipe-2>"
+                return True
+            return False
+
+        mon._open_device = fake_open  # type: ignore[method-assign]
+
+        thread = threading.Thread(target=mon._poll_loop, daemon=True)
+        thread.start()
+
+        os.close(w1)  # disconnect on fd1
+
+        self.assertTrue(
+            _wait(lambda: len(attempts) >= 2, timeout=6.0),
+            "loop didn't reach a successful reconnect within two backoffs",
+        )
+        # Reconnect is in. A press on the new fd should produce a wake.
+        os.write(w2, _btn(True))
+        self.assertTrue(
+            _wait(mon.consume_unmute_event, timeout=1.0),
+            "wake event missing on reconnected fd",
+        )
+
+        mon._shutdown.set()
+        os.close(w2)
+        thread.join(timeout=2.0)
+        try:
+            os.close(r1)
+        except OSError:
+            pass
+        try:
+            os.close(r2)
         except OSError:
             pass
 

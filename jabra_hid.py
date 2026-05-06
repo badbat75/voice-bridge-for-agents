@@ -1,11 +1,18 @@
 """Jabra SPEAK 510 HID button monitor.
 
 Watches /dev/hidraw* for the device's mute button and surfaces presses as
-edge-triggered wake events on a background daemon thread. On USB
-disconnect or read failure it sets `device_lost` and exits — the bridge
-is expected to notice this, finish any in-flight turn, and exit cleanly
-(systemd then waits for the udev `add` rule to bring it back up when
-the device is reconnected).
+edge-triggered wake events on a background daemon thread. The monitor
+owns the full lifecycle of the hidraw fd: on USB disconnect or read
+failure it closes the fd and loops on `_open_device()` with a 2 s backoff
+until the Jabra reappears or `stop()` is called. The bridge sees one
+continuous monitor across plug cycles — no exit, no external supervisor
+needed.
+
+Idle CPU is ~0 by design. The reconnect backoff blocks in
+`threading.Event.wait()`, not `time.sleep()`, so the thread is parked
+on the kernel wait-queue and `stop()` wakes it immediately. While the
+device is attached, the read loop's BlockingIOError sleep is also a
+short event-wait, for the same reason.
 
 The mute button is a *momentary* HID Telephony button (bit 4 of byte 1
 of report 0x03, usage 0x2F "Mic Mute") — high while held, low when
@@ -32,9 +39,19 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import time
 
 log = logging.getLogger(__name__)
+
+# Backoff between reconnect attempts when no Jabra is present. The poll
+# thread parks in `_shutdown.wait()` for this interval, so the cost
+# while the device is absent is one cheap `_find_device()` (a single
+# listdir) every 2 s — effectively zero CPU. `stop()` sets the event
+# and the thread returns immediately.
+_RECONNECT_BACKOFF_S = 2.0
+# Idle wait between non-blocking read attempts when the fd is open but
+# has no data. Same Event-based wait (kernel-blocked, not spin) so
+# stop() wakes it instantly.
+_READ_IDLE_S = 0.05
 
 
 class HidMuteMonitor:
@@ -51,12 +68,11 @@ class HidMuteMonitor:
         self._fd: int | None = None
         self._button_down: bool = False
         self._unmute_event = threading.Event()
-        # Set when the read loop detects the device is gone (USB unplug,
-        # power-off, ENODEV/EOF). Bridge polls this and exits cleanly.
-        self._device_lost = threading.Event()
+        # Set by stop() to wake the poll thread out of any blocking wait
+        # (read-idle sleep or reconnect backoff) and tear it down.
+        self._shutdown = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
-        self._running = False
         self._device: str | None = None
 
     def consume_unmute_event(self) -> bool:
@@ -65,11 +81,6 @@ class HidMuteMonitor:
             self._unmute_event.clear()
             return True
         return False
-
-    def device_lost(self) -> bool:
-        """Set when the read loop has observed the Jabra disappear (USB
-        unplug, power-off, ENODEV/EOF). Bridge polls this and shuts down."""
-        return self._device_lost.is_set()
 
     @staticmethod
     def _find_device() -> str | None:
@@ -105,8 +116,8 @@ class HidMuteMonitor:
         """Find, open O_RDWR, and engage the Jabra. Sets self._fd / self._device.
 
         Returns True on success. On failure (no device, open denied) leaves
-        self._fd as None and returns False — the caller decides whether to
-        retry or give up.
+        self._fd as None and returns False — the poll loop retries after
+        the reconnect backoff.
         """
         path = self._find_device()
         if not path:
@@ -121,26 +132,7 @@ class HidMuteMonitor:
         self._device = path
         return True
 
-    def start(self) -> bool:
-        """Find, open, engage the Jabra and start the read thread.
-
-        Returns False (without starting the thread) if the device isn't
-        present at startup — the caller is expected to treat that as a
-        clean shutdown signal."""
-        if not self._open_device():
-            log.warning("No Jabra SPEAK 510 found at startup")
-            return False
-        self._running = True
-        self._device_lost.clear()
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._thread.start()
-        log.info("HID button monitor on %s", self._device)
-        return True
-
-    def stop(self) -> None:
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=2.0)
+    def _close_fd(self) -> None:
         if self._fd is not None:
             try:
                 os.close(self._fd)
@@ -148,26 +140,63 @@ class HidMuteMonitor:
                 pass
             self._fd = None
 
+    def start(self) -> None:
+        """Start the poll thread. Returns immediately.
+
+        The thread acquires the device on its own — if the Jabra isn't
+        plugged in yet, it parks in the reconnect backoff (zero CPU)
+        until the device appears or `stop()` is called. Plug state is
+        treated as runtime state, not init state, so there is no
+        startup-failure path."""
+        self._shutdown.clear()
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._shutdown.set()
+        if self._thread:
+            # Generous timeout: a backoff sleep can be in-flight; the
+            # event wakes it immediately so the join almost always
+            # returns well under a second.
+            self._thread.join(timeout=2.0 + _RECONNECT_BACKOFF_S)
+        self._close_fd()
+
     def _poll_loop(self) -> None:
         debug = os.environ.get("JABRA_HID_DEBUG", "").lower() not in ("", "0", "false")
-        while self._running:
+        while not self._shutdown.is_set():
+            if self._fd is None:
+                if not self._open_device():
+                    # Device not present (or unopenable). Park on the
+                    # shutdown event for the backoff interval — kernel
+                    # wait, no CPU. Returns True if stop() fired.
+                    if self._shutdown.wait(_RECONNECT_BACKOFF_S):
+                        return
+                    continue
+                log.info("HID button monitor on %s", self._device)
+                # Reset held-state on every fresh attach: the device
+                # always comes up with the button released, so the next
+                # press is a clean rising edge.
+                with self._lock:
+                    self._button_down = False
+
             try:
                 n = os.read(self._fd, 64)
             except BlockingIOError:
-                # No data available right now — non-blocking fd, normal idle.
-                time.sleep(0.05)
+                # No data available — non-blocking fd, normal idle.
+                if self._shutdown.wait(_READ_IDLE_S):
+                    return
                 continue
             except OSError as exc:
-                if self._running:
-                    log.warning("HID read failed: %s — device lost", exc)
-                    self._device_lost.set()
-                return
+                if not self._shutdown.is_set():
+                    log.warning("HID read failed: %s — reconnecting", exc)
+                self._close_fd()
+                continue
             if not n:
                 # EOF on a hidraw fd means the device was unplugged.
-                if self._running:
-                    log.warning("HID read returned EOF — device lost")
-                    self._device_lost.set()
-                return
+                if not self._shutdown.is_set():
+                    log.warning("HID read returned EOF — reconnecting")
+                self._close_fd()
+                continue
             if len(n) < 2:
                 continue
             if debug:

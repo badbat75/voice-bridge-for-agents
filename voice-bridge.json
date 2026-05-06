@@ -8,5 +8,6 @@
   "output_device": "plug:jabra_dmix",
   "hid_mute_enabled": true,
   "stt_provider": "elevenlabs",
-  "tts_provider": "elevenlabs"
+  "tts_provider": "elevenlabs",
+  "session_key": "agent:main:voice-bridge"
 }

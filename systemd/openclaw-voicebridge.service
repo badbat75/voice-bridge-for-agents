@@ -1,5 +1,12 @@
 [Unit]
 Description=OpenClaw Voice Bridge — Jabra mute button to gateway
+# This is a *user* unit — installed under ~/.config/systemd/user and
+# managed with `systemctl --user`. It runs as the invoking user (no
+# `User=`) and inherits that user's group memberships, so the user
+# must already be in `audio` for ALSA and `plugdev` for /dev/hidraw*
+# (granted by the matching udev rule). Enable linger
+# (`sudo loginctl enable-linger <user>`) so the unit starts at boot
+# without a login session.
 After=sound.target network-online.target
 Wants=network-online.target
 # Don't spam-restart if the gateway is unreachable at boot — let the
@@ -10,10 +17,6 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# Set the user that owns the .venv and has access to /dev/hidraw* + audio.
-# On the dev Pi this is "openclaw"; change before installing if different.
-User=openclaw
-SupplementaryGroups=audio
 WorkingDirectory=/home/openclaw/.openclaw/workspace/voice-bridge
 # Inherit the same secrets the openclaw gateway uses — DEEPGRAM_API_KEY
 # in particular, since voice-bridge.py looks it up as an env fallback
@@ -26,9 +29,12 @@ ExecStart=/home/openclaw/.openclaw/workspace/voice-bridge/.venv/bin/python /home
 Restart=on-failure
 RestartSec=5
 # Voice-bridge handles SIGTERM/SIGINT cleanly: finishes the in-flight
-# turn, stops the HID thread, exits.
+# turn, stops the HID thread, exits. The HID monitor's reconnect loop
+# parks on a threading.Event between attempts, so a missing Jabra
+# costs ~0 CPU — no need for the unit to stop and restart on unplug.
 KillSignal=SIGTERM
 TimeoutStopSec=10
 
 [Install]
-WantedBy=multi-user.target
+# default.target is the user-mode equivalent of multi-user.target.
+WantedBy=default.target

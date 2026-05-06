@@ -1,10 +1,14 @@
-# udev rule: start openclaw-voicebridge.service when the Jabra SPEAK 510
-# (USB 0b0e:0422) appears as a hidraw node. The service runs continuously
-# and handles unplug/replug internally via its reconnect loop, so we only
-# need to trigger it on add — no REMOVE handling required.
+# udev rule: grant the `plugdev` group read/write on the Jabra SPEAK 510
+# (USB 0b0e:0422) hidraw node. The voice-bridge service runs as a user
+# unit (not root) and the user is in plugdev — without this rule the
+# default `root:root 0600` permissions block the bridge from opening
+# /dev/hidraw*.
 #
-# Trigger uses SUBSYSTEM=="hidraw" rather than "usb" so the rule fires
-# *after* /dev/hidrawN has been created, avoiding a race where the
-# service starts before its target file exists.
+# The bridge keeps a single long-running reconnect loop on its own, so
+# this rule does NOT trigger the service. It only sets permissions; the
+# bridge picks up plug events from its 2 s reconnect poll.
+#
+# SUBSYSTEM=="hidraw" rather than "usb" so the rule fires *after*
+# /dev/hidrawN exists — that's the node we need MODE/GROUP on.
 
-ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b0e", ATTRS{idProduct}=="0422", TAG+="systemd", ENV{SYSTEMD_WANTS}+="openclaw-voicebridge.service"
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b0e", ATTRS{idProduct}=="0422", GROUP="plugdev", MODE="0660"

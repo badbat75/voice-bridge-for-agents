@@ -1,85 +1,103 @@
-# Deploying the voice-bridge as a systemd service
+# Deploying the voice-bridge as a (user) systemd service
 
 Two files in this directory:
 
 - `openclaw-voicebridge.service` — the unit. Runs `voice-bridge.py`
-  from the in-tree `.venv`. Edit `User=` and the absolute paths before
-  installing if your deployment isn't at
+  from the in-tree `.venv`. **This is a user unit**: it lives under
+  `~/.config/systemd/user` and is managed with `systemctl --user`,
+  no `User=` directive. Edit the absolute paths in `WorkingDirectory=`
+  and `ExecStart=` if your deployment isn't at
   `/home/openclaw/.openclaw/workspace/voice-bridge`.
-- `99-openclaw-voicebridge.rules` — udev rule that triggers the
-  service on `/dev/hidraw*` add for the Jabra SPEAK 510 (USB `0b0e:0422`).
+- `99-openclaw-voicebridge.rules` — udev rule that grants the
+  `plugdev` group read/write on the Jabra SPEAK 510's `/dev/hidraw*`
+  node. The rule does NOT trigger the service — the bridge handles
+  device attach/detach via its internal reconnect loop.
 
 The `openclaw-` prefix matches the user's sudo policy for this Pi
-(passwordless `systemctl <verb> openclaw-*` for the `openclaw` user).
+(passwordless `systemctl <verb> openclaw-*` for the `openclaw` user),
+though with a user unit you generally won't need sudo at all.
+
+## Prerequisites
+
+- The user must be in groups `plugdev` (for hidraw access via the
+  udev rule) and `audio` (for ALSA / `aplay`).
+- Linger must be enabled (`sudo loginctl enable-linger $USER`) so
+  the user-mode systemd starts at boot without a login session.
+
+`install.sh` checks both and prompts you with the exact `usermod`
+command if a group is missing; it enables linger automatically.
 
 ## Install / uninstall
 
 ```bash
-./install.sh              # install (link unit + rule, reload, trigger)
+./install.sh              # install (link unit + rule, reload, enable+start)
 ./install.sh --status     # show current install state + last 20 log lines
 ./install.sh --uninstall  # remove links and reload
 ```
 
-The script asks `sudo` for the privileged steps. It uses
-`systemctl link` for the unit (creates the right symlink in
-`/etc/systemd/system/` and registers it with systemd in one step) and
-`ln -sf` for the udev rule (udev has no equivalent verb). Both point
-back to this directory, so editing the source files is enough — no
-re-copy needed, just a reload:
+The script asks `sudo` only for the privileged steps (udev rule, linger,
+and a one-time cleanup if the older system-mode install is still
+present). The unit itself is linked with `systemctl --user link`, no
+sudo. Both links point back to this directory, so editing the source
+files is enough — no re-copy needed, just a reload:
 
 ```bash
-sudo systemctl daemon-reload                       # after editing the .service
-sudo udevadm control --reload-rules                # after editing the .rules
-sudo systemctl restart openclaw-voicebridge        # if it was running
+systemctl --user daemon-reload                         # after editing the .service
+sudo udevadm control --reload-rules                    # after editing the .rules
+systemctl --user restart openclaw-voicebridge          # if it was running
 ```
 
-The install also runs `udevadm trigger --subsystem-match=hidraw`,
-which re-emits `add` events for already-plugged hidraw devices — so
-if the Jabra is connected when you install, the unit starts
-immediately without unplug/replug.
+The install also runs `udevadm trigger --subsystem-match=hidraw
+--action=add`, which re-emits `add` events for already-plugged
+hidraw devices — so the new MODE/GROUP take effect without unplug
+/replug.
 
 ## How it behaves
 
-- **Boot, no Jabra plugged in**: nothing runs.
-- **Jabra plugged**: udev fires `SYSTEMD_WANTS=openclaw-voicebridge.service`,
-  systemd starts the unit. The bridge engages off-hook and begins
-  watching for button presses.
-- **Jabra unplugged while bridge runs**: read on the hidraw fd raises
-  EOF/`ENODEV`. The bridge logs `HID read returned EOF — reconnecting`
-  and enters a 2-second backoff loop calling `_find_device()` until it
-  reappears. The unit stays active.
-- **Jabra re-plugged**: either the bridge's reconnect loop sees the new
-  hidraw node first, or udev re-fires (the unit is already active so
-  systemd no-ops). Either way the bridge re-engages.
-- **Bridge crash**: `Restart=on-failure` plus `StartLimitBurst=5` over
-  60s — restarts up to 5 times, then gives up to avoid a tight crash
-  loop. Check `journalctl -u openclaw-voicebridge` to see why.
+- **Boot, no Jabra plugged in**: the unit starts (linger pulls up the
+  user systemd at boot). The bridge's HID monitor parks in its
+  reconnect-backoff `Event.wait()` — kernel-blocked, ~0 CPU. It tries
+  `_find_device()` once every 2 s.
+- **Jabra plugged**: udev sets `plugdev:0660` on the new
+  `/dev/hidraw*`. Within 2 s the bridge's reconnect loop opens it,
+  engages off-hook, and starts watching for button presses.
+- **Jabra unplugged while bridge runs**: `os.read` returns EOF (or
+  raises ENODEV); `_poll_loop` logs `HID read returned EOF —
+  reconnecting`, closes the fd, and re-enters the 2 s backoff. The
+  unit stays active.
+- **Jabra re-plugged**: udev re-applies permissions; the reconnect
+  loop opens it on the next poll (≤ 2 s).
+- **Bridge crash**: `Restart=on-failure` plus `StartLimitBurst=5`
+  over 60 s — restarts up to 5 times, then gives up to avoid a tight
+  crash loop. Check `journalctl --user -u openclaw-voicebridge` to
+  see why.
 
 ## Verify
 
 ```bash
-systemctl status openclaw-voicebridge
-journalctl -u openclaw-voicebridge -f       # watch live logs
+systemctl --user status openclaw-voicebridge
+journalctl --user -u openclaw-voicebridge -f      # watch live logs
 ```
 
 You should see `[jabra_hid] INFO HID button monitor on /dev/hidraw0`
-on a successful start, then `HID: button press → wake` on each press.
+once the device is detected, then `HID: button press → wake` on each
+press.
 
 ## Manual control
 
 ```bash
-sudo systemctl start openclaw-voicebridge      # start without unplug/replug
-sudo systemctl stop openclaw-voicebridge       # graceful shutdown (handles SIGTERM)
-sudo systemctl enable openclaw-voicebridge     # also start at boot if Jabra is there
-sudo systemctl disable openclaw-voicebridge    # remove from boot (udev still triggers)
+systemctl --user start openclaw-voicebridge       # start
+systemctl --user stop openclaw-voicebridge        # graceful shutdown (SIGTERM)
+systemctl --user enable openclaw-voicebridge      # start at boot (needs linger)
+systemctl --user disable openclaw-voicebridge     # remove from boot
 ```
 
-## Why the bridge runs even without the device
+## Why a single long-running unit instead of udev-triggered
 
-Because USB devices come and go and re-emitting boot-time service
-dependencies is fragile. The bridge's internal reconnect loop is the
-authoritative state machine; udev is just a convenience starter. If you
-want the unit to truly stop when the device is unplugged you'd add a
-`BindsTo=` to a `.device` unit, but that adds complexity for limited
-benefit — the running bridge with no device costs effectively zero CPU
-(it's idle in `_shutdown.wait(2.0)` between `_find_device()` calls).
+Earlier versions started the unit via `SYSTEMD_WANTS=` from the udev
+rule and exited the bridge on disconnect. That mechanism only works
+with system-mode systemd (udev runs as root and can't address user
+units). To go user-mode without losing the "auto-start when device
+is plugged" property, the bridge now does that work itself with an
+in-process reconnect loop. The cost while the device is absent is
+~0 CPU (Event-based wait), so a long-running unit isn't wasteful.
