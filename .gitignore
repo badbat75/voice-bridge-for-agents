@@ -1,0 +1,20 @@
+# Local virtualenv — recreate via:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# (Too large to track: ~68 MB on aarch64.)
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Claude Code session state
+.claude/
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# Local backups produced when editing /home/openclaw/.openclaw/openclaw.json
+*.before-*

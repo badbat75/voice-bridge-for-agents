@@ -1,0 +1,34 @@
+[Unit]
+Description=OpenClaw Voice Bridge — Jabra mute button to gateway
+After=sound.target network-online.target
+Wants=network-online.target
+# Don't spam-restart if the gateway is unreachable at boot — let the
+# bridge log and try, but if it crash-loops fast, back off.
+# (StartLimit* live in [Unit], not [Service], on modern systemd.)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Set the user that owns the .venv and has access to /dev/hidraw* + audio.
+# On the dev Pi this is "openclaw"; change before installing if different.
+User=openclaw
+SupplementaryGroups=audio
+WorkingDirectory=/home/openclaw/.openclaw/workspace/voice-bridge
+# Inherit the same secrets the openclaw gateway uses — DEEPGRAM_API_KEY
+# in particular, since voice-bridge.py looks it up as an env fallback
+# before the JSON config (voice-bridge.py:58). The leading `-` makes
+# the file optional: if it's missing the bridge still starts and dies
+# with a clear "No Deepgram API key" message instead of a cryptic
+# systemd "file not found".
+EnvironmentFile=-/home/openclaw/.openclaw/gateway.systemd.env
+ExecStart=/home/openclaw/.openclaw/workspace/voice-bridge/.venv/bin/python /home/openclaw/.openclaw/workspace/voice-bridge/voice-bridge.py
+Restart=on-failure
+RestartSec=5
+# Voice-bridge handles SIGTERM/SIGINT cleanly: finishes the in-flight
+# turn, stops the HID thread, exits.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

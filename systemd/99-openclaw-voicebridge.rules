@@ -1,0 +1,10 @@
+# udev rule: start openclaw-voicebridge.service when the Jabra SPEAK 510
+# (USB 0b0e:0422) appears as a hidraw node. The service runs continuously
+# and handles unplug/replug internally via its reconnect loop, so we only
+# need to trigger it on add — no REMOVE handling required.
+#
+# Trigger uses SUBSYSTEM=="hidraw" rather than "usb" so the rule fires
+# *after* /dev/hidrawN has been created, avoiding a race where the
+# service starts before its target file exists.
+
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b0e", ATTRS{idProduct}=="0422", TAG+="systemd", ENV{SYSTEMD_WANTS}+="openclaw-voicebridge.service"
