@@ -783,10 +783,18 @@ class VoiceBridge:
 
             # Reset silence_count when the player finishes a reply, so
             # the time spent listening to TTS doesn't count toward
-            # idle_timeout_ms.
+            # idle_timeout_ms. Also drain audio_q: the recorder was
+            # filling it while aplay was running, and those chunks
+            # (silence — the user was listening to the reply) would
+            # otherwise be processed back-to-back right after the reset
+            # and burn the idle counter down to nearly the threshold
+            # before the first wall-clock-fresh chunk even arrives. The
+            # whole point of this reset is "start counting from end-of-
+            # aplay", which means dropping the queued past too.
             if self._idle_reset_pending.is_set():
                 self._idle_reset_pending.clear()
                 silence_count = 0
+                self._drain_queue(self.audio_q)
 
             # HID press while recording = "send what I said and stop
             # listening". If we're in the middle of a speech buffer,
