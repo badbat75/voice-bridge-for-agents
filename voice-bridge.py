@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """
-Binary Voice Bridge v2 — minimal, ARM-friendly.
+Binary Voice Bridge v3 — always-on mic, async pipeline.
 
-Trigger: Jabra SPEAK 510 HID unmute (no wake word).
-STT:     Deepgram REST API (streaming).
-TTS:     ElevenLabs REST API.
+Trigger: voice activity (no wake word, no PTT).
+         Jabra HID button = hard-cancel toggle (stops/resumes everything).
+STT:     Deepgram or ElevenLabs Scribe (configurable).
+TTS:     Deepgram Aura or ElevenLabs (configurable, streaming).
 Output:  ALSA aplay.
 
-CPU idle: ~0% (sleep loop, no audio stream open).
+Four worker threads connected by queues:
+
+    Recorder ──audio_q──▶ Endpointer ──utt_q──▶ Worker ──playback_q──▶ Player
+
+Recorder keeps PyAudio open while `recording` is set; endpointer runs
+RMS VAD per chunk and commits utterances on a configurable pause; worker
+drives STT → gateway SSE → TTS streaming; player drives one aplay
+subprocess per utterance. The bridge auto-idles (closes the mic stream)
+after `idle_timeout_ms` of pure silence; an HID press resumes it. CPU is
+low by design — recorder blocks in `stream.read`, endpointer does a
+single RMS per ~64 ms chunk, worker/player are idle off-turn.
 """
 
 from __future__ import annotations
@@ -16,17 +27,21 @@ import array
 import contextlib
 import json
 import logging
+import math
 import os
+import queue
 import signal
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from typing import Iterable, Iterator
 
 import pyaudio
 
 from deepgram_voice import DeepgramVoice
+from deezer_connect_plugin import DeezerConnectPlugin
 from elevenlabs_voice import ElevenLabsVoice
 from jabra_hid import HidMuteMonitor
 
@@ -126,6 +141,39 @@ def load_config() -> dict:
     # Output sample rate must be agreed upon by TTS request, the
     # synth library, and the aplay invocation. One number, one place.
     cfg["tts_sample_rate"] = int(cfg.get("tts_sample_rate", 22050))
+
+    # Endpointer / VAD knobs. All configurable so the bridge can be
+    # retuned per environment without touching code.
+    #
+    # - `vad_rms_threshold`: per-chunk energy above which a chunk is
+    #   counted as speech. Same dimensionless metric the legacy
+    #   `record_until_silence` used (sum(s²)/sqrt(N), not true RMS) so
+    #   prior calibrations carry over. Quiet rooms typically need ~300;
+    #   noisy ones higher.
+    # - `silence_timeout_ms`: pause after speech that ends an utterance
+    #   and pushes it down the pipeline. Don't push this below ~600 ms
+    #   or natural between-word pauses get split into separate turns.
+    # - `idle_timeout_ms`: total silence (no speech) after which the
+    #   recording stream is closed entirely. Set to 0 to disable
+    #   auto-idle (mic stays open until SIGTERM or HID press).
+    cfg["vad_rms_threshold"] = float(cfg.get("vad_rms_threshold", 300))
+    cfg["silence_timeout_ms"] = int(cfg.get("silence_timeout_ms", 800))
+    cfg["idle_timeout_ms"] = int(cfg.get("idle_timeout_ms", 10000))
+    # Trailing silence preserved in the committed PCM. The full
+    # silence_timeout_ms window is captured to *detect* end-of-speech,
+    # but only `silence_keep_ms` of it is included in the audio handed
+    # to STT — the rest is trimmed. Keeping a small tail (default
+    # 500 ms) helps STT models that use trailing silence as a
+    # word-boundary cue without bloating each utterance with the full
+    # detection window.
+    cfg["silence_keep_ms"] = int(cfg.get("silence_keep_ms", 500))
+    # Pre-roll: how much audio captured *before* the threshold-crossing
+    # to prepend to the committed PCM. Helps STT catch the very first
+    # phoneme, which often dips below the VAD threshold (the leading
+    # consonant of a word can be quieter than its vowel). The bridge
+    # keeps a rolling window of the last `pre_speech_keep_ms` of
+    # below-threshold audio and pastes it in at speech onset.
+    cfg["pre_speech_keep_ms"] = int(cfg.get("pre_speech_keep_ms", 100))
 
     # TTS streaming strategy. `http_sentence` (default) buffers gateway
     # deltas to sentence boundaries and calls the HTTP streaming endpoint
@@ -277,18 +325,20 @@ def play_audio_stream(device: str, audio_iter: Iterable[bytes], sample_rate: int
     return wrote_any
 
 
-def play_beep(device: str, sample_rate: int) -> None:
-    """Play a short ~80 ms 880 Hz beep at the given output sample rate."""
-    duration = 0.08
-    freq = 880
+def _make_beep_pcm(sample_rate: int, freq: float, duration: float, amplitude: int = 16000) -> bytes:
+    """Generate a fade-out sine beep as S16LE mono PCM bytes."""
     n_samples = int(sample_rate * duration)
     buf = array.array("h")
     for i in range(n_samples):
-        # Fade out
         env = 1.0 - (i / n_samples)
-        val = int(16000 * env * (0.5 + 0.5 * __import__("math").sin(2 * __import__("math").pi * freq * i / sample_rate)))
+        val = int(amplitude * env * (0.5 + 0.5 * math.sin(2 * math.pi * freq * i / sample_rate)))
         buf.append(max(-32768, min(32767, val)))
-    play_audio(device, buf.tobytes(), sample_rate)
+    return buf.tobytes()
+
+
+def play_beep(device: str, sample_rate: int) -> None:
+    """Play a short ~80 ms 880 Hz beep at the given output sample rate."""
+    play_audio(device, _make_beep_pcm(sample_rate, freq=880, duration=0.08), sample_rate)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +370,7 @@ def gateway_chat(base_url: str, token: str, text: str, voice_model: str, session
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
+            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', url, resp.status, resp.reason)
             result = json.loads(resp.read())
             return result["choices"][0]["message"]["content"]
     except Exception as exc:
@@ -328,6 +379,38 @@ def gateway_chat(base_url: str, token: str, text: str, voice_model: str, session
 
 
 GATEWAY_FALLBACK_REPLY = "Mi dispiace, ho avuto un problema di connessione."
+
+# Tokens the agent emits to signal "stay silent on this turn" (e.g. when the
+# user utterance was just background noise). The bridge intercepts these
+# before they hit TTS and plays a short low beep instead.
+NO_REPLY_SENTINELS: frozenset[str] = frozenset({"NO_REPLY", "NOREPLY", "NO-REPLY"})
+_NO_REPLY_MAX_LEN = max(len(s) for s in NO_REPLY_SENTINELS)
+
+
+def _filter_no_reply(stream: Iterable[str]) -> Iterator[str]:
+    """Wrap a delta stream and swallow it entirely if it strips to a
+    NO_REPLY sentinel. Otherwise yield deltas unchanged.
+
+    Buffers up to a few characters (enough to distinguish a sentinel from
+    a real reply) before it commits to a passthrough — this only delays
+    first-audio by one or two SSE deltas in the normal case, and avoids a
+    wasted TTS HTTP call when the agent decided to stay silent.
+    """
+    buf = ""
+    holding = True
+    for delta in stream:
+        if not holding:
+            yield delta
+            continue
+        buf += delta
+        if len(buf) > _NO_REPLY_MAX_LEN + 2:
+            yield buf
+            buf = ""
+            holding = False
+    if holding and buf:
+        if buf.strip() in NO_REPLY_SENTINELS:
+            return
+        yield buf
 
 
 def gateway_chat_stream(
@@ -370,6 +453,7 @@ def gateway_chat_stream(
     req = urllib.request.Request(url, data=payload, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
+            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', url, resp.status, resp.reason)
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line.startswith("data:"):
@@ -393,48 +477,596 @@ def gateway_chat_stream(
 
 
 # ---------------------------------------------------------------------------
-# Recording
+# Async pipeline orchestrator
 # ---------------------------------------------------------------------------
-def record_until_silence(
-    pa: pyaudio.PyAudio,
-    stream: pyaudio.Stream,
-    chunk_size: int,
-    silence_ms: int,
-    max_s: int,
-    sample_rate: int,
-) -> list[bytes]:
-    """Record audio chunks until silence or max duration."""
-    frames: list[bytes] = []
-    silence_threshold = 300  # RMS energy threshold
-    silence_count = 0
-    silence_limit = int(silence_ms / (chunk_size / sample_rate * 1000))
-    max_frames = int(max_s * sample_rate / chunk_size)
+# Sentinel pushed into `playback_q` after each utterance's audio chunks
+# so the player thread knows to close the current aplay process and
+# wait for the next utterance. Plain None would conflict with empty-
+# chunk filtering elsewhere; an explicit object is unambiguous.
+class _EndOfUtterance:
+    pass
 
-    log.info("Recording...")
-    while len(frames) < max_frames:
+
+_END_OF_UTTERANCE = _EndOfUtterance()
+
+
+class VoiceBridge:
+    """Always-on mic + 4-stage async pipeline + HID hard-cancel toggle.
+
+    Threads (all daemons):
+
+      - `_hid_loop`        polls HidMuteMonitor; triggers state toggles
+      - `_recorder_loop`   PyAudio open/read while `recording` is set
+      - `_endpointer_loop` RMS VAD; emits utterances on `silence_timeout_ms`
+                           pauses, triggers auto-idle on `idle_timeout_ms`
+      - `_worker_loop`     STT → gateway SSE → TTS streaming
+      - `_player_loop`     one aplay subprocess per utterance
+
+    Cancellation has two grades:
+
+      - **Hard cancel** (HID press while recording): bumps `_gen`,
+        drains every queue, kills the active aplay. Pipeline items
+        carry the generation they were produced under; downstream
+        stages drop anything whose generation has been superseded.
+      - **Soft idle** (silence > `idle_timeout_ms`): clears `recording`
+        (closes the mic stream) but does NOT bump `_gen`. Anything
+        already queued continues to flow — the user gets the reply they
+        were waiting for even though the mic is now idle.
+
+    Resuming from idle/cancel is always an HID press: it sets
+    `recording` and bumps `_gen` so any leftover stale chunks are shed.
+    """
+
+    def __init__(self, cfg: dict, stt, tts, hid: HidMuteMonitor,
+                 deezer: DeezerConnectPlugin | None = None) -> None:
+        self.cfg = cfg
+        self.stt = stt
+        self.tts = tts
+        self.hid = hid
+        # Optional deezer-connect ducking plugin. No-op unless enabled
+        # in voice-bridge.json under `deezer_connect`. Constructed by
+        # main() so tests can inject a fake.
+        self.deezer = deezer or DeezerConnectPlugin(cfg.get("deezer_connect"))
+
+        # `audio_q` is unbounded: the endpointer is O(N) over a 1024-
+        # sample chunk per ~64 ms — easily faster than the recorder, so
+        # the queue should stay near-empty in practice. The other queues
+        # are also unbounded; backpressure is naturally bounded by an
+        # utterance's duration (~10s of audio = ~250KB at 24kHz).
+        self.audio_q: "queue.Queue[tuple[int, bytes]]" = queue.Queue()
+        self.utterance_q: "queue.Queue[tuple[int, bytes, int]]" = queue.Queue()
+        self.playback_q: "queue.Queue[tuple[int, bytes | _EndOfUtterance]]" = queue.Queue()
+
+        self.shutdown_event = threading.Event()
+        # `recording` gates the recorder thread. With HID enabled (the
+        # canonical deployment), the bridge boots muted — the
+        # HidMuteMonitor's engage write puts the device into firmware-
+        # mute (LED red, USB capture silenced) and `recording` stays
+        # clear until the user presses the button. Cleared/set in pairs
+        # with `hid.set_led()` so device state always tracks `recording`.
+        # If HID is disabled, fall back to "always-on" boot so there's
+        # still a way to use the bridge — without HID there's nothing to
+        # un-mute it from a muted boot.
+        self.recording = threading.Event()
+        if not cfg.get("hid_mute_enabled"):
+            self.recording.set()
+
+        self._gen = 0
+        self._gen_lock = threading.Lock()
+
+        # Set by the player after a playback completes so the endpointer
+        # resets its silence counter — otherwise the 10s playback eats
+        # into the idle window and the bridge auto-idles right after the
+        # reply finishes. Effect: idle timer measures silence *after* the
+        # last interaction (user speech OR our reply), not just user speech.
+        self._idle_reset_pending = threading.Event()
+
+        # Set by an HID-press while recording to tell the endpointer to
+        # commit any in-progress speech buffer right now, instead of
+        # waiting for `silence_timeout_ms`. The companion to "soft mute":
+        # the user pressed mute, so we still send what they were saying
+        # but stop listening for new input.
+        self._force_commit = threading.Event()
+
+        # Set by `_enter_idle` (auto-idle on silence), cleared on the
+        # next user transition. The player checks it when the first PCM
+        # chunk of a reply arrives: if the bridge auto-idled mid-turn
+        # (silence timeout while the worker was still processing), the
+        # player un-idles itself so the user can talk back the moment
+        # the reply ends. If the user explicitly muted via HID, this
+        # flag stays clear and the player respects the press — playback
+        # happens but the mic stays muted afterwards.
+        self._auto_idled = threading.Event()
+
+        # The active aplay process, if any. Held under `_player_lock`
+        # so a hard-cancel from the HID thread can `kill()` it without
+        # racing the player thread's setup/teardown.
+        self._player_proc: subprocess.Popen | None = None
+        self._player_lock = threading.Lock()
+
+        self._threads: list[threading.Thread] = []
+
+    # -- generation helpers --------------------------------------------
+    def _current_gen(self) -> int:
+        with self._gen_lock:
+            return self._gen
+
+    def _bump_gen(self) -> int:
+        with self._gen_lock:
+            self._gen += 1
+            return self._gen
+
+    @staticmethod
+    def _drain_queue(q: "queue.Queue") -> int:
+        n = 0
         try:
-            data = stream.read(chunk_size, exception_on_overflow=False)
-        except Exception:
-            break
+            while True:
+                q.get_nowait()
+                n += 1
+        except queue.Empty:
+            return n
 
-        frames.append(data)
+    def _kill_player(self) -> None:
+        with self._player_lock:
+            proc = self._player_proc
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except Exception as exc:
+            log.warning("kill aplay failed: %s", exc)
 
-        # Check silence (RMS energy)
-        samples = array.array("h", data)
-        if len(samples) == 0:
-            continue
-        rms = sum(s * s for s in samples) / len(samples) ** 0.5
+    def _is_playing(self) -> bool:
+        with self._player_lock:
+            return self._player_proc is not None
 
-        if rms < silence_threshold:
-            silence_count += 1
-            if silence_count >= silence_limit:
-                log.info("Silence detected (%d frames)", silence_count)
-                break
+    # -- state transitions ---------------------------------------------
+    def _enter_idle(self, source: str) -> None:
+        """Hard idle: close mic, firmware-mute, LED red.
+
+        Fires after `idle_timeout_ms` of silence following the last
+        "transaction" — either a user utterance commit or the end of
+        a TTS playback. The 10 s window is owned by the endpointer's
+        `silence_count`, which is reset on both commit and playback
+        end so the timer always measures silence *after* the last
+        interaction, not just after the last user speech.
+
+        We deliberately don't bump `_gen` here, so any utterance the
+        worker is processing (and any audio the player is still
+        flushing) finishes naturally. The audio_q is drained because
+        anything captured after the silence threshold won't change
+        the outcome; sparing the endpointer the work of filtering it
+        out chunk-by-chunk on resume.
+        """
+        if not self.recording.is_set():
+            return
+        log.info("Idle (%s): closing mic, in-flight pipeline continues", source)
+        self.recording.clear()
+        self._drain_queue(self.audio_q)
+        # Mark this idle as auto so the player un-idles itself when the
+        # in-flight reply starts playing — see `_player_loop`.
+        self._auto_idled.set()
+        self.hid.set_led(muted=True)
+
+    def _on_hid_press(self) -> None:
+        if self.recording.is_set():
+            log.info("HID press: commit-and-mute (in-flight pipeline continues)")
+            # Soft mute: tell the endpointer to commit any in-progress
+            # speech buffer right now (don't wait for silence_timeout_ms),
+            # stop the recorder, write LED on. The worker still picks the
+            # committed utterance off `utterance_q` and runs STT → gateway
+            # → TTS as usual; the player still plays the reply. We just
+            # stop listening for new input until the next press resumes.
+            # No queue drain, no gen bump, no aplay kill — those would
+            # discard the very thing the user pressed mute to send.
+            self._force_commit.set()
+            self.recording.clear()
+            self.hid.set_led(muted=True)
         else:
-            silence_count = 0
+            log.info("HID press: resume recording")
+            # Bump gen so any stragglers from before (e.g. an old
+            # in-progress speech buffer the endpointer might have under
+            # the previous gen) are shed by downstream stages.
+            self._auto_idled.clear()
+            self._bump_gen()
+            self.recording.set()
+            self.hid.set_led(muted=False)
 
-    log.info("Recorded %d frames", len(frames))
-    return frames
+    # -- thread loops --------------------------------------------------
+    def _hid_loop(self) -> None:
+        while not self.shutdown_event.wait(0.05):
+            if self.hid.consume_unmute_event():
+                self._on_hid_press()
+
+    def _recorder_loop(self) -> None:
+        pa = pyaudio.PyAudio()
+        stream: pyaudio.Stream | None = None
+        sr = self.cfg["sample_rate"]
+        chunk = self.cfg["chunk_size"]
+        try:
+            while not self.shutdown_event.is_set():
+                if not self.recording.is_set():
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        stream = None
+                        log.info("Recorder: stream closed")
+                    # Park on `recording`. A timeout lets us notice
+                    # shutdown even if no toggle ever arrives.
+                    self.recording.wait(0.2)
+                    continue
+
+                if stream is None:
+                    idx = find_input_device(pa)
+                    try:
+                        stream = pa.open(
+                            format=pyaudio.paInt16,
+                            channels=1,
+                            rate=sr,
+                            input=True,
+                            input_device_index=idx,
+                            frames_per_buffer=chunk,
+                        )
+                        log.info("Recorder: opened (idx=%s rate=%dHz chunk=%d)",
+                                 idx, sr, chunk)
+                    except Exception as exc:
+                        log.warning("Recorder: cannot open: %s — retry in 1s", exc)
+                        if self.shutdown_event.wait(1.0):
+                            return
+                        continue
+
+                try:
+                    data = stream.read(chunk, exception_on_overflow=False)
+                except Exception as exc:
+                    log.warning("Recorder: read failed: %s — reopening", exc)
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    stream = None
+                    continue
+                self.audio_q.put((self._current_gen(), data))
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+
+    def _endpointer_loop(self) -> None:
+        """RMS VAD. Two timers run off the same per-chunk silence count:
+
+          - speech-then-silence ≥ `silence_timeout_ms` → commit utterance
+          - cumulative silence ≥ `idle_timeout_ms` (no speech) → enter idle
+
+        The silence count is NOT reset by a commit, so the idle timer
+        accounts for the trailing silence of the last utterance too.
+        """
+        sr = self.cfg["sample_rate"]
+        chunk = self.cfg["chunk_size"]
+        chunk_ms = (chunk / sr) * 1000.0
+        rms_threshold = float(self.cfg["vad_rms_threshold"])
+        commit_chunks = max(1, int(self.cfg["silence_timeout_ms"] / chunk_ms))
+        keep_chunks = max(0, int(self.cfg.get("silence_keep_ms", 500) / chunk_ms))
+        pre_chunks = max(0, int(self.cfg.get("pre_speech_keep_ms", 100) / chunk_ms))
+        prebuf: "deque[bytes] | None" = (
+            deque(maxlen=pre_chunks) if pre_chunks > 0 else None
+        )
+        idle_ms = int(self.cfg.get("idle_timeout_ms", 0))
+        idle_chunks = int(idle_ms / chunk_ms) if idle_ms > 0 else 0
+
+        seen_gen = self._current_gen()
+        in_speech = False
+        silence_count = 0
+        buf: list[bytes] = []
+        gen_at_start = seen_gen
+        speech_tick = 0
+
+        while not self.shutdown_event.is_set():
+            # Reset on resume: a gen bump means the user pressed HID
+            # to resume from idle, so any half-built speech buffer
+            # captured under the old gen must be discarded.
+            cur_gen = self._current_gen()
+            if cur_gen != seen_gen:
+                in_speech = False
+                silence_count = 0
+                buf.clear()
+                if prebuf is not None:
+                    prebuf.clear()
+                seen_gen = cur_gen
+
+            # Reset silence_count when the player finishes a reply, so
+            # the time spent listening to TTS doesn't count toward
+            # idle_timeout_ms.
+            if self._idle_reset_pending.is_set():
+                self._idle_reset_pending.clear()
+                silence_count = 0
+
+            # HID press while recording = "send what I said and stop
+            # listening". If we're in the middle of a speech buffer,
+            # commit it now (don't wait for silence_timeout_ms); the
+            # worker will pick it up off utterance_q normally. If
+            # there's nothing in flight, the press is just a soft mute.
+            if self._force_commit.is_set():
+                self._force_commit.clear()
+                if in_speech and buf:
+                    trim = max(0, min(silence_count - keep_chunks, len(buf)))
+                    speech_buf = buf[:-trim] if trim > 0 else buf
+                    pcm = b"".join(speech_buf)
+                    duration_s = len(speech_buf) * chunk_ms / 1000.0
+                    log.info("Endpointer: force-commit on HID press "
+                             "(%d chunks ≈ %.2fs)",
+                             len(speech_buf), duration_s)
+                    self.utterance_q.put((gen_at_start, pcm, sr))
+                    buf = []
+                    in_speech = False
+                    silence_count = 0
+
+            try:
+                gen, data = self.audio_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if gen != cur_gen:
+                continue
+
+            samples = array.array("h", data)
+            if not samples:
+                continue
+            # Same not-quite-RMS metric the legacy `record_until_silence`
+            # used: `sum(s²) / sqrt(N)`. Operator precedence makes this
+            # `sum(s²) / len(samples)**0.5`. Keeping the formula as-is
+            # so the threshold default (`vad_rms_threshold`) carries
+            # over from prior calibrations.
+            rms = sum(s * s for s in samples) / len(samples) ** 0.5
+
+            if rms >= rms_threshold:
+                if not in_speech:
+                    in_speech = True
+                    gen_at_start = gen
+                    speech_tick = 0
+                    if prebuf:
+                        buf.extend(prebuf)
+                        prebuf.clear()
+                    log.info("Endpointer: sound detected (rms=%.0f ≥ %g)",
+                             rms, rms_threshold)
+                buf.append(data)
+                silence_count = 0
+                speech_tick += 1
+                if speech_tick % 32 == 0:
+                    log.info("Endpointer: still in_speech tick=%d rms=%.0f",
+                             speech_tick, rms)
+            else:
+                if in_speech:
+                    buf.append(data)
+                    if silence_count == 0:
+                        log.info("Endpointer: silence onset (rms=%.0f < %g, "
+                                 "need %d chunks ≈ %dms to commit)",
+                                 rms, rms_threshold, commit_chunks,
+                                 self.cfg["silence_timeout_ms"])
+                elif prebuf is not None:
+                    # Rolling pre-roll window for the next utterance.
+                    prebuf.append(data)
+                silence_count += 1
+
+                if in_speech and silence_count >= commit_chunks:
+                    # Keep only `keep_chunks` of the trailing silence
+                    # in the committed audio: the rest of the detection
+                    # window is trimmed so STT doesn't see a full
+                    # silence_timeout_ms tail. With keep_chunks=0 the
+                    # cut is exactly at the last above-threshold chunk.
+                    trim = max(0, min(silence_count - keep_chunks, len(buf)))
+                    speech_buf = buf[:-trim] if trim > 0 else buf
+                    pcm = b"".join(speech_buf)
+                    duration_s = len(speech_buf) * chunk_ms / 1000.0
+                    log.info("Endpointer: commit (%d chunks ≈ %.2fs, "
+                             "kept %d trailing silence, trimmed %d)",
+                             len(speech_buf), duration_s,
+                             min(keep_chunks, silence_count), trim)
+                    self.utterance_q.put((gen_at_start, pcm, sr))
+                    buf = []
+                    in_speech = False
+                    # Treat commit as a "transaction" boundary: the
+                    # idle 10 s window starts counting from here, not
+                    # from the trailing-silence chunks already absorbed
+                    # to detect end-of-speech. (Playback end resets it
+                    # again via _idle_reset_pending — whichever lands
+                    # later wins.)
+                    silence_count = 0
+
+                if (not in_speech
+                        and idle_chunks > 0
+                        and silence_count >= idle_chunks
+                        and not self._is_playing()):
+                    self._enter_idle(source=f"silence>{idle_ms}ms")
+                    silence_count = 0
+                    buf = []
+
+    def _worker_loop(self) -> None:
+        while not self.shutdown_event.is_set():
+            try:
+                gen, pcm, sr = self.utterance_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if gen != self._current_gen():
+                continue
+
+            log.info("Worker: STT (%d bytes ≈ %.2fs)", len(pcm), len(pcm) / (sr * 2))
+            text = self.stt.transcribe(pcm, sr)
+            if not text:
+                log.info("Worker: empty transcription, skipping")
+                continue
+            if gen != self._current_gen():
+                continue
+            log.info("User: %s", text)
+
+            log.info("Worker: → gateway %s (model=%s session=%s)",
+                     self.cfg["gateway_base_url"],
+                     self.cfg["voice_model"],
+                     self.cfg.get("session_key", "voice-bridge"))
+            text_stream = gateway_chat_stream(
+                self.cfg["gateway_base_url"],
+                self.cfg["gateway_token"],
+                text,
+                self.cfg["voice_model"],
+                self.cfg.get("session_key", "voice-bridge"),
+            )
+            collected: list[str] = []
+
+            def _tee(s: Iterable[str]) -> Iterator[str]:
+                for delta in s:
+                    if gen != self._current_gen():
+                        return
+                    collected.append(delta)
+                    yield delta
+
+            try:
+                for chunk in self.tts.synthesize_stream(_filter_no_reply(_tee(text_stream))):
+                    if gen != self._current_gen():
+                        break
+                    if not chunk:
+                        continue
+                    self.playback_q.put((gen, chunk))
+            except Exception as exc:
+                log.error("Worker: TTS pipeline error: %s", exc)
+            finally:
+                full_reply = "".join(collected).strip()
+                if full_reply in NO_REPLY_SENTINELS and gen == self._current_gen():
+                    # Agent said "stay silent" — play a short low beep so
+                    # the user gets feedback that the turn was processed
+                    # but nothing needed saying.
+                    log.info("Binary: %s (sentinel — low beep)", full_reply)
+                    beep = _make_beep_pcm(
+                        self.cfg["tts_sample_rate"],
+                        freq=220,
+                        duration=0.18,
+                    )
+                    self.playback_q.put((gen, beep))
+                # Always emit the end-of-utterance marker (even after
+                # cancel) so the player can release the current aplay
+                # cleanly. Stale gen → player drops it harmlessly.
+                self.playback_q.put((gen, _END_OF_UTTERANCE))
+
+            if collected and full_reply not in NO_REPLY_SENTINELS:
+                log.info("Binary: %s", "".join(collected)[:200])
+
+    def _player_loop(self) -> None:
+        device = self.cfg["output_device"]
+        sample_rate = self.cfg["tts_sample_rate"]
+        while not self.shutdown_event.is_set():
+            try:
+                gen, item = self.playback_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            # Skip end-of-utterance markers that arrive with no
+            # preceding audio (e.g. worker bailed before producing any
+            # PCM), and stale-gen anything.
+            if isinstance(item, _EndOfUtterance) or gen != self._current_gen():
+                continue
+
+            # If the bridge auto-idled while this turn was still being
+            # processed (worker → TTS), the device is currently muted
+            # and the mic is closed. Resume recording before playing the
+            # reply so the user can talk back the moment it ends; reset
+            # the idle silence counter so the next idle window measures
+            # from end-of-playback. Only fires for *auto*-idle — if the
+            # user explicitly pressed HID to mute, `_auto_idled` is
+            # clear and we leave the mic muted (the press wins).
+            if self._auto_idled.is_set():
+                log.info("Player: un-idling for playback (auto-idle, "
+                         "resume mic + LED off)")
+                self._auto_idled.clear()
+                self.recording.set()
+                self.hid.set_led(muted=False)
+                self._idle_reset_pending.set()
+
+            # Duck deezer-connect (no-op if disabled or BFF unreachable).
+            # Paired with unduck() in the finally below; the lock inside
+            # the plugin keeps the pair safe under back-to-back replies.
+            self.deezer.duck()
+            proc = _aplay_popen(device, sample_rate, bufsize=0)
+            with self._player_lock:
+                self._player_proc = proc
+            try:
+                if not self._write_chunk(proc, item):
+                    continue
+                while not self.shutdown_event.is_set():
+                    try:
+                        gen2, item2 = self.playback_q.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    if gen2 != self._current_gen():
+                        # Hard-cancel happened mid-utterance; the proc
+                        # has likely already been killed, but break
+                        # explicitly so we close it cleanly.
+                        break
+                    if isinstance(item2, _EndOfUtterance):
+                        break
+                    if not self._write_chunk(proc, item2):
+                        break
+            finally:
+                with self._player_lock:
+                    self._player_proc = None
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                self.deezer.unduck()
+                self._idle_reset_pending.set()
+
+    @staticmethod
+    def _write_chunk(proc: subprocess.Popen, chunk: bytes) -> bool:
+        if not chunk:
+            return True
+        try:
+            proc.stdin.write(chunk)
+            return True
+        except BrokenPipeError:
+            return False
+
+    # -- lifecycle -----------------------------------------------------
+    def start(self) -> None:
+        for name, fn in (
+            ("hid", self._hid_loop),
+            ("recorder", self._recorder_loop),
+            ("endpointer", self._endpointer_loop),
+            ("worker", self._worker_loop),
+            ("player", self._player_loop),
+        ):
+            t = threading.Thread(target=fn, name=f"vb-{name}", daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def stop(self) -> None:
+        self.shutdown_event.set()
+        # Wake any thread parked on `recording.wait()` so it notices
+        # shutdown immediately instead of waiting out its timeout.
+        self.recording.set()
+        # Kill the active aplay so the player loop's wait returns
+        # without hitting the 2s timeout.
+        self._kill_player()
+        for t in self._threads:
+            t.join(timeout=3.0)
+        # Restore deezer-connect's volume if we were ducked when stop
+        # arrived (SIGTERM mid-playback). No-op when the plugin is
+        # disabled or wasn't currently ducking.
+        self.deezer.unduck()
 
 
 # ---------------------------------------------------------------------------
@@ -444,15 +1076,12 @@ def main() -> None:
     cfg = load_config()
 
     # Validate only the API keys actually needed for the chosen
-    # providers (voice-bridge.conf decides which).
+    # providers (voice-bridge.json decides which).
     needed_providers = {cfg["stt_provider"], cfg["tts_provider"]}
     if "elevenlabs" in needed_providers and not cfg.get("elevenlabs_key"):
         log.error("ElevenLabs selected but no ElevenLabs API key in gateway config")
         sys.exit(1)
     if cfg["tts_provider"] == "elevenlabs":
-        # We use whatever voice/model the openclaw config specifies.
-        # If those are missing we'd silently fall through to SDK defaults
-        # (random English voice etc.) — fail loudly instead.
         if not cfg.get("elevenlabs_voice"):
             log.error("messages.tts.providers.elevenlabs.voiceId missing in openclaw config")
             sys.exit(1)
@@ -472,118 +1101,43 @@ def main() -> None:
              cfg["tts_provider"], cfg["elevenlabs_voice"], cfg["elevenlabs_model"],
              cfg["tts_sample_rate"], cfg["tts_streaming_mode"])
     log.info("Output: %s @ %d Hz", cfg["output_device"], cfg["tts_sample_rate"])
+    log.info("VAD: rms_threshold=%g pause_commit=%dms idle=%dms",
+             cfg["vad_rms_threshold"], cfg["silence_timeout_ms"], cfg["idle_timeout_ms"])
+    if not cfg.get("hid_mute_enabled") and cfg["idle_timeout_ms"] > 0:
+        log.warning("HID disabled but idle_timeout_ms>0 — auto-idle will be unrecoverable; "
+                    "set idle_timeout_ms=0 or hid_mute_enabled=true")
 
     stt = _build_voice_provider("stt", cfg)
     tts = _build_voice_provider("tts", cfg)
 
-    # Start HID mute monitor. The monitor's poll thread owns the device
-    # lifecycle: it parks (zero CPU) until the Jabra is plugged in, and
-    # transparently reconnects across unplug/replug. The bridge stays
-    # up indefinitely; only SIGTERM/SIGINT exits.
     hid = HidMuteMonitor()
     if cfg.get("hid_mute_enabled"):
         hid.start()
 
-    # Graceful shutdown
-    shutdown_event = threading.Event()
+    bridge = VoiceBridge(cfg, stt, tts, hid)
 
-    def _sigterm(signum, frame):
+    def _sigterm(_signum, _frame):
         log.info("Shutdown requested")
-        shutdown_event.set()
+        bridge.shutdown_event.set()
 
     signal.signal(signal.SIGTERM, _sigterm)
     signal.signal(signal.SIGINT, _sigterm)
 
-    log.info("Ready — waiting for unmute...")
+    bridge.start()
+    if cfg.get("hid_mute_enabled"):
+        log.info("Ready — device starts muted, press the Jabra button to begin")
+    else:
+        log.info("Ready — listening (always-on mic, HID button disabled)")
 
-    # Main loop — edge-triggered on mute→unmute transitions. Exits only
-    # on SIGTERM/SIGINT; device unplug is handled inside the HID monitor.
-    while not shutdown_event.is_set():
-        if not hid.consume_unmute_event():
-            time.sleep(0.2)
-            continue
-
-        log.info("Wake: unmute detected")
-        play_beep(cfg["output_device"], cfg["tts_sample_rate"])
-
-        # Open audio stream
-        pa = pyaudio.PyAudio()
-        input_dev = find_input_device(pa)
-        try:
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=cfg["sample_rate"],
-                input=True,
-                input_device_index=input_dev,
-                frames_per_buffer=cfg["chunk_size"],
-            )
-        except Exception as exc:
-            log.error("Cannot open audio: %s", exc)
-            pa.terminate()
-            time.sleep(1)
-            continue
-
-        log.info("Input device: %s", input_dev)
-
-        # Record
-        frames = record_until_silence(
-            pa, stream, cfg["chunk_size"],
-            cfg["silence_timeout_ms"], cfg["max_recording_s"],
-            cfg["sample_rate"],
-        )
-
-        # Close audio stream immediately
-        stream.close()
-        stream = None
-        pa.terminate()
-        pa = None
-
-        if not frames:
-            log.info("No audio captured")
-            continue
-
-        # Transcribe
-        log.info("Transcribing...")
-        text = stt.transcribe(b"".join(frames), cfg["sample_rate"])
-
-        if not text:
-            log.info("No speech detected")
-            continue
-
-        log.info("User: %s", text)
-
-        # Streaming pipeline: gateway SSE → TTS (mode-dependent) → aplay
-        # stdin. Each stage is a lazy iterator pulled by the next; aplay
-        # writes the first PCM bytes as soon as the TTS produces them.
-        # First-audio latency is one sentence under `http_sentence` mode
-        # and one token under `websocket` mode (paid tier only).
-        log.info("Streaming response...")
-        text_stream = gateway_chat_stream(
-            cfg["gateway_base_url"],
-            cfg["gateway_token"],
-            text,
-            cfg["voice_model"],
-            cfg.get("session_key", "voice-bridge"),
-        )
-        # Tee deltas through a list so we can still log the full assembled
-        # reply once playback ends. The list lives on the stack of this
-        # turn — no shared state with future turns.
-        collected: list[str] = []
-
-        def _tee(stream: Iterable[str]) -> Iterator[str]:
-            for delta in stream:
-                collected.append(delta)
-                yield delta
-
-        audio_stream = tts.synthesize_stream(_tee(text_stream))
-        played = play_audio_stream(cfg["output_device"], audio_stream, cfg["tts_sample_rate"])
-        log.info("Binary: %s", "".join(collected)[:200])
-        if not played:
-            log.info("No audio produced")
-
-    hid.stop()
-    log.info("Stopped")
+    # Block here until SIGTERM/SIGINT. Worker threads do all the work;
+    # main is only around to own the signal handlers and the cleanup.
+    try:
+        while not bridge.shutdown_event.wait(1.0):
+            pass
+    finally:
+        bridge.stop()
+        hid.stop()
+        log.info("Stopped")
 
 
 if __name__ == "__main__":

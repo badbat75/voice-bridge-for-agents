@@ -27,6 +27,16 @@ buttons working.
    key on `/dev/input/event*` because the descriptor flags those bits
    as `Constant Variable Relative` (item type `0x07`), and Constant
    fields are skipped by the input layer. **hidraw is the right path.**
+6. **Bit 2 of byte 1 of the *output* report `0x03` is the firmware
+   capture-mute switch — not just a LED indicator.** Writing `0x05`
+   (Off-Hook + Mute) makes the USB-Audio capture endpoint emit pure
+   silence at the device level (PCM probe: 0/14400 non-zero samples in
+   1 s). Writing `0x01` (Off-Hook only) restores normal capture. The
+   bridge uses this for authoritative mute control: it ignores the
+   firmware's internal toggle on physical press and writes the report
+   directly on every state transition. This means there is no
+   "host doesn't know if the mic is muted" problem on this device —
+   if the bridge said `set_led(True)`, the mic *is* muted in firmware.
 
 ## Device IDs / paths
 
@@ -126,66 +136,60 @@ Byte 1 (LED page 0x08), 7 bits low nibble first:
 | 7 | `0x80` | `0x9E` Ringer (Telephony page) |
 
 Bits 8-15 are padding. So the engage write `[0x03, 0x01, 0x00]` sets
-*only* Off-Hook LED on. To also light the Mute LED when we have an
-internal mute state to mirror, write `[0x03, 0x05, 0x00]` (Off-Hook +
-Mute LEDs). This is optional — useful UX, not required for button
-detection.
+*only* Off-Hook LED on. Writing `[0x03, 0x05, 0x00]` (Off-Hook + Mute
+LED) **also silences the USB-Audio capture endpoint at the firmware
+level**, not just the LED — see TL;DR #6. So this is the bridge's
+authoritative mute switch, not just visual feedback.
+
+Verified empirically: with `0x05` written, a 1 s capture via
+`arecord plughw:3,0 -f S16_LE -r 16000 -c 1` returns **0/14400 non-zero
+samples**. Switch to `0x01` and the next capture returns
+~14400/14400 non-zero. ALSA's `Headset Capture Switch` mixer control
+stays at `on` in both cases — the firmware does not surface its
+internal mute via the USB Audio Class Feature Unit.
 
 ## Tracking mute state
 
-The Jabra mute button is a **momentary** physical switch (push-to-make,
-release-to-break). Pressing it does not change a persistent flag inside
-the device firmware. The device reports only "button is held now"
-(bit 4 = 1) and "button is released now" (bit 4 = 0). Whatever "the mic
-is currently muted" means, the host has to track and decide it.
+**Current model (Option A, after the LED-controls-mute discovery):**
+the bridge holds a `_muted_pref: bool` inside `HidMuteMonitor` and
+writes the matching output-report payload on every transition. Because
+that same write also flips the firmware's USB-Audio capture mute (see
+TL;DR #6), the bridge has authoritative control: there is no
+"physical state vs logical state can drift" problem. Whatever the
+bridge most recently asked for via `set_led(muted=...)` is what the
+device is actually doing.
 
-Three patterns, pick based on what `voice-bridge.py` actually needs:
+Boot-time invariant: `_muted_pref = True` by default, applied at the
+first `_engage()` after `_open_device()`. So a fresh bridge always
+starts with the mic firmware-muted regardless of the device's previous
+state. The user has to press to begin recording — and that press
+toggles the firmware mute internally too, but the bridge re-asserts
+its intent in `_on_hid_press` immediately after. End state:
+deterministic.
 
-### A. Host-side toggle + LED feedback (softphone-like)
-
-Tracks `_muted: bool` on the host, toggles on each rising edge of bit 4,
-and writes the LED state back so the device's red ring mirrors it.
+Public API exposed to `voice-bridge.py`:
 
 ```python
-# rising edge handler in _poll_loop, after edge detection:
-self._muted = not self._muted
-self._unmute_event.set()  # wake event for the bridge
-
-# mirror to device LED
-led_byte = 0x01 | (0x04 if self._muted else 0x00)  # Off-Hook | Mute LED
-try:
-    os.write(self._fd, bytes([0x03, led_byte, 0x00]))
-except OSError:
-    pass
+hid.set_led(muted=True)   # red ring on, capture silenced
+hid.set_led(muted=False)  # ring off, capture live
 ```
 
-This matches user expectation (LED reflects the logical state) and is
-what every softphone does. Caveat: if some other process writes the
-output report (we don't observed any doing it on this system, but it's
-possible) the LED can drift from `_muted`. Cheap mitigation: rewrite
-the LED on every received input report.
+Thread-safe; updates `_muted_pref` even when the device is unplugged,
+so the next reconnect's `_engage()` honors the most recent intent
+rather than reverting to the boot default.
 
-### B. Bind to ALSA mixer state
+### Alternative we did NOT pick — and why
 
-Drive the `Headset Capture Switch` (numid=5 on the Jabra card) on/off
-as part of the toggle. Pros: the rest of the audio stack sees the mic
-as muted (PipeWire reflects it, recording apps respect it). Cons: the
-mixer is a system-wide audio concern; the bridge becomes a side-effect
-producer over global audio state. Probably not worth it unless you
-specifically want the mic actually muted at the OS level when the user
-toggles.
-
-### C. Don't track state at all (current `voice-bridge.py`)
-
-For the bridge's actual flow — wake → record → STT → LLM → TTS → idle
-— the bridge doesn't need to know "is the mic muted right now". Each
-press just means "user wants to start a turn now". The mainloop after
-the previous edits already operates this way (`consume_unmute_event()`
-drives the wake; nothing reads a `muted` property). If we don't add UX
-that requires the user to "be in mute mode", option C is the simplest
-working baseline. Option A only matters once we want to give visual
-feedback or interpret presses asymmetrically (press-during-record =
-abort, press-during-idle = wake, etc.).
+- **Bind to ALSA mixer state** (`Headset Capture Switch`, numid=5).
+  The mixer doesn't reflect the firmware's internal mute on this
+  device (verified — kernel doesn't bridge HID Telephony Mic Mute →
+  ALSA), so writing it isn't equivalent. We'd be operating on a
+  parallel control while the firmware mute remains untouched.
+- **Don't track state at all (the previous bridge mainloop).** Worked
+  fine for the wake-on-press flow, but didn't solve the
+  "boot-with-physically-muted-device" failure case where the firmware
+  silently swallowed the first turn's audio. Authoritative LED-driven
+  mute eliminates that class of bug entirely.
 
 ## Why the "obvious" paths don't work
 
@@ -231,11 +235,17 @@ detail to rebuild a focused probe in 30 lines.
 
 Reflecting what's now in code:
 
-- `HidMuteMonitor._ENGAGE_PAYLOAD = bytes([0x03, 0x01, 0x00])` — the
-  off-hook output report. Written by `_engage(fd)` once during
-  `start()`, after the fd is opened in `O_RDWR`.
-- `HidMuteMonitor._BUTTON_BIT = 0x10` — bit 4 of byte 1 of report
-  `0x03`, the HID Telephony Mic Mute usage.
+- `HidMuteMonitor._OFFHOOK_BIT = 0x01` and `._MUTE_BIT = 0x04` — the
+  two bits of byte 1 in output report `0x03` we drive. Off-Hook is
+  required to wake telephony input reports; Mute toggles the LED *and*
+  the firmware capture mute together.
+- `HidMuteMonitor._BUTTON_BIT = 0x10` — bit 4 of byte 1 of input
+  report `0x03`, the HID Telephony Mic Mute usage.
+- `HidMuteMonitor._muted_pref: bool` — authoritative mute intent, set
+  via `set_led(muted)`. Default `True` so the device boots muted.
+  Re-applied on every reconnect via `_engage()`.
+- `set_led(muted)` is thread-safe and a no-op (preference still
+  recorded) if the device is not currently attached.
 - `_engage()` swallows `OSError` and logs a warning. The read loop
   still runs even on failure, so the monitor stays alive; the operator
   sees the warning in logs and knows why presses aren't observed.
@@ -248,10 +258,12 @@ What is **not** done yet, deliberately:
   reconnect) is the validated minimum. If we ever observe presses
   going silent after some idle period, add a keep-alive on a timer or
   piggy-back on each received input report.
-- **No LED feedback.** `voice-bridge.py` doesn't track persistent mute
-  state; option C from "Tracking mute state" applies. To switch to
-  option A, write `bytes([0x03, 0x05, 0x00])` to flip the Mute LED on
-  alongside Off-Hook, mirroring whatever `_muted` boolean we maintain.
+- **No re-write on every received input report.** In principle the
+  firmware could drift from `_muted_pref` if some other process wrote
+  to hidraw. We don't observe any such process in this deployment, so
+  the bridge writes only on its own state transitions. If drift becomes
+  an issue, mitigation is a single `set_led(self._muted_pref)` call at
+  the bottom of the read loop after each report — cheap.
 
 ### Reconnect on USB unplug/replug
 
@@ -286,13 +298,17 @@ Capture answers here as they're learned.
 - **Reboot resilience**: after a cold start of the Pi, does the engage
   still work, or is there a USB enumeration race? If yes, retry with
   backoff in `start()`.
-- **LED feedback in option A**: does the device respect the Mute LED
-  bit (write `03 05 00`), or only the Off-Hook bit? (Some Jabra firmware
-  drives the LED ring color from internal state regardless of host
-  writes.) Easy to test once option A is wired up.
 - **Other buttons**: this doc focuses on mute. If we ever want to use
   the call/hangup/redial buttons too, the same engage applies and they
   appear in the same report at the bit positions documented above.
+
+### Resolved
+
+- **LED bit semantics** *(answered 2026-05-08)*: writing `0x03 0x05 0x00`
+  vs `0x03 0x01 0x00` flips both the LED red ring and the firmware-
+  level USB-Audio capture mute, in lockstep. Confirmed via PCM probe
+  on the running device. ALSA's `Headset Capture Switch` does NOT
+  reflect the change. See TL;DR #6 and "Output report 0x03 layout".
 
 ## Sources
 

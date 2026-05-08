@@ -301,15 +301,37 @@ class HidMuteMonitorReconnectTest(unittest.TestCase):
 
 class HidMuteMonitorEngageTest(unittest.TestCase):
     """The off-hook engage must run before reads, with the exact bytes
-    the device firmware expects. Regression-protect that wire format."""
+    the device firmware expects. The same byte also carries the mute
+    preference, since on this device output report 0x03 byte 1 bit 2
+    *is* the firmware capture-mute switch (verified by PCM probe).
+    Regression-protect both wire formats and the preference plumbing."""
 
-    def test_engage_writes_off_hook_payload(self) -> None:
+    def test_engage_writes_muted_payload_by_default(self) -> None:
+        """Default startup is muted — engage writes Off-Hook + Mute LED."""
         r, w = os.pipe()
         try:
-            ok = HidMuteMonitor._engage(w)
+            mon = HidMuteMonitor()
+            ok = mon._engage(w)
             self.assertTrue(ok)
             data = os.read(r, 8)
-            # Output report 0x03 with byte 1 bit 0 (LED Off-Hook) set.
+            # 0x05 = Off-Hook (0x01) | Mute (0x04). Device boots muted.
+            self.assertEqual(data, bytes([0x03, 0x05, 0x00]))
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_engage_after_set_led_unmuted_uses_unmuted_payload(self) -> None:
+        """After set_led(False), an engage on a fresh fd writes Off-Hook
+        only — confirms reconnect honors the bridge's current intent
+        instead of snapping back to the boot default."""
+        r, w = os.pipe()
+        try:
+            mon = HidMuteMonitor()
+            # No fd attached: set_led only records the preference.
+            mon.set_led(muted=False)
+            ok = mon._engage(w)
+            self.assertTrue(ok)
+            data = os.read(r, 8)
             self.assertEqual(data, bytes([0x03, 0x01, 0x00]))
         finally:
             os.close(r)
@@ -321,7 +343,65 @@ class HidMuteMonitorEngageTest(unittest.TestCase):
         r, w = os.pipe()
         os.close(w)
         os.close(r)
-        self.assertFalse(HidMuteMonitor._engage(w))
+        mon = HidMuteMonitor()
+        self.assertFalse(mon._engage(w))
+
+
+class HidMuteMonitorSetLedTest(unittest.TestCase):
+    """set_led writes output report 0x03 to drive both the LED *and*
+    the firmware capture mute (same bit). It must always update the
+    preference (so future reconnects honor it) but only write when a
+    device is actually attached."""
+
+    def test_set_led_muted_writes_offhook_plus_mute(self) -> None:
+        r, w = os.pipe()
+        mon = HidMuteMonitor()
+        mon._fd = w  # pretend device attached
+        try:
+            mon.set_led(muted=True)
+            data = os.read(r, 8)
+            self.assertEqual(data, bytes([0x03, 0x05, 0x00]))
+            self.assertTrue(mon._muted_pref)
+        finally:
+            mon._fd = None
+            os.close(r)
+            os.close(w)
+
+    def test_set_led_unmuted_writes_offhook_only(self) -> None:
+        r, w = os.pipe()
+        mon = HidMuteMonitor()
+        mon._fd = w
+        try:
+            mon.set_led(muted=False)
+            data = os.read(r, 8)
+            self.assertEqual(data, bytes([0x03, 0x01, 0x00]))
+            self.assertFalse(mon._muted_pref)
+        finally:
+            mon._fd = None
+            os.close(r)
+            os.close(w)
+
+    def test_set_led_with_no_device_records_preference_silently(self) -> None:
+        """When the Jabra is unplugged, set_led must not raise — the
+        preference still updates so the next reconnect picks it up."""
+        mon = HidMuteMonitor()
+        self.assertTrue(mon._muted_pref)  # boot default
+        mon.set_led(muted=False)
+        self.assertFalse(mon._muted_pref)
+        mon.set_led(muted=True)
+        self.assertTrue(mon._muted_pref)
+
+    def test_set_led_swallows_oserror_on_dead_fd(self) -> None:
+        """A write to a closed fd must not crash — the device may have
+        just been unplugged between the bridge's intent and the write."""
+        r, w = os.pipe()
+        mon = HidMuteMonitor()
+        mon._fd = w
+        os.close(w)
+        os.close(r)
+        # Should not raise. The preference still lands.
+        mon.set_led(muted=False)
+        self.assertFalse(mon._muted_pref)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,21 @@
-"""Jabra SPEAK 510 HID button monitor.
+"""Jabra SPEAK 510 HID button monitor + mute control.
 
 Watches /dev/hidraw* for the device's mute button and surfaces presses as
-edge-triggered wake events on a background daemon thread. The monitor
-owns the full lifecycle of the hidraw fd: on USB disconnect or read
-failure it closes the fd and loops on `_open_device()` with a 2 s backoff
-until the Jabra reappears or `stop()` is called. The bridge sees one
-continuous monitor across plug cycles — no exit, no external supervisor
-needed.
+edge-triggered wake events on a background daemon thread. Also drives the
+device's mute LED via output report 0x03 — and that write controls more
+than just the LED: bit 2 of byte 1 in the same report is the firmware's
+USB-Audio capture mute switch, verified by PCM probe (0/14400 non-zero
+samples in 1 s of capture with the bit set, vs ~14400/14400 with it
+clear). So `set_led()` is mis-named-but-keep-it: turning the LED on also
+silences the mic at the device level, not just visually.
+
+The monitor owns the full lifecycle of the hidraw fd: on USB disconnect
+or read failure it closes the fd and loops on `_open_device()` with a 2 s
+backoff until the Jabra reappears or `stop()` is called. The bridge sees
+one continuous monitor across plug cycles — no exit, no external
+supervisor needed. The mute preference (`_muted_pref`) is remembered
+across reconnects so the device snaps back to the bridge's intended
+state on replug.
 
 Idle CPU is ~0 by design. The reconnect backoff blocks in
 `threading.Event.wait()`, not `time.sleep()`, so the thread is parked
@@ -22,9 +31,10 @@ regardless of the release.
 
 The Jabra SPEAK 510 firmware does NOT emit telephony input reports until
 the host writes an output report putting the device into off-hook state.
-`_engage()` performs that write each time the fd is (re)opened. Without
-it no mute press ever reaches userspace. See docs/JABRA.md for the full
-protocol reference.
+`_engage()` performs that write (combined with the current mute
+preference) each time the fd is (re)opened. Without it no mute press
+ever reaches userspace. See docs/JABRA.md for the full protocol
+reference.
 
 Device discovery matches USB vendor 0B0E / product 0422 via
 /sys/class/hidraw/*/device/uevent.
@@ -55,14 +65,21 @@ _READ_IDLE_S = 0.05
 
 
 class HidMuteMonitor:
-    """Detect Jabra SPEAK 510 mute-button presses via /dev/hidraw."""
+    """Detect Jabra SPEAK 510 mute-button presses via /dev/hidraw, and
+    drive the device's mute LED + firmware capture mute via the same
+    output report channel.
+    """
 
     _FEATURE_RPT = 0x03
     _BUTTON_BIT = 0x10  # bit 4 of byte 1 = HID Telephony usage 0x2F (Mic Mute)
-    # Output report 0x03 with byte 1 bit 0 (LED Off-Hook) set. Tells the
-    # device firmware "we're in an active call" so it starts sending input
-    # reports for telephony buttons. See docs/JABRA.md.
-    _ENGAGE_PAYLOAD = bytes([0x03, 0x01, 0x00])
+    # Output report 0x03 byte 1 bits we drive:
+    #   0x01 = LED Off-Hook  → tells firmware "in a call", starts emitting
+    #          telephony input reports for the buttons.
+    #   0x04 = LED Mute      → both lights the red ring AND mutes the
+    #          USB-Audio capture inside the firmware. Setting/clearing
+    #          is the bridge's authoritative mute switch.
+    _OFFHOOK_BIT = 0x01
+    _MUTE_BIT = 0x04
 
     def __init__(self) -> None:
         self._fd: int | None = None
@@ -74,6 +91,12 @@ class HidMuteMonitor:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._device: str | None = None
+        # Authoritative mute preference. The bridge boots muted (LED red,
+        # firmware capture silenced) so the user has to press the button
+        # before any audio is recorded — and the device's mute state is
+        # deterministic at startup, not whatever the previous session left
+        # it in. Re-applied on every reconnect via _engage().
+        self._muted_pref: bool = True
 
     def consume_unmute_event(self) -> bool:
         """Non-blocking check: was the mute button pressed since last call?"""
@@ -97,20 +120,51 @@ class HidMuteMonitor:
                 continue
         return None
 
-    @classmethod
-    def _engage(cls, fd: int) -> bool:
-        """Put the Jabra into off-hook state so telephony buttons emit reports.
+    def _build_payload(self, muted: bool) -> bytes:
+        """Output report 0x03 byte 1 = Off-Hook | (Mute if muted)."""
+        b1 = self._OFFHOOK_BIT | (self._MUTE_BIT if muted else 0)
+        return bytes([0x03, b1, 0x00])
 
-        Returns True if the SET_REPORT write succeeded. A failure here is
-        recoverable in principle (the read loop will still run) but in
-        practice it means no mute presses will be seen.
+    def _engage(self, fd: int) -> bool:
+        """Put the Jabra into off-hook state and apply the current mute pref.
+
+        Off-hook is required for the device to emit telephony input
+        reports at all; the mute bit is bundled in so reconnects don't
+        snap the device back to unmuted on top of whatever the bridge
+        wanted. Returns True if the SET_REPORT write succeeded.
         """
+        with self._lock:
+            payload = self._build_payload(self._muted_pref)
         try:
-            os.write(fd, cls._ENGAGE_PAYLOAD)
+            os.write(fd, payload)
             return True
         except OSError as exc:
             log.warning("Off-hook engage write failed: %s — buttons may stay silent", exc)
             return False
+
+    def set_led(self, muted: bool) -> None:
+        """Set device mute state (LED + firmware capture mute, both at once).
+
+        Writing this report immediately silences/unsilences the USB-Audio
+        capture endpoint at the firmware level — empirically verified
+        with PCM probes. The preference is also remembered, so a USB
+        unplug/replug or any future _engage() restores the bridge's
+        intent rather than reverting to the device's last physical state.
+
+        Thread-safe. No-op (but the preference is still recorded) if the
+        device is not currently attached; the next successful
+        _open_device() will pick up the value via _engage().
+        """
+        with self._lock:
+            self._muted_pref = muted
+            fd = self._fd
+            payload = self._build_payload(muted)
+        if fd is None:
+            return
+        try:
+            os.write(fd, payload)
+        except OSError as exc:
+            log.warning("LED/mute write failed: %s", exc)
 
     def _open_device(self) -> bool:
         """Find, open O_RDWR, and engage the Jabra. Sets self._fd / self._device.

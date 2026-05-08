@@ -3,12 +3,19 @@
   "sample_rate": 16000,
   "tts_sample_rate": 24000,
   "chunk_size": 1024,
-  "silence_timeout_ms": 1500,
-  "max_recording_s": 30,
-  "output_device": "plug:jabra_dmix",
+  "vad_rms_threshold": 1200000,
+  "silence_timeout_ms": 1000,
+  "idle_timeout_ms": 5000,
+  "output_device": "plug:sw_out",
   "hid_mute_enabled": true,
   "stt_provider": "elevenlabs",
   "tts_provider": "elevenlabs",
   "tts_streaming_mode": "http_sentence",
-  "session_key": "agent:main:voice-bridge"
+  "session_key": "agent:main:voice-bridge",
+  "deezer_connect": {
+    "enabled": true,
+    "base_url": "http://localhost:8980",
+    "ducking_percent": 50,
+    "request_timeout_s": 1.0
+  }
 }
