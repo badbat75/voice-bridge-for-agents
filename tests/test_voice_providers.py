@@ -14,7 +14,7 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deepgram_voice import DeepgramVoice  # noqa: E402
 from elevenlabs_voice import ElevenLabsVoice  # noqa: E402
 
@@ -117,7 +117,7 @@ class ProviderSelectionTest(unittest.TestCase):
             _json.dump(base, f)
             tmp = f.name
         try:
-            here = os.path.dirname(os.path.abspath(__file__))
+            here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             spec = importlib.util.spec_from_file_location(
                 "vb", os.path.join(here, "voice-bridge.py")
             )
@@ -199,7 +199,7 @@ class ProviderFactoryTest(unittest.TestCase):
 
     def _vb(self):
         import importlib.util
-        here = os.path.dirname(os.path.abspath(__file__))
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         spec = importlib.util.spec_from_file_location(
             "vb", os.path.join(here, "voice-bridge.py")
         )

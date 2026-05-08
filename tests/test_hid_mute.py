@@ -25,7 +25,7 @@ import threading
 import time
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jabra_hid import HidMuteMonitor  # noqa: E402
 
 

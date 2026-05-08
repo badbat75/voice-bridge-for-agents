@@ -19,20 +19,24 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import time
 import unittest
 import urllib.error
 import urllib.request
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 
 def _load_voice_bridge():
     """`voice-bridge.py` has a hyphen in its name, so a normal `import`
     won't work — load it via importlib so we can call its real
-    `load_config` and `gateway_chat`."""
+    `load_config` and `gateway_chat`. The provider modules it imports
+    live in the project root, which is added to sys.path above."""
     spec = importlib.util.spec_from_file_location(
-        "voice_bridge", os.path.join(_HERE, "voice-bridge.py"),
+        "voice_bridge", os.path.join(_PROJECT_ROOT, "voice-bridge.py"),
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -92,10 +96,51 @@ class GatewayChatIntegrationTest(unittest.TestCase):
         # `gateway_chat` swallows exceptions and returns this string —
         # if we see it, the underlying request actually failed.
         self.assertNotIn(
-            "Mi dispiace, ho avuto un problema di connessione.",
+            self.vb.GATEWAY_FALLBACK_REPLY,
             reply,
             "gateway_chat hit its exception fallback — request failed",
         )
+
+    def test_chat_completion_streaming_round_trip(self) -> None:
+        """Same gateway, streaming flavor: SSE deltas come back, the
+        first one earlier than the full reply, and the assembled text
+        is non-empty / not the fallback string.
+
+        Also captures the time-to-first-token, which is the latency
+        number that actually matters for perceived voice-bridge
+        responsiveness — once a delta is in hand, TTS can start
+        speaking. If this regresses (e.g. the gateway accidentally
+        buffers the SSE), this test will catch it before users do."""
+        prompt = "Rispondi con una sola parola: ok"
+        t0 = time.monotonic()
+        deltas: list[str] = []
+        first_delta_at: float | None = None
+        for delta in self.vb.gateway_chat_stream(
+            self.cfg["gateway_base_url"],
+            self.cfg["gateway_token"],
+            prompt,
+            self.cfg["voice_model"],
+            self.cfg.get("session_key", "voice-bridge"),
+        ):
+            if first_delta_at is None:
+                first_delta_at = time.monotonic() - t0
+            deltas.append(delta)
+        full_dt = time.monotonic() - t0
+        reply = "".join(deltas)
+        print(f"\n  prompt        : {prompt}")
+        print(f"  reply         : {reply!r}")
+        print(f"  deltas        : {len(deltas)}")
+        print(f"  ttft          : {first_delta_at:.2f}s")
+        print(f"  full latency  : {full_dt:.2f}s")
+
+        self.assertTrue(deltas, "gateway streaming returned no deltas")
+        self.assertNotIn(
+            self.vb.GATEWAY_FALLBACK_REPLY,
+            reply,
+            "gateway_chat_stream hit its exception fallback — request failed",
+        )
+        # Sanity: assembled reply is non-empty after stripping.
+        self.assertTrue(reply.strip(), f"streaming reply was blank: {reply!r}")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,9 @@ WorkingDirectory=/home/openclaw/.openclaw/workspace/voice-bridge
 # with a clear "No Deepgram API key" message instead of a cryptic
 # systemd "file not found".
 EnvironmentFile=-/home/openclaw/.openclaw/gateway.systemd.env
+# Diagnostic: surface aplay's stderr (underrun!!! lines) to the journal.
+# Cheap to leave on; remove once we've ruled out streaming-TTS underruns.
+Environment=VOICE_BRIDGE_DEBUG_AUDIO=1
 ExecStart=/home/openclaw/.openclaw/workspace/voice-bridge/.venv/bin/python /home/openclaw/.openclaw/workspace/voice-bridge/voice-bridge.py
 Restart=on-failure
 RestartSec=5

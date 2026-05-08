@@ -68,6 +68,7 @@ cleanup_legacy_system_install() {
 
 uninstall() {
     echo "Uninstalling $SERVICE_NAME (user)"
+    ensure_user_session_env
     systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
     systemctl --user disable "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$SERVICE_DST"
@@ -82,6 +83,7 @@ uninstall() {
 }
 
 show_status() {
+    ensure_user_session_env
     echo "=== install state ==="
     for path in "$SERVICE_DST" "$RULES_DST"; do
         if [ -L "$path" ]; then
@@ -149,6 +151,7 @@ install_unit() {
     check_groups
     cleanup_legacy_system_install
     ensure_linger
+    ensure_user_session_env
 
     echo "Linking $SERVICE_NAME via systemctl --user link"
     mkdir -p "$USER_UNIT_DIR"

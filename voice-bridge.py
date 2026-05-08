@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Iterable, Iterator
 
 import pyaudio
 
@@ -45,6 +46,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_HERE, "voice-bridge.json")
 
 VALID_PROVIDERS = ("elevenlabs", "deepgram")
+VALID_TTS_STREAM_MODES = ("http_sentence", "websocket")
 
 
 def _camel_to_snake_keys(d: dict | None) -> dict | None:
@@ -125,6 +127,21 @@ def load_config() -> dict:
     # synth library, and the aplay invocation. One number, one place.
     cfg["tts_sample_rate"] = int(cfg.get("tts_sample_rate", 22050))
 
+    # TTS streaming strategy. `http_sentence` (default) buffers gateway
+    # deltas to sentence boundaries and calls the HTTP streaming endpoint
+    # per sentence — works on every account tier. `websocket` feeds
+    # deltas straight into ElevenLabs' realtime websocket for token-level
+    # latency, but requires a paid tier (free accounts get HTTP 403 on
+    # the upgrade). Only consulted when tts_provider == "elevenlabs".
+    cfg["tts_streaming_mode"] = str(
+        cfg.get("tts_streaming_mode", "http_sentence")
+    ).strip().lower()
+    if cfg["tts_streaming_mode"] not in VALID_TTS_STREAM_MODES:
+        raise ValueError(
+            f"voice-bridge.json: unknown tts_streaming_mode "
+            f"{cfg['tts_streaming_mode']!r}; valid: {VALID_TTS_STREAM_MODES}"
+        )
+
     return cfg
 
 
@@ -147,6 +164,7 @@ def _build_voice_provider(role: str, cfg: dict):
             tts_language=cfg.get("elevenlabs_language"),
             tts_voice_settings=cfg.get("elevenlabs_voice_settings"),
             tts_text_normalization=cfg.get("elevenlabs_text_normalization"),
+            tts_stream_mode=cfg.get("tts_streaming_mode", "http_sentence"),
         )
     if name == "deepgram":
         kwargs = {
@@ -172,18 +190,91 @@ def find_input_device(pa: pyaudio.PyAudio) -> int | None:
     return None
 
 
+_AUDIO_DEBUG = os.environ.get("VOICE_BRIDGE_DEBUG_AUDIO") == "1"
+
+
+def _drain_aplay_stderr(stream) -> None:
+    """Forward aplay's stderr line-by-line to the Python logger.
+
+    Runs as a daemon thread; exits when aplay closes stderr.
+    """
+    try:
+        for raw in iter(stream.readline, b""):
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                log.warning("aplay: %s", line)
+    finally:
+        with contextlib.suppress(Exception):
+            stream.close()
+
+
+def _aplay_popen(device: str, sample_rate: int, *, bufsize: int = -1) -> subprocess.Popen:
+    """Spawn aplay for raw S16LE mono PCM at `sample_rate`.
+
+    With `VOICE_BRIDGE_DEBUG_AUDIO=1`, drops `-q` and forwards aplay's
+    stderr to the logger — that's where ALSA prints `underrun!!!` lines.
+    """
+    cmd = ["aplay", "-D", device, "-f", "S16_LE", "-r", str(sample_rate), "-c", "1"]
+    if not _AUDIO_DEBUG:
+        cmd.insert(1, "-q")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE if _AUDIO_DEBUG else subprocess.DEVNULL,
+        bufsize=bufsize,
+    )
+    if _AUDIO_DEBUG and proc.stderr is not None:
+        threading.Thread(
+            target=_drain_aplay_stderr,
+            args=(proc.stderr,),
+            daemon=True,
+        ).start()
+    return proc
+
+
 def play_audio(device: str, audio_data: bytes, sample_rate: int) -> None:
     """Play raw S16LE mono PCM bytes through aplay at `sample_rate`.
 
     `sample_rate` MUST match what the TTS provider produced (we ask it
     for `pcm_<rate>` / `linear16` at the same number) — otherwise aplay
     plays back at the wrong speed/pitch."""
-    proc = subprocess.Popen(
-        ["aplay", "-q", "-D", device, "-f", "S16_LE", "-r", str(sample_rate), "-c", "1"],
-        stdin=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
+    proc = _aplay_popen(device, sample_rate)
     proc.communicate(input=audio_data)
+
+
+def play_audio_stream(device: str, audio_iter: Iterable[bytes], sample_rate: int) -> bool:
+    """Pipe audio chunks through aplay as they arrive.
+
+    aplay is started immediately (so ALSA acquires the device early) and
+    each chunk is written to its stdin the moment it's pulled from
+    `audio_iter`. ALSA's own period buffer absorbs short pauses in the
+    producer (e.g. waiting on the next sentence from TTS). With
+    `bufsize=0`, every write goes straight to the pipe — no Python-level
+    buffering between TTS chunks and ALSA.
+
+    Returns True if at least one chunk was written (i.e. something was
+    actually played), so callers can distinguish "speech happened" from
+    "stream produced nothing".
+    """
+    proc = _aplay_popen(device, sample_rate, bufsize=0)
+    wrote_any = False
+    try:
+        for chunk in audio_iter:
+            if not chunk:
+                continue
+            try:
+                proc.stdin.write(chunk)
+            except BrokenPipeError:
+                # aplay died (device gone, ALSA error). Stop pulling
+                # from the upstream iterators — still need to drain the
+                # process below.
+                break
+            wrote_any = True
+    finally:
+        with contextlib.suppress(Exception):
+            proc.stdin.close()
+        proc.wait()
+    return wrote_any
 
 
 def play_beep(device: str, sample_rate: int) -> None:
@@ -234,6 +325,71 @@ def gateway_chat(base_url: str, token: str, text: str, voice_model: str, session
     except Exception as exc:
         log.error("Gateway error: %s", exc)
         return "Mi dispiace, ho avuto un problema di connessione."
+
+
+GATEWAY_FALLBACK_REPLY = "Mi dispiace, ho avuto un problema di connessione."
+
+
+def gateway_chat_stream(
+    base_url: str,
+    token: str,
+    text: str,
+    voice_model: str,
+    session_key: str = "voice-bridge",
+) -> Iterator[str]:
+    """Same shape as `gateway_chat`, but yields content deltas as they arrive.
+
+    Posts with `stream: true` and parses the OpenAI-style SSE response
+    (`data: {...}\\n\\n`, terminated by `data: [DONE]`). Yields each
+    `choices[0].delta.content` string. Malformed or non-data lines are
+    skipped silently — the OpenAI spec allows comments and keep-alives.
+
+    On transport error this yields the same fallback string `gateway_chat`
+    returns, so the downstream TTS still has *something* to speak. This
+    means an empty stream really does mean "no content" (the model said
+    nothing), distinct from "the request blew up."
+    """
+    import urllib.request
+
+    url = f"{base_url}/v1/chat/completions"
+    payload = json.dumps({
+        "model": voice_model,
+        "messages": [{"role": "user", "content": text}],
+        "max_tokens": 500,
+        "stream": True,
+    }).encode()
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+    }
+    if session_key:
+        headers["X-OpenClaw-Session-Key"] = session_key
+
+    req = urllib.request.Request(url, data=payload, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].lstrip()
+                if data == "[DONE]":
+                    return
+                try:
+                    ev = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                try:
+                    delta = ev["choices"][0].get("delta", {}).get("content")
+                except (KeyError, IndexError, TypeError):
+                    delta = None
+                if delta:
+                    yield delta
+    except Exception as exc:
+        log.error("Gateway streaming error: %s", exc)
+        yield GATEWAY_FALLBACK_REPLY
 
 
 # ---------------------------------------------------------------------------
@@ -312,9 +468,9 @@ def main() -> None:
 
     log.info("Config loaded")
     log.info("STT provider: %s", cfg["stt_provider"])
-    log.info("TTS provider: %s (voice=%s model=%s rate=%dHz)",
+    log.info("TTS provider: %s (voice=%s model=%s rate=%dHz stream=%s)",
              cfg["tts_provider"], cfg["elevenlabs_voice"], cfg["elevenlabs_model"],
-             cfg["tts_sample_rate"])
+             cfg["tts_sample_rate"], cfg["tts_streaming_mode"])
     log.info("Output: %s @ %d Hz", cfg["output_device"], cfg["tts_sample_rate"])
 
     stt = _build_voice_provider("stt", cfg)
@@ -397,18 +553,34 @@ def main() -> None:
 
         log.info("User: %s", text)
 
-        # Gateway chat
-        log.info("Getting response...")
-        reply = gateway_chat(cfg["gateway_base_url"], cfg["gateway_token"], text, cfg["voice_model"], cfg.get("session_key", "voice-bridge"))
-        log.info("Binary: %s", reply[:100])
+        # Streaming pipeline: gateway SSE → TTS (mode-dependent) → aplay
+        # stdin. Each stage is a lazy iterator pulled by the next; aplay
+        # writes the first PCM bytes as soon as the TTS produces them.
+        # First-audio latency is one sentence under `http_sentence` mode
+        # and one token under `websocket` mode (paid tier only).
+        log.info("Streaming response...")
+        text_stream = gateway_chat_stream(
+            cfg["gateway_base_url"],
+            cfg["gateway_token"],
+            text,
+            cfg["voice_model"],
+            cfg.get("session_key", "voice-bridge"),
+        )
+        # Tee deltas through a list so we can still log the full assembled
+        # reply once playback ends. The list lives on the stack of this
+        # turn — no shared state with future turns.
+        collected: list[str] = []
 
-        # TTS
-        log.info("Synthesizing...")
-        audio = tts.synthesize(reply)
+        def _tee(stream: Iterable[str]) -> Iterator[str]:
+            for delta in stream:
+                collected.append(delta)
+                yield delta
 
-        if audio:
-            play_audio(cfg["output_device"], audio, cfg["tts_sample_rate"])
-            log.info("Playback done")
+        audio_stream = tts.synthesize_stream(_tee(text_stream))
+        played = play_audio_stream(cfg["output_device"], audio_stream, cfg["tts_sample_rate"])
+        log.info("Binary: %s", "".join(collected)[:200])
+        if not played:
+            log.info("No audio produced")
 
     hid.stop()
     log.info("Stopped")

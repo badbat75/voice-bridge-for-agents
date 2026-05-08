@@ -9,5 +9,6 @@
   "hid_mute_enabled": true,
   "stt_provider": "elevenlabs",
   "tts_provider": "elevenlabs",
+  "tts_streaming_mode": "http_sentence",
   "session_key": "agent:main:voice-bridge"
 }

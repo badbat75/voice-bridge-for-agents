@@ -24,7 +24,7 @@ import time
 # Set JABRA_HID_DEBUG=0 before invocation to suppress.
 os.environ.setdefault("JABRA_HID_DEBUG", "1")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from jabra_hid import HidMuteMonitor  # noqa: E402
 
 N_PRESSES_DEFAULT = 3

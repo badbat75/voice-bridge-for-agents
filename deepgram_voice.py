@@ -21,6 +21,7 @@ import asyncio
 import io
 import logging
 import wave
+from typing import Iterable, Iterator
 
 import deepgram
 
@@ -78,6 +79,25 @@ class DeepgramVoice:
         except Exception as exc:
             log.error("TTS error: %s", exc)
             return None
+
+    def synthesize_stream(self, text_iter: Iterable[str]) -> Iterator[bytes]:
+        """Buffer all text deltas, then call `synthesize()` and yield the
+        result as a single chunk.
+
+        This is a *compatibility shim*, not real streaming. Aura's REST
+        endpoint doesn't take incremental text input, and the bridge's
+        Italian deployment uses ElevenLabs anyway — so the priority here
+        is just to keep `synthesize_stream` callable on either provider.
+        First-audio latency under this provider is therefore the full
+        gateway-stream + full TTS round-trip, same as the non-streaming
+        path.
+        """
+        text = "".join(text_iter).strip()
+        if not text:
+            return
+        audio = self.synthesize(text)
+        if audio:
+            yield audio
 
     # -----------------------------------------------------------------------
 
