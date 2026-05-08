@@ -1010,8 +1010,14 @@ class VoiceBridge:
                     if not self._write_chunk(proc, item2):
                         break
             finally:
-                with self._player_lock:
-                    self._player_proc = None
+                # Close stdin first so aplay knows there's no more PCM
+                # coming, then wait for it to drain its ALSA buffer.
+                # Crucially, keep `_player_proc` set throughout the wait:
+                # `_is_playing()` is the endpointer's guard against firing
+                # auto-idle prematurely, and clearing the handle before
+                # `proc.wait()` returns would let the idle timer fire
+                # during the audible tail of the reply (the mic would
+                # mute the instant the user hears the end of the message).
                 try:
                     proc.stdin.close()
                 except Exception:
@@ -1027,6 +1033,8 @@ class VoiceBridge:
                         proc.wait(timeout=1.0)
                     except Exception:
                         pass
+                with self._player_lock:
+                    self._player_proc = None
                 self.deezer.unduck()
                 self._idle_reset_pending.set()
 
