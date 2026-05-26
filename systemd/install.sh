@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install (or uninstall) the openclaw-voicebridge user systemd unit
+# Install (or uninstall) the voice-bridge user systemd unit
 # and the matching udev permission rule.
 #
 # The unit is a USER unit (lives under ~/.config/systemd/user) — it
@@ -20,8 +20,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(dirname "$HERE")"
 
-SERVICE_NAME="openclaw-voicebridge.service"
-RULES_NAME="99-openclaw-voicebridge.rules"
+SERVICE_NAME="voice-bridge.service"
+RULES_NAME="99-voice-bridge.rules"
 SERVICE_SRC="$HERE/$SERVICE_NAME"
 RULES_SRC="$HERE/$RULES_NAME"
 USER_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -140,7 +140,10 @@ install_unit() {
     # Sanity: the unit's WorkingDirectory should point at *this* tree.
     # If someone copied this directory elsewhere without editing the
     # service file, starting the unit would launch the wrong instance.
-    if ! grep -qx "WorkingDirectory=$WORKSPACE" "$SERVICE_SRC"; then
+    # Accept both the absolute path and the %h-specifier form
+    # (%h expands to $HOME for a user unit).
+    WORKSPACE_SPEC="${WORKSPACE/#$HOME/%h}"
+    if ! grep -qxE "WorkingDirectory=($WORKSPACE|$WORKSPACE_SPEC)" "$SERVICE_SRC"; then
         echo "WARNING: $SERVICE_NAME has a WorkingDirectory other than this tree."
         say "this script lives under: $WORKSPACE"
         grep "^WorkingDirectory" "$SERVICE_SRC" | sed 's/^/  unit says:        /'

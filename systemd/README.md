@@ -2,20 +2,17 @@
 
 Two files in this directory:
 
-- `openclaw-voicebridge.service` — the unit. Runs `voice-bridge.py`
+- `voice-bridge.service` — the unit. Runs `voice-bridge.py`
   from the in-tree `.venv`. **This is a user unit**: it lives under
   `~/.config/systemd/user` and is managed with `systemctl --user`,
-  no `User=` directive. Edit the absolute paths in `WorkingDirectory=`
-  and `ExecStart=` if your deployment isn't at
-  `/home/openclaw/.openclaw/workspace/voice-bridge`.
-- `99-openclaw-voicebridge.rules` — udev rule that grants the
+  no `User=` directive. Paths use systemd's `%h` specifier (the
+  running user's home), so the unit resolves to `~/MCP/voice-bridge`.
+  Edit the `MCP/voice-bridge` suffix in `WorkingDirectory=` and
+  `ExecStart=` if your checkout lives elsewhere under `$HOME`.
+- `99-voice-bridge.rules` — udev rule that grants the
   `plugdev` group read/write on the Jabra SPEAK 510's `/dev/hidraw*`
   node. The rule does NOT trigger the service — the bridge handles
   device attach/detach via its internal reconnect loop.
-
-The `openclaw-` prefix matches the user's sudo policy for this Pi
-(passwordless `systemctl <verb> openclaw-*` for the `openclaw` user),
-though with a user unit you generally won't need sudo at all.
 
 ## Prerequisites
 
@@ -44,7 +41,7 @@ files is enough — no re-copy needed, just a reload:
 ```bash
 systemctl --user daemon-reload                         # after editing the .service
 sudo udevadm control --reload-rules                    # after editing the .rules
-systemctl --user restart openclaw-voicebridge          # if it was running
+systemctl --user restart voice-bridge                  # if it was running
 ```
 
 The install also runs `udevadm trigger --subsystem-match=hidraw
@@ -69,14 +66,14 @@ hidraw devices — so the new MODE/GROUP take effect without unplug
   loop opens it on the next poll (≤ 2 s).
 - **Bridge crash**: `Restart=on-failure` plus `StartLimitBurst=5`
   over 60 s — restarts up to 5 times, then gives up to avoid a tight
-  crash loop. Check `journalctl --user -u openclaw-voicebridge` to
+  crash loop. Check `journalctl --user -u voice-bridge` to
   see why.
 
 ## Verify
 
 ```bash
-systemctl --user status openclaw-voicebridge
-journalctl --user -u openclaw-voicebridge -f      # watch live logs
+systemctl --user status voice-bridge
+journalctl --user -u voice-bridge -f      # watch live logs
 ```
 
 You should see `[jabra_hid] INFO HID button monitor on /dev/hidraw0`
@@ -86,10 +83,10 @@ press.
 ## Manual control
 
 ```bash
-systemctl --user start openclaw-voicebridge       # start
-systemctl --user stop openclaw-voicebridge        # graceful shutdown (SIGTERM)
-systemctl --user enable openclaw-voicebridge      # start at boot (needs linger)
-systemctl --user disable openclaw-voicebridge     # remove from boot
+systemctl --user start voice-bridge       # start
+systemctl --user stop voice-bridge        # graceful shutdown (SIGTERM)
+systemctl --user enable voice-bridge      # start at boot (needs linger)
+systemctl --user disable voice-bridge     # remove from boot
 ```
 
 ## Why a single long-running unit instead of udev-triggered

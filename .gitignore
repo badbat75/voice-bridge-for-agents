@@ -18,3 +18,7 @@ __pycache__/
 
 # Local backups produced when editing /home/openclaw/.openclaw/openclaw.json
 *.before-*
+
+# Local secrets: API keys + gateway token. Keep this file out of the repo.
+# Copy voice-bridge.secrets.example.json → voice-bridge.secrets.json and fill in.
+voice-bridge.secrets.json

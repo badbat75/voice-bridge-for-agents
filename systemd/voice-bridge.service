@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenClaw Voice Bridge — Jabra mute button to gateway
+Description=Voice Bridge — Jabra speakerphone to gateway voice client
 # This is a *user* unit — installed under ~/.config/systemd/user and
 # managed with `systemctl --user`. It runs as the invoking user (no
 # `User=`) and inherits that user's group memberships, so the user
@@ -9,29 +9,21 @@ Description=OpenClaw Voice Bridge — Jabra mute button to gateway
 # without a login session.
 After=sound.target network-online.target
 Wants=network-online.target
-# Don't spam-restart if the gateway is unreachable at boot — let the
-# bridge log and try, but if it crash-loops fast, back off.
-# (StartLimit* live in [Unit], not [Service], on modern systemd.)
+# Back off if the bridge crash-loops fast (StartLimit* live in [Unit]).
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=/home/openclaw/.openclaw/workspace/voice-bridge
-# Inherit the same secrets the openclaw gateway uses — DEEPGRAM_API_KEY
-# in particular, since voice-bridge.py looks it up as an env fallback
-# before the JSON config (voice-bridge.py:58). The leading `-` makes
-# the file optional: if it's missing the bridge still starts and dies
-# with a clear "No Deepgram API key" message instead of a cryptic
-# systemd "file not found".
-EnvironmentFile=-/home/openclaw/.openclaw/gateway.systemd.env
+# %h is systemd's specifier for the running user's home dir (user unit).
+# Edit the MCP/voice-bridge suffix if your checkout lives elsewhere.
+WorkingDirectory=%h/MCP/voice-bridge
 # Diagnostic: surface aplay's stderr (underrun!!! lines) to the journal.
-# Cheap to leave on; remove once we've ruled out streaming-TTS underruns.
 Environment=VOICE_BRIDGE_DEBUG_AUDIO=1
-ExecStart=/home/openclaw/.openclaw/workspace/voice-bridge/.venv/bin/python /home/openclaw/.openclaw/workspace/voice-bridge/voice-bridge.py
+ExecStart=%h/MCP/voice-bridge/.venv/bin/python %h/MCP/voice-bridge/voice-bridge.py
 Restart=on-failure
 RestartSec=5
-# Voice-bridge handles SIGTERM/SIGINT cleanly: finishes the in-flight
+# The bridge handles SIGTERM/SIGINT cleanly: finishes the in-flight
 # turn, stops the HID thread, exits. The HID monitor's reconnect loop
 # parks on a threading.Event between attempts, so a missing Jabra
 # costs ~0 CPU — no need for the unit to stop and restart on unplug.

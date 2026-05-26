@@ -59,6 +59,10 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_HERE, "voice-bridge.json")
+# Local, gitignored secrets file (API keys + gateway token). The bridge
+# is self-contained: everything it needs lives in this folder. See
+# voice-bridge.secrets.example.json for the expected shape.
+SECRETS_PATH = os.path.join(_HERE, "voice-bridge.secrets.json")
 
 VALID_PROVIDERS = ("elevenlabs", "deepgram")
 VALID_TTS_STREAM_MODES = ("http_sentence", "websocket")
@@ -83,48 +87,61 @@ def _camel_to_snake_keys(d: dict | None) -> dict | None:
     return out
 
 
+def _read_json(path: str) -> dict:
+    """Read a JSON object from `path`, or {} if it's missing/unreadable.
+
+    Used for the optional local secrets file, which is allowed to be
+    absent (e.g. a fresh checkout before keys are filled in).
+    """
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
 
-    # Secrets from gateway config
-    gw_path = os.path.expanduser("~/.openclaw/openclaw.json")
-    with open(gw_path) as f:
-        gw = json.load(f)
+    # Self-contained config: secrets live in a local, gitignored file in
+    # this folder. Everything else is in voice-bridge.json above.
+    secrets = _read_json(SECRETS_PATH)
 
-    cfg["gateway_token"] = gw.get("gateway", {}).get("auth", {}).get("token", "") or gw.get("token", "")
-    cfg["deepgram_key"] = os.environ.get("DEEPGRAM_API_KEY", "") or gw.get("stt", {}).get("deepgram", {}).get("apiKey", "")
-
-    # Pull Deepgram STT settings from the openclaw `tools.media.audio`
-    # section: model name from `models[where provider==deepgram]`, and
-    # all extra kwargs (smart_format, punctuate, detect_language, ...)
-    # straight from `providerOptions.deepgram`. Already snake_case in
-    # openclaw — no key translation needed (unlike ElevenLabs).
-    audio = gw.get("tools", {}).get("media", {}).get("audio", {}) or {}
-    cfg["deepgram_stt_options"] = audio.get("providerOptions", {}).get("deepgram") or {}
-    cfg["deepgram_stt_model"] = next(
-        (m.get("model") for m in audio.get("models") or [] if m.get("provider") == "deepgram"),
-        "",
+    # --- Secrets: local file first, env override for Deepgram ---
+    cfg["gateway_token"] = secrets.get("gateway_token", "")
+    cfg["deepgram_key"] = (
+        os.environ.get("DEEPGRAM_API_KEY", "")
+        or secrets.get("deepgram_api_key", "")
     )
 
-    # Pull the entire ElevenLabs TTS block from the openclaw gateway
-    # config — voice id, model, language, voice_settings, text
-    # normalization. The bridge does not invent its own values: whatever
-    # openclaw says about TTS is what we use. (Note the key is `modelId`
-    # in openclaw's schema, not `model`.)
-    el = gw.get("messages", {}).get("tts", {}).get("providers", {}).get("elevenlabs", {})
-    cfg["elevenlabs_key"] = el.get("apiKey", "")
-    cfg["elevenlabs_voice"] = el.get("voiceId", "")
-    cfg["elevenlabs_model"] = el.get("modelId", "")
+    # --- Deepgram STT settings ---
+    # The `deepgram` block in voice-bridge.json: `sttOptions` are extra
+    # kwargs (smart_format, punctuate, ...) passed verbatim, `sttModel`
+    # is the model name. Only used if a Deepgram provider is selected.
+    dg_local = cfg.get("deepgram") or {}
+    cfg["deepgram_stt_options"] = dg_local.get("sttOptions") or {}
+    cfg["deepgram_stt_model"] = dg_local.get("sttModel") or ""
+
+    # --- ElevenLabs TTS settings ---
+    # The `elevenlabs` block in voice-bridge.json holds the non-secret
+    # bits (voice id, model, language, voice_settings, text
+    # normalization); the API key comes from the secrets file. Keys stay
+    # camelCase here (`modelId`, not `model`); voiceSettings are
+    # translated to the SDK's snake_case at this boundary.
+    el = cfg.get("elevenlabs") or {}
+    cfg["elevenlabs_key"] = secrets.get("elevenlabs_api_key", "")
+    cfg["elevenlabs_voice"] = el.get("voiceId", "") or ""
+    cfg["elevenlabs_model"] = el.get("modelId", "") or ""
     cfg["elevenlabs_language"] = el.get("languageCode")
     cfg["elevenlabs_voice_settings"] = _camel_to_snake_keys(el.get("voiceSettings")) or None
     cfg["elevenlabs_text_normalization"] = el.get("applyTextNormalization")
 
-    cfg["voice_model"] = gw.get("agents", {}).get("defaults", {}).get("voiceBridgeModel", "openclaw")
+    cfg["voice_model"] = cfg.get("voice_model") or "openclaw"
 
-    # Session key for the voice bridge: local voice-bridge.json wins,
-    # then gateway config, then a literal fallback.
-    cfg["session_key"] = cfg.get("session_key") or gw.get("voice", {}).get("sessionKey") or "voice-bridge"
+    # Session key for the voice bridge: from voice-bridge.json, with a
+    # literal fallback.
+    cfg["session_key"] = cfg.get("session_key") or "voice-bridge"
 
     # Provider selection lives in voice-bridge.json itself
     # (`stt_provider`, `tts_provider`). Missing keys → default to

@@ -41,24 +41,21 @@ python3 -m venv .venv
 
 There's no global Python tooling for `deepgram`, `elevenlabs`, `pyaudio` on the host Pi, so always install into the local `.venv`, never `pip install --user`.
 
-## Config — two files, merged at startup
+## Config — self-contained in this folder
 
-`load_config()` reads:
+The bridge is **self-contained**: everything it needs lives in this directory. `load_config()` reads two local files and edits take effect on `systemctl --user restart voice-bridge`:
 
-1. `voice-bridge.json` (this directory): everything local to the bridge. Runtime knobs:
+1. `voice-bridge.json` (tracked, **no secrets**): all non-secret config.
    - **Audio I/O**: `sample_rate` (mic), `chunk_size` (PyAudio frames per read), `tts_sample_rate` (TTS output + `aplay` rate — MUST match), `output_device` (ALSA PCM name).
    - **Endpointer / VAD**: `vad_rms_threshold` (per-chunk energy above which a chunk counts as speech; same `sum(s²)/sqrt(N)` metric the legacy code used, NOT true RMS — see *Architecture notes*), `silence_timeout_ms` (pause after speech that commits an utterance; values <600 ms split natural between-word pauses), `idle_timeout_ms` (cumulative silence after which the mic stream is closed; set to `0` to disable auto-idle).
-   - **Control**: `hid_mute_enabled` (whether the Jabra HID button toggles the bridge), `stt_provider` / `tts_provider` (`elevenlabs` or `deepgram`), `tts_streaming_mode` (see *Architecture notes*), `session_key` (sent verbatim as `X-OpenClaw-Session-Key`; see session-key note below).
+   - **Control**: `hid_mute_enabled` (whether the Jabra HID button toggles the bridge), `stt_provider` / `tts_provider` (`elevenlabs` or `deepgram`), `tts_streaming_mode` (see *Architecture notes*), `session_key` (sent verbatim as `X-OpenClaw-Session-Key`; see session-key note below), `voice_model` (gateway agent/model; defaults to `"openclaw"` → gateway's default agent, currently `main`), `gateway_base_url`.
+   - **`elevenlabs` block** (non-secret TTS settings): `voiceId`, `modelId` (note camelCase — `modelId`, not `model`), `languageCode`, `applyTextNormalization`, `voiceSettings`. The `voiceSettings` keys are converted from camelCase (`similarityBoost`, `useSpeakerBoost`) to the SDK's snake_case (`similarity_boost`, `use_speaker_boost`) at load-config time. The bridge does not fabricate these — whatever's here is what's used.
+   - **`deepgram` block**: `sttModel` (e.g. `nova-3`) and `sttOptions` (extra STT kwargs like `smart_format`, `punctuate`, `detect_language`, passed verbatim — already snake_case). Only used if a Deepgram provider is selected.
+2. `voice-bridge.secrets.json` (**gitignored**, secrets only): `gateway_token` (bearer for `/v1/chat/completions`), `elevenlabs_api_key`, `deepgram_api_key`. Copy `voice-bridge.secrets.example.json` → `voice-bridge.secrets.json` and fill in on a fresh checkout. `DEEPGRAM_API_KEY` env var, if set, overrides `deepgram_api_key`.
 
-   Edit and `systemctl --user restart openclaw-voicebridge` to apply.
-2. `~/.openclaw/openclaw.json` (gateway config, owned by the wider OpenClaw system): all secrets and voice/agent settings. Specifically pulls:
-   - `gateway.auth.token` → bearer for `/v1/chat/completions`
-   - `stt.deepgram.apiKey` (or `DEEPGRAM_API_KEY` env override) — only validated if a Deepgram provider is selected
-   - `messages.tts.providers.elevenlabs.*` — the **whole** ElevenLabs TTS block is consumed: `apiKey`, `voiceId`, `modelId` (note camelCase — earlier code looked for `model` and silently fell back to a hardcoded multilingual_v2), `voiceSettings`, `languageCode`, `applyTextNormalization`. The bridge does not fabricate any of these values. The `voiceSettings` keys are converted from openclaw's camelCase (`similarityBoost`, `useSpeakerBoost`) to the SDK's snake_case (`similarity_boost`, `use_speaker_boost`) at load-config time.
+To switch which voice provider is used, or to change any voice/agent behavior, edit `voice-bridge.json` (secrets go in `voice-bridge.secrets.json`). Never commit real keys — they belong only in the gitignored secrets file. `load_config()` reads **only** these two local files; the bridge has no dependency on the wider OpenClaw gateway config.
 
-> **Schema gotcha (gateway v2026.5.5).** Earlier revisions of this doc described `agents.defaults.voiceBridgeModel` and a top-level `voice.sessionKey` block in `~/.openclaw/openclaw.json`. **Both are now rejected by the gateway's config schema** — adding them makes the gateway hard-crash at startup with `Unrecognized key: "voiceBridgeModel"` / `Unrecognized key: "voice"` (at runtime it merely "skips reload", which masks the bomb until the next restart). The bridge still reads them defensively as a fallback, but in practice: model defaults to `"openclaw"` (→ gateway's default agent, currently `main`), and the session key lives in `voice-bridge.json`. Don't put either back into the gateway config without verifying the schema accepts them again.
-
-When changing voice/agent behavior, edit `~/.openclaw/openclaw.json`, **not** this script — except for `session_key`, which lives in `voice-bridge.json` for the reason above. Don't hardcode keys in `voice-bridge.json`. To switch which voice provider is used, edit `voice-bridge.json`.
+> **Don't move `voice_model` / `session_key` into the gateway config.** These live in `voice-bridge.json`. The gateway's config schema **rejects** `agents.defaults.voiceBridgeModel` and a top-level `voice.sessionKey` block — adding them makes the gateway hard-crash at startup (`Unrecognized key: ...`; at runtime it merely "skips reload", masking the bomb until the next restart). `voice_model` defaults to `"openclaw"` → the gateway's default agent (currently `main`).
 
 ## Architecture notes that aren't obvious from one file
 
@@ -89,8 +86,8 @@ When changing voice/agent behavior, edit `~/.openclaw/openclaw.json`, **not** th
 
 Run as a long-lived **user** systemd process on the Pi. `SIGTERM`/`SIGINT` are handled — it finishes any in-flight turn, stops the HID thread, and exits cleanly. Don't add a PID file or daemonization here; that's the unit's job.
 
-`systemd/openclaw-voicebridge.service` is a user unit (linked into `~/.config/systemd/user/`, no `User=` directive). It runs as the invoking user (`openclaw`) and inherits that user's groups; `audio` is needed for ALSA, `plugdev` for /dev/hidraw* (granted by the udev rule). Linger (`loginctl enable-linger`) makes the user-mode systemd start at boot without a login session.
+`systemd/voice-bridge.service` is a user unit (linked into `~/.config/systemd/user/`, no `User=` directive). It runs as the invoking user (`openclaw`) and inherits that user's groups; `audio` is needed for ALSA, `plugdev` for /dev/hidraw* (granted by the udev rule). Linger (`loginctl enable-linger`) makes the user-mode systemd start at boot without a login session.
 
-`systemd/99-openclaw-voicebridge.rules` (udev) sets `GROUP=plugdev MODE=0660` on the Jabra's hidraw node so the user can open it. The rule does **not** trigger the service — the bridge's reconnect loop handles plug/unplug on its own (`_poll_loop` parks on `_shutdown.wait(2.0)` between `_find_device()` attempts). This decoupling is what enabled moving from system to user systemd: udev can't directly start user units.
+`systemd/99-voice-bridge.rules` (udev) sets `GROUP=plugdev MODE=0660` on the Jabra's hidraw node so the user can open it. The rule does **not** trigger the service — the bridge's reconnect loop handles plug/unplug on its own (`_poll_loop` parks on `_shutdown.wait(2.0)` between `_find_device()` attempts). This decoupling is what enabled moving from system to user systemd: udev can't directly start user units.
 
-`systemd/install.sh` does the link + reload + linger + group sanity checks; see `systemd/README.md` for details. The `openclaw-` prefix matches the Pi's passwordless sudo policy for this user, though most operations on the user unit don't need sudo at all.
+`systemd/install.sh` does the link + reload + linger + group sanity checks; see `systemd/README.md` for details. Most operations on the user unit don't need sudo at all.

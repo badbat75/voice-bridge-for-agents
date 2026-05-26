@@ -1,17 +1,39 @@
 {
-  "gateway_base_url": "http://127.0.0.1:18789",
+  "gateway_base_url": "http://127.0.0.1:42617",
   "sample_rate": 16000,
   "tts_sample_rate": 24000,
   "chunk_size": 1024,
   "vad_rms_threshold": 1200000,
   "silence_timeout_ms": 1000,
   "idle_timeout_ms": 5000,
-  "output_device": "plug:sw_out",
+  "output_device": "plug:jabra_dmix",
   "hid_mute_enabled": true,
   "stt_provider": "elevenlabs",
   "tts_provider": "elevenlabs",
   "tts_streaming_mode": "http_sentence",
   "session_key": "agent:main:voice-bridge",
+  "voice_model": "openclaw",
+  "elevenlabs": {
+    "voiceId": "8KInRSd4DtD5L5gK7itu",
+    "modelId": "eleven_v3",
+    "languageCode": "it",
+    "applyTextNormalization": "auto",
+    "voiceSettings": {
+      "stability": 0.7,
+      "similarityBoost": 0.5,
+      "style": 0,
+      "useSpeakerBoost": false,
+      "speed": 1
+    }
+  },
+  "deepgram": {
+    "sttModel": "nova-3",
+    "sttOptions": {
+      "detect_language": true,
+      "punctuate": true,
+      "smart_format": true
+    }
+  },
   "deezer_connect": {
     "enabled": true,
     "base_url": "http://localhost:8980",

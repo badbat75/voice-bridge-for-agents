@@ -9,7 +9,7 @@ needs to actually run.
 | `test_hid_interactive.py` | **Jabra plugged in** | no | Manual: prompts the operator to press the button N times and asserts edge counts. Run on the Pi. |
 | `test_voice_providers.py` | no | no | Provider interface/contract, defaults, config plumbing, factory wiring. Uses dummy API keys; no outbound calls. |
 | `test_streaming_pipeline.py` | no | loopback only | SSE parser + ElevenLabs / Deepgram `synthesize_stream` (SDK mocked) + `play_audio_stream` (Popen mocked) + a glue test that wires all three. |
-| `test_gateway_integration.py` | no | live gateway | Real round-trip against the OpenClaw gateway using the merged `~/.openclaw/openclaw.json` + `voice-bridge.json`. Auto-skips if the gateway isn't reachable. |
+| `test_gateway_integration.py` | no | live gateway | Real round-trip against the OpenClaw gateway using the local `voice-bridge.json` + `voice-bridge.secrets.json`. Auto-skips if the gateway isn't reachable. |
 
 ## Running
 
