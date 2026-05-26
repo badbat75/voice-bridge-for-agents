@@ -1,5 +1,6 @@
 {
   "gateway_base_url": "http://127.0.0.1:42617",
+  "gateway_backend": "zeroclaw",
   "sample_rate": 16000,
   "tts_sample_rate": 24000,
   "chunk_size": 1024,

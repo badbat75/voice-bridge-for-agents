@@ -66,6 +66,7 @@ SECRETS_PATH = os.path.join(_HERE, "voice-bridge.secrets.json")
 
 VALID_PROVIDERS = ("elevenlabs", "deepgram")
 VALID_TTS_STREAM_MODES = ("http_sentence", "websocket")
+VALID_GATEWAY_BACKENDS = ("openclaw", "zeroclaw")
 
 
 def _camel_to_snake_keys(d: dict | None) -> dict | None:
@@ -138,6 +139,18 @@ def load_config() -> dict:
     cfg["elevenlabs_text_normalization"] = el.get("applyTextNormalization")
 
     cfg["voice_model"] = cfg.get("voice_model") or "openclaw"
+
+    # Which gateway protocol the worker speaks. `openclaw` (default) posts
+    # to `/v1/chat/completions` with OpenAI-style SSE; `zeroclaw` posts to
+    # `/webhook` and parses a single non-streaming JSON reply. Selecting a
+    # backend also implies which gateway `gateway_base_url`/`gateway_token`
+    # point at — they are not interchangeable.
+    cfg["gateway_backend"] = str(cfg.get("gateway_backend", "openclaw")).strip().lower()
+    if cfg["gateway_backend"] not in VALID_GATEWAY_BACKENDS:
+        raise ValueError(
+            f"voice-bridge.json: unknown gateway_backend "
+            f"{cfg['gateway_backend']!r}; valid: {VALID_GATEWAY_BACKENDS}"
+        )
 
     # Session key for the voice bridge: from voice-bridge.json, with a
     # literal fallback.
@@ -488,6 +501,51 @@ def gateway_chat_stream(
                     delta = None
                 if delta:
                     yield delta
+    except Exception as exc:
+        log.error("Gateway streaming error: %s", exc)
+        yield GATEWAY_FALLBACK_REPLY
+
+
+def gateway_chat_stream_zeroclaw(
+    base_url: str,
+    token: str,
+    text: str,
+) -> Iterator[str]:
+    """zeroclaw gateway leg — same iterator contract as `gateway_chat_stream`.
+
+    zeroclaw's gateway is NOT OpenAI-compatible: it exposes `POST /webhook`
+    expecting ``{"message": "..."}`` with ``Authorization: Bearer <token>``
+    and replies with a single, non-streaming JSON ``{"model": ..., "response":
+    "..."}``. There is no SSE and no session header — conversational context
+    is keyed by the bearer token itself (the paired token *is* the session),
+    so `voice_model` and `session_key` have no place here.
+
+    The whole reply text is yielded as one delta; the downstream sentence
+    buffer (`http_sentence` TTS mode) splits it for synthesis. On transport
+    error this yields the same fallback string the OpenClaw leg uses, so the
+    TTS stage always has something to speak.
+    """
+    import urllib.request
+
+    url = f"{base_url}/webhook"
+    payload = json.dumps({"message": text}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    req = urllib.request.Request(url, data=payload, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', url, resp.status, resp.reason)
+            body = resp.read().decode("utf-8", errors="replace")
+        try:
+            reply = (json.loads(body).get("response") or "").strip()
+        except json.JSONDecodeError:
+            log.error("zeroclaw gateway: non-JSON body: %.200s", body)
+            reply = ""
+        if reply:
+            yield reply
     except Exception as exc:
         log.error("Gateway streaming error: %s", exc)
         yield GATEWAY_FALLBACK_REPLY
@@ -930,17 +988,27 @@ class VoiceBridge:
                 continue
             log.info("User: %s", text)
 
-            log.info("Worker: → gateway %s (model=%s session=%s)",
-                     self.cfg["gateway_base_url"],
-                     self.cfg["voice_model"],
-                     self.cfg.get("session_key", "voice-bridge"))
-            text_stream = gateway_chat_stream(
-                self.cfg["gateway_base_url"],
-                self.cfg["gateway_token"],
-                text,
-                self.cfg["voice_model"],
-                self.cfg.get("session_key", "voice-bridge"),
-            )
+            backend = self.cfg.get("gateway_backend", "openclaw")
+            if backend == "zeroclaw":
+                log.info("Worker: → gateway %s (backend=zeroclaw)",
+                         self.cfg["gateway_base_url"])
+                text_stream = gateway_chat_stream_zeroclaw(
+                    self.cfg["gateway_base_url"],
+                    self.cfg["gateway_token"],
+                    text,
+                )
+            else:
+                log.info("Worker: → gateway %s (backend=openclaw model=%s session=%s)",
+                         self.cfg["gateway_base_url"],
+                         self.cfg["voice_model"],
+                         self.cfg.get("session_key", "voice-bridge"))
+                text_stream = gateway_chat_stream(
+                    self.cfg["gateway_base_url"],
+                    self.cfg["gateway_token"],
+                    text,
+                    self.cfg["voice_model"],
+                    self.cfg.get("session_key", "voice-bridge"),
+                )
             collected: list[str] = []
 
             def _tee(s: Iterable[str]) -> Iterator[str]:
