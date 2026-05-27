@@ -75,9 +75,45 @@ class GatewayChatIntegrationTest(unittest.TestCase):
         for key in ("gateway_base_url", "gateway_token", "voice_model", "session_key"):
             self.assertTrue(self.cfg.get(key), f"cfg[{key!r}] is empty")
 
+    def _stream_for_backend(self, prompt: str):
+        """Return the delta iterator for whichever gateway leg the merged
+        cfg selects, so this test exercises the protocol actually in use
+        (openclaw SSE, zeroclaw webhook, or zeroclaw_ws WebSocket)."""
+        backend = self.cfg.get("gateway_backend", "openclaw")
+        if backend == "zeroclaw_ws":
+            return self.vb.gateway_chat_stream_zeroclaw_ws(
+                self.cfg["gateway_base_url"],
+                self.cfg["gateway_token"],
+                prompt,
+                self.cfg.get("gateway_agent", "default"),
+                self.cfg.get("session_key", "voice-bridge"),
+            )
+        if backend == "zeroclaw":
+            return self.vb.gateway_chat_stream_zeroclaw(
+                self.cfg["gateway_base_url"],
+                self.cfg["gateway_token"],
+                prompt,
+            )
+        return self.vb.gateway_chat_stream(
+            self.cfg["gateway_base_url"],
+            self.cfg["gateway_token"],
+            prompt,
+            self.cfg["voice_model"],
+            self.cfg.get("session_key", "voice-bridge"),
+        )
+
     def test_chat_completion_round_trip(self) -> None:
         """Send a short Italian prompt, expect a non-empty reply that
-        is NOT the bridge's hardcoded exception fallback."""
+        is NOT the bridge's hardcoded exception fallback.
+
+        Non-streaming `gateway_chat` is the openclaw `/v1/chat/completions`
+        primitive only — the zeroclaw legs have no synchronous equivalent,
+        so skip there (the streaming test below covers them)."""
+        if self.cfg.get("gateway_backend", "openclaw") != "openclaw":
+            self.skipTest(
+                f"gateway_chat is openclaw-only; backend is "
+                f"{self.cfg.get('gateway_backend')!r}"
+            )
         prompt = "Rispondi con una sola parola: ok"
         t0 = time.monotonic()
         reply = self.vb.gateway_chat(
@@ -115,13 +151,7 @@ class GatewayChatIntegrationTest(unittest.TestCase):
         t0 = time.monotonic()
         deltas: list[str] = []
         first_delta_at: float | None = None
-        for delta in self.vb.gateway_chat_stream(
-            self.cfg["gateway_base_url"],
-            self.cfg["gateway_token"],
-            prompt,
-            self.cfg["voice_model"],
-            self.cfg.get("session_key", "voice-bridge"),
-        ):
+        for delta in self._stream_for_backend(prompt):
             if first_delta_at is None:
                 first_delta_at = time.monotonic() - t0
             deltas.append(delta)

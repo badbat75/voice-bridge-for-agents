@@ -61,12 +61,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_HERE, "voice-bridge.json")
 # Local, gitignored secrets file (API keys + gateway token). The bridge
 # is self-contained: everything it needs lives in this folder. See
-# voice-bridge.secrets.example.json for the expected shape.
+# resources/voice-bridge.secrets.example.json for the expected shape.
 SECRETS_PATH = os.path.join(_HERE, "voice-bridge.secrets.json")
 
 VALID_PROVIDERS = ("elevenlabs", "deepgram")
 VALID_TTS_STREAM_MODES = ("http_sentence", "websocket")
-VALID_GATEWAY_BACKENDS = ("openclaw", "zeroclaw")
+VALID_GATEWAY_BACKENDS = ("openclaw", "zeroclaw", "zeroclaw_ws")
 
 
 def _camel_to_snake_keys(d: dict | None) -> dict | None:
@@ -116,13 +116,18 @@ def load_config() -> dict:
         or secrets.get("deepgram_api_key", "")
     )
 
-    # --- Deepgram STT settings ---
+    # --- Deepgram STT/TTS settings ---
     # The `deepgram` block in voice-bridge.json: `sttOptions` are extra
     # kwargs (smart_format, punctuate, ...) passed verbatim, `sttModel`
-    # is the model name. Only used if a Deepgram provider is selected.
+    # is the STT model name, `ttsModel` is the Aura TTS voice model.
+    # Deepgram TTS has no separate `language` param — the language is
+    # baked into the voice model name (e.g. `aura-2-thalia-en` is English,
+    # `aura-2-livia-it` is Italian), so picking an Italian voice IS how you
+    # get Italian speech. Only used if a Deepgram provider is selected.
     dg_local = cfg.get("deepgram") or {}
     cfg["deepgram_stt_options"] = dg_local.get("sttOptions") or {}
     cfg["deepgram_stt_model"] = dg_local.get("sttModel") or ""
+    cfg["deepgram_tts_model"] = dg_local.get("ttsModel") or ""
 
     # --- ElevenLabs TTS settings ---
     # The `elevenlabs` block in voice-bridge.json holds the non-secret
@@ -138,19 +143,40 @@ def load_config() -> dict:
     cfg["elevenlabs_voice_settings"] = _camel_to_snake_keys(el.get("voiceSettings")) or None
     cfg["elevenlabs_text_normalization"] = el.get("applyTextNormalization")
 
+    # Output softvol level re-asserted at startup (see `_apply_output_volume`).
+    # The `output_volume` block targets the `voice_out` softvol control —
+    # independent from deezer-connect's player gain. ALSA resets a softvol
+    # control to 100% when it first re-creates it after a reboot, so the
+    # bridge pins the configured level on every start. Missing block / keys
+    # default to 100% on the conventional VoiceBridge control / card 1.
+    ov = cfg.get("output_volume") or {}
+    cfg["output_volume_control"] = ov.get("control", "VoiceBridge")
+    cfg["output_volume_card"] = ov.get("card", 1)
+    cfg["output_volume_percent"] = int(ov.get("percent", 100))
+
     cfg["voice_model"] = cfg.get("voice_model") or "openclaw"
 
     # Which gateway protocol the worker speaks. `openclaw` (default) posts
     # to `/v1/chat/completions` with OpenAI-style SSE; `zeroclaw` posts to
-    # `/webhook` and parses a single non-streaming JSON reply. Selecting a
-    # backend also implies which gateway `gateway_base_url`/`gateway_token`
-    # point at — they are not interchangeable.
+    # `/webhook` and parses a single non-streaming JSON reply; `zeroclaw_ws`
+    # streams over the `/ws/chat` WebSocket and consumes only `chunk` frames
+    # (the reasoning arrives in separate `thinking` frames and is dropped —
+    # this is why `zeroclaw_ws` keeps deepseek-reasoner's chain-of-thought
+    # out of TTS, where the lossy `/webhook` leg cannot). Selecting a backend
+    # also implies which gateway `gateway_base_url`/`gateway_token` point at —
+    # they are not interchangeable.
     cfg["gateway_backend"] = str(cfg.get("gateway_backend", "openclaw")).strip().lower()
     if cfg["gateway_backend"] not in VALID_GATEWAY_BACKENDS:
         raise ValueError(
             f"voice-bridge.json: unknown gateway_backend "
             f"{cfg['gateway_backend']!r}; valid: {VALID_GATEWAY_BACKENDS}"
         )
+
+    # Agent alias for the `/ws/chat` WebSocket leg (`zeroclaw_ws` backend
+    # only). zeroclaw requires an explicit `?agent=<alias>`; the runtime
+    # synthesizes a `default` agent even when `[agents]` is empty in its
+    # config, so `default` is the safe fallback. Ignored by other backends.
+    cfg["gateway_agent"] = (cfg.get("gateway_agent") or "default").strip()
 
     # Session key for the voice bridge: from voice-bridge.json, with a
     # literal fallback.
@@ -252,6 +278,8 @@ def _build_voice_provider(role: str, cfg: dict):
         }
         if cfg.get("deepgram_stt_model"):
             kwargs["stt_model"] = cfg["deepgram_stt_model"]
+        if cfg.get("deepgram_tts_model"):
+            kwargs["tts_model"] = cfg["deepgram_tts_model"]
         return DeepgramVoice(**kwargs)
     raise ValueError(f"unknown provider: {name}")
 
@@ -308,6 +336,43 @@ def _aplay_popen(device: str, sample_rate: int, *, bufsize: int = -1) -> subproc
             daemon=True,
         ).start()
     return proc
+
+
+def _apply_output_volume(cfg: dict) -> None:
+    """Re-assert the configured softvol level on the output control.
+
+    The `voice_out` softvol control gives the bridge a volume independent
+    from deezer-connect's player gain. ALSA creates that control lazily on
+    first PCM open and resets it to 100% after a reboot, so we (1) open the
+    device with a brief silent buffer to instantiate the control, then
+    (2) set it with `amixer`. Best-effort: any failure is logged and
+    swallowed — a missing mixer must never take the bridge down (it just
+    means the level stays at ALSA's 100% default)."""
+    control = cfg.get("output_volume_control")
+    card = cfg.get("output_volume_card")
+    percent = int(cfg.get("output_volume_percent", 100))
+    if not control or card is None:
+        return
+    device = cfg["output_device"]
+    rate = int(cfg["tts_sample_rate"])
+    # ~50 ms of silence: enough to make ALSA open the PCM and create the
+    # softvol control element, inaudible since every sample is zero.
+    silence = b"\x00\x00" * (rate // 20)
+    try:
+        proc = _aplay_popen(device, rate)
+        proc.communicate(input=silence, timeout=5)
+    except Exception as exc:
+        log.warning("output volume: could not prime %s (%s); "
+                    "amixer set may fail", device, exc)
+    try:
+        subprocess.run(
+            ["amixer", "-c", str(card), "sset", control, f"{percent}%"],
+            check=True, capture_output=True, timeout=5,
+        )
+        log.info("Output volume: %s on card %s → %d%%", control, card, percent)
+    except Exception as exc:
+        log.warning("output volume: amixer set %s on card %s failed: %s",
+                    control, card, exc)
 
 
 def play_audio(device: str, audio_data: bytes, sample_rate: int) -> None:
@@ -551,6 +616,82 @@ def gateway_chat_stream_zeroclaw(
         yield GATEWAY_FALLBACK_REPLY
 
 
+def gateway_chat_stream_zeroclaw_ws(
+    base_url: str,
+    token: str,
+    text: str,
+    agent: str = "default",
+    session_id: str = "voice-bridge",
+) -> Iterator[str]:
+    """zeroclaw `/ws/chat` WebSocket leg — same iterator contract as the others.
+
+    Unlike `/webhook` (non-streaming, which returns the tool loop's whole
+    `accumulated_display_text` — for a reasoning model that string is the
+    chain-of-thought narration *concatenated* with the answer), the WS leg
+    streams typed frames and keeps reasoning separate:
+      - ``{"type":"chunk","content":...}``    → the actual answer (yielded)
+      - ``{"type":"thinking","content":...}`` → reasoning (dropped — never TTS'd)
+      - ``tool_call`` / ``tool_result``       → tool activity (dropped)
+      - ``approval_request``                   → auto-denied (voice can't approve)
+      - ``done``                               → end of turn (its `full_response`
+                                                 is the same lossy string; ignored)
+
+    Connects to ``ws(s)://<host>/ws/chat?agent=<agent>&session_id=<id>`` with
+    the paired token as the ``?token=`` query param. Conversational context is
+    keyed by ``session_id`` (the gateway namespaces it as ``gw_<id>``), so a
+    stable id keeps every turn in the same session. On any transport error this
+    yields the shared fallback string so the TTS stage always has something to
+    speak.
+    """
+    from urllib.parse import urlsplit, urlunsplit, urlencode
+    from websockets.sync.client import connect
+
+    parts = urlsplit(base_url)
+    ws_scheme = "wss" if parts.scheme == "https" else "ws"
+    query = urlencode({"agent": agent, "session_id": session_id, "token": token})
+    url = urlunsplit((ws_scheme, parts.netloc, "/ws/chat", query, ""))
+
+    try:
+        # open_timeout caps the upgrade; the per-recv timeout below caps each
+        # frame wait so a stalled turn can't hang the worker forever.
+        with connect(url, max_size=None, open_timeout=30) as ws:
+            log.info("WS connect: %s/ws/chat (agent=%s session=%s)",
+                     base_url, agent, session_id)
+            ws.send(json.dumps({"type": "message", "content": text}))
+            while True:
+                raw = ws.recv(timeout=120)
+                try:
+                    frame = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                ftype = frame.get("type")
+                if ftype == "chunk":
+                    delta = frame.get("content")
+                    if delta:
+                        yield delta
+                elif ftype == "done":
+                    return
+                elif ftype == "error":
+                    log.error("WS gateway error frame: %s",
+                              frame.get("message", raw[:200]))
+                    return
+                elif ftype == "approval_request":
+                    # Voice has no interactive approval path; deny so the turn
+                    # finishes instead of blocking on a prompt no one answers.
+                    log.info("WS approval_request for tool %r → auto-deny",
+                             frame.get("tool"))
+                    ws.send(json.dumps({
+                        "type": "approval_response",
+                        "request_id": frame.get("request_id"),
+                        "decision": "deny",
+                    }))
+                # thinking / tool_call / tool_result / session_start /
+                # chunk_reset / agent_end etc. are intentionally dropped.
+    except Exception as exc:
+        log.error("Gateway WS streaming error: %s", exc)
+        yield GATEWAY_FALLBACK_REPLY
+
+
 # ---------------------------------------------------------------------------
 # Async pipeline orchestrator
 # ---------------------------------------------------------------------------
@@ -722,6 +863,9 @@ class VoiceBridge:
         # in-flight reply starts playing — see `_player_loop`.
         self._auto_idled.set()
         self.hid.set_led(muted=True)
+        # Mute → stop ducking deezer-connect (ducking tracks mute state,
+        # not playback; no-op if disabled / not currently ducked).
+        self.deezer.unduck()
 
     def _on_hid_press(self) -> None:
         if self.recording.is_set():
@@ -737,6 +881,9 @@ class VoiceBridge:
             self._force_commit.set()
             self.recording.clear()
             self.hid.set_led(muted=True)
+            # Mute → unduck, even if a reply is still playing (ducking
+            # tracks mute state now, not the aplay lifecycle).
+            self.deezer.unduck()
         else:
             log.info("HID press: resume recording")
             # Bump gen so any stragglers from before (e.g. an old
@@ -746,6 +893,8 @@ class VoiceBridge:
             self._bump_gen()
             self.recording.set()
             self.hid.set_led(muted=False)
+            # Unmute → duck deezer-connect for the whole listening window.
+            self.deezer.duck()
 
     # -- thread loops --------------------------------------------------
     def _hid_loop(self) -> None:
@@ -989,7 +1138,19 @@ class VoiceBridge:
             log.info("User: %s", text)
 
             backend = self.cfg.get("gateway_backend", "openclaw")
-            if backend == "zeroclaw":
+            if backend == "zeroclaw_ws":
+                log.info("Worker: → gateway %s (backend=zeroclaw_ws agent=%s session=%s)",
+                         self.cfg["gateway_base_url"],
+                         self.cfg.get("gateway_agent", "default"),
+                         self.cfg.get("session_key", "voice-bridge"))
+                text_stream = gateway_chat_stream_zeroclaw_ws(
+                    self.cfg["gateway_base_url"],
+                    self.cfg["gateway_token"],
+                    text,
+                    self.cfg.get("gateway_agent", "default"),
+                    self.cfg.get("session_key", "voice-bridge"),
+                )
+            elif backend == "zeroclaw":
                 log.info("Worker: → gateway %s (backend=zeroclaw)",
                          self.cfg["gateway_base_url"])
                 text_stream = gateway_chat_stream_zeroclaw(
@@ -1077,11 +1238,10 @@ class VoiceBridge:
                 self.recording.set()
                 self.hid.set_led(muted=False)
                 self._idle_reset_pending.set()
+                # Auto-resume is an unmute → duck (ducking tracks mute
+                # state; the player no longer ducks per-aplay).
+                self.deezer.duck()
 
-            # Duck deezer-connect (no-op if disabled or BFF unreachable).
-            # Paired with unduck() in the finally below; the lock inside
-            # the plugin keeps the pair safe under back-to-back replies.
-            self.deezer.duck()
             proc = _aplay_popen(device, sample_rate, bufsize=0)
             with self._player_lock:
                 self._player_proc = proc
@@ -1128,7 +1288,6 @@ class VoiceBridge:
                         pass
                 with self._player_lock:
                     self._player_proc = None
-                self.deezer.unduck()
                 self._idle_reset_pending.set()
 
     @staticmethod
@@ -1143,6 +1302,15 @@ class VoiceBridge:
 
     # -- lifecycle -----------------------------------------------------
     def start(self) -> None:
+        # Pin deezer-connect to its configured baseline volume on boot
+        # (no-op unless the plugin is enabled).
+        self.deezer.apply_default_volume()
+        # Ducking now tracks mute state (duck on unmute, unduck on mute).
+        # With HID enabled the bridge boots muted, so the first duck waits
+        # for the first unmute press. In always-on mode (HID disabled) the
+        # mic boots open = unmuted, so duck immediately to match.
+        if self.recording.is_set():
+            self.deezer.duck()
         for name, fn in (
             ("hid", self._hid_loop),
             ("recorder", self._recorder_loop),
@@ -1202,6 +1370,7 @@ def main() -> None:
              cfg["tts_provider"], cfg["elevenlabs_voice"], cfg["elevenlabs_model"],
              cfg["tts_sample_rate"], cfg["tts_streaming_mode"])
     log.info("Output: %s @ %d Hz", cfg["output_device"], cfg["tts_sample_rate"])
+    _apply_output_volume(cfg)
     log.info("VAD: rms_threshold=%g pause_commit=%dms idle=%dms",
              cfg["vad_rms_threshold"], cfg["silence_timeout_ms"], cfg["idle_timeout_ms"])
     if not cfg.get("hid_mute_enabled") and cfg["idle_timeout_ms"] > 0:

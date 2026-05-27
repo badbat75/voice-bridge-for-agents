@@ -1,0 +1,36 @@
+# voice-bridge dedicated ALSA output — install as ~/.asoundrc on the Pi.
+#
+#   cp resources/asoundrc.example ~/.asoundrc
+#
+# Defines the `voice_out` PCM that voice-bridge.json points at via
+# `output_device`. The softvol gives the bridge its own "VoiceBridge" mixer
+# control (card 1) so TTS loudness is independent from deezer-connect's music
+# gain. softvol sits over the shared `sw_dmix` (defined in /etc/asound.conf,
+# managed by deezer-connect) so both can play concurrently; the outer plug
+# converts the bridge's 24 kHz mono PCM up to sw_dmix's 48 kHz stereo slave.
+#
+# If you are NOT running deezer-connect, replace `sw_dmix` below with a direct
+# dmix or `hw:1,0` slave of your own. Adjust `card` to your Jabra's card index
+# (check `aplay -l`); this template assumes card 1.
+#
+# `max_dB` is the gain at the VoiceBridge control's 100% position. A positive
+# ceiling lets the control boost TTS *above unity* (TTS-only — music goes
+# straight to sw_dmix, bypassing this softvol), which is needed for quiet TTS
+# voices: e.g. Deepgram Aura has a very low RMS (~-27 dBFS) with only a couple
+# of full-scale outlier samples, so it sounds faint at 0 dB. ~+9 dB lifts
+# perceived loudness while clipping only a negligible fraction of peak samples.
+# Raise toward +12 for louder, lower (toward 0) if it sounds harsh; ElevenLabs
+# (already loud) is fine at 0.
+pcm.voice_out {
+    type plug
+    slave.pcm {
+        type softvol
+        slave.pcm "sw_dmix"
+        control {
+            name "VoiceBridge"
+            card 1
+        }
+        min_dB -51.0
+        max_dB 9.0
+    }
+}

@@ -16,9 +16,10 @@ __pycache__/
 *.swp
 .DS_Store
 
-# Local backups produced when editing /home/openclaw/.openclaw/openclaw.json
+# Local timestamped backups produced when editing config in place
 *.before-*
+*.bak-*
 
 # Local secrets: API keys + gateway token. Keep this file out of the repo.
-# Copy voice-bridge.secrets.example.json → voice-bridge.secrets.json and fill in.
+# Copy resources/voice-bridge.secrets.example.json → voice-bridge.secrets.json and fill in.
 voice-bridge.secrets.json

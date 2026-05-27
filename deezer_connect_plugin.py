@@ -49,9 +49,27 @@ class DeezerConnectPlugin:
         # this is a sign the BFF is hung — better to skip ducking than
         # to delay the start of aplay.
         self.timeout = float(cfg.get("request_timeout_s", 1.0))
+        # Baseline volume the player is pinned to when the plugin is
+        # enabled, applied once at bridge startup (see
+        # `apply_default_volume`). Ducking then works off whatever the
+        # player is at when a reply plays. Clamp to [0, 100]; default 75.
+        self.default_volume = max(0, min(100, int(cfg.get("default_volume_percent", 75))))
 
         self._lock = threading.Lock()
         self._original_volume: int | None = None
+
+    # -- startup --------------------------------------------------------
+    def apply_default_volume(self) -> None:
+        """Pin the deezer-connect player to `default_volume` at startup.
+
+        Best-effort and no-op when disabled — mirrors how the bridge
+        re-asserts its own output softvol level on boot. Any BFF failure
+        is logged and swallowed (the GET/POST helper already warns)."""
+        if not self.enabled:
+            return
+        if self._request("POST", "/api/player/volume", {"volume": self.default_volume}) is None:
+            return
+        log.info("deezer-connect: default volume set to %d%%", self.default_volume)
 
     # -- HTTP helper ----------------------------------------------------
     def _request(self, method: str, path: str, body: dict | None = None) -> dict | None:

@@ -1,0 +1,30 @@
+[Unit]
+Description=Voice Bridge MCP server — STT/TTS tools for an MCP client (e.g. zeroclaw)
+# This is a *user* unit — installed under ~/.config/systemd/user and
+# managed with `systemctl --user`. It runs as the invoking user (no
+# `User=`). Unlike voice-bridge.service it needs no audio/hidraw access:
+# it only talks to the STT/TTS providers and shells out to ffmpeg, so the
+# only host requirement is that `ffmpeg` (with libmp3lame + libopus) is on
+# PATH. Enable linger (`sudo loginctl enable-linger <user>`) so the unit
+# starts at boot without a login session.
+After=network-online.target
+Wants=network-online.target
+# Back off if it crash-loops fast (StartLimit* live in [Unit]).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# %h is systemd's specifier for the running user's home dir (user unit).
+# Edit the MCP/voice-bridge suffix if your checkout lives elsewhere.
+WorkingDirectory=%h/MCP/voice-bridge
+ExecStart=%h/MCP/voice-bridge/.venv/bin/python %h/MCP/voice-bridge/mcp_voice_server.py
+Restart=on-failure
+RestartSec=5
+# FastMCP/uvicorn stops cleanly on SIGTERM (graceful app shutdown).
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+# default.target is the user-mode equivalent of multi-user.target.
+WantedBy=default.target

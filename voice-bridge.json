@@ -1,16 +1,22 @@
 {
   "gateway_base_url": "http://127.0.0.1:42617",
-  "gateway_backend": "zeroclaw",
+  "gateway_backend": "zeroclaw_ws",
+  "gateway_agent": "default",
   "sample_rate": 16000,
   "tts_sample_rate": 24000,
   "chunk_size": 1024,
-  "vad_rms_threshold": 1200000,
+  "vad_rms_threshold": 1800000,
   "silence_timeout_ms": 1000,
   "idle_timeout_ms": 5000,
-  "output_device": "plug:jabra_dmix",
+  "output_device": "voice_out",
+  "output_volume": {
+    "control": "VoiceBridge",
+    "card": 1,
+    "percent": 100
+  },
   "hid_mute_enabled": true,
-  "stt_provider": "elevenlabs",
-  "tts_provider": "elevenlabs",
+  "stt_provider": "deepgram",
+  "tts_provider": "deepgram",
   "tts_streaming_mode": "http_sentence",
   "session_key": "agent:main:voice-bridge",
   "voice_model": "openclaw",
@@ -29,6 +35,7 @@
   },
   "deepgram": {
     "sttModel": "nova-3",
+    "ttsModel": "aura-2-livia-it",
     "sttOptions": {
       "detect_language": true,
       "punctuate": true,
@@ -38,6 +45,7 @@
   "deezer_connect": {
     "enabled": true,
     "base_url": "http://localhost:8980",
+    "default_volume_percent": 75,
     "ducking_percent": 50,
     "request_timeout_s": 1.0
   }
