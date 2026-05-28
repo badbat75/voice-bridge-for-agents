@@ -20,21 +20,53 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import threading
 import wave
-from typing import Iterable, Iterator
+from typing import Any, Coroutine, Iterable, Iterator
 
 import deepgram
 
 log = logging.getLogger(__name__)
 
 
+def _run_sync(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Run an async coroutine from sync code, even when an event loop is
+    already running in the calling thread (e.g. inside FastMCP / asyncio
+    servers). When there's no live loop we use plain `asyncio.run`;
+    otherwise we hand the coroutine to a one-shot worker thread that owns
+    its own loop, which keeps Deepgram's async client off the caller's
+    loop entirely.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    box: dict = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            box["error"] = exc
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 class DeepgramVoice:
     """Deepgram STT + TTS provider.
 
     The SDK is async-first; we expose sync methods by wrapping with
-    asyncio.run(). Each call constructs a fresh client (cheap) — keeps
-    the class stateless w.r.t. event loops, so calling it from a thread
-    that doesn't already have a running loop just works.
+    `_run_sync`, which uses `asyncio.run` when no loop is live and
+    falls back to a worker thread with its own loop when called from
+    inside one (FastMCP / asyncio servers). Each call constructs a
+    fresh client (cheap) — keeps the class stateless w.r.t. event
+    loops.
 
     `stt_options` is a free-form dict of additional kwargs forwarded to
     `transcribe_file` — that's where openclaw-driven settings like
@@ -64,7 +96,7 @@ class DeepgramVoice:
         if not pcm:
             return ""
         try:
-            return asyncio.run(self._transcribe_async(pcm, sample_rate))
+            return _run_sync(self._transcribe_async(pcm, sample_rate))
         except Exception as exc:
             log.error("STT error: %s", exc)
             return ""
@@ -75,7 +107,7 @@ class DeepgramVoice:
         if not text:
             return None
         try:
-            return asyncio.run(self._synthesize_async(text))
+            return _run_sync(self._synthesize_async(text))
         except Exception as exc:
             log.error("TTS error: %s", exc)
             return None
