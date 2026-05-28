@@ -16,9 +16,9 @@ StartLimitBurst=5
 [Service]
 Type=simple
 # %h is systemd's specifier for the running user's home dir (user unit).
-# Edit the MCP/voice-bridge suffix if your checkout lives elsewhere.
-WorkingDirectory=%h/MCP/voice-bridge
-ExecStart=%h/MCP/voice-bridge/.venv/bin/python %h/MCP/voice-bridge/mcp_voice_server.py
+# Edit the Services/voice-bridge suffix if your checkout lives elsewhere.
+WorkingDirectory=%h/Services/voice-bridge
+ExecStart=%h/Services/voice-bridge/.venv/bin/python %h/Services/voice-bridge/mcp_voice_server.py
 Restart=on-failure
 RestartSec=5
 # FastMCP/uvicorn stops cleanly on SIGTERM (graceful app shutdown).

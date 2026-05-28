@@ -16,11 +16,11 @@ StartLimitBurst=5
 [Service]
 Type=simple
 # %h is systemd's specifier for the running user's home dir (user unit).
-# Edit the MCP/voice-bridge suffix if your checkout lives elsewhere.
-WorkingDirectory=%h/MCP/voice-bridge
+# Edit the Services/voice-bridge suffix if your checkout lives elsewhere.
+WorkingDirectory=%h/Services/voice-bridge
 # Diagnostic: surface aplay's stderr (underrun!!! lines) to the journal.
 Environment=VOICE_BRIDGE_DEBUG_AUDIO=1
-ExecStart=%h/MCP/voice-bridge/.venv/bin/python %h/MCP/voice-bridge/voice-bridge.py
+ExecStart=%h/Services/voice-bridge/.venv/bin/python %h/Services/voice-bridge/voice-bridge.py
 Restart=on-failure
 RestartSec=5
 # The bridge handles SIGTERM/SIGINT cleanly: finishes the in-flight
