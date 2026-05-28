@@ -115,6 +115,15 @@ def load_config() -> dict:
         os.environ.get("DEEPGRAM_API_KEY", "")
         or secrets.get("deepgram_api_key", "")
     )
+    # Telegram bot token, used only by the MCP sidecar's `send_voice_telegram`
+    # / `say_to_telegram` tools. The bridge itself ignores it; loaded here so
+    # the same shared `load_config()` keeps every secret in one place. The
+    # default destination chat_id is non-secret config (`telegram.chat_id` in
+    # voice-bridge.json) and exposed as `telegram_chat_id` — callers may still
+    # override per-tool-call.
+    cfg["telegram_bot_token"] = secrets.get("telegram_bot_token", "")
+    tg_local = cfg.get("telegram") or {}
+    cfg["telegram_chat_id"] = str(tg_local.get("chat_id") or "").strip()
 
     # --- Deepgram STT/TTS settings ---
     # The `deepgram` block in voice-bridge.json: `sttOptions` are extra

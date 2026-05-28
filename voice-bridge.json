@@ -48,5 +48,8 @@
     "default_volume_percent": 75,
     "ducking_percent": 50,
     "request_timeout_s": 1.0
+  },
+  "telegram": {
+    "chat_id": "654854423"
   }
 }

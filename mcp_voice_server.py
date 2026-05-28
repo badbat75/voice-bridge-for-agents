@@ -7,6 +7,13 @@ from the bridge; this module is a thin wrapper around them plus an `ffmpeg`
 boundary that handles every container format (ogg/opus, mp3, wav) so the
 providers can stay PCM-centric, exactly as the bridge uses them.
 
+A third tool, `send_voice_telegram`, delivers a synthesized Opus/Ogg file
+to a Telegram chat via the Bot API. It exists here (not in zeroclaw)
+because the bridge's TTS already produces the OGG, and a one-shot
+`sendVoice` POST does NOT conflict with zeroclaw's `getUpdates` poller —
+the 409 only applies to long-polling. Requires `telegram_bot_token` in
+voice-bridge.secrets.json.
+
 Design notes:
 - **All container <-> PCM conversion goes through ffmpeg, uniformly.** STT
   decodes whatever the client sent to S16LE mono PCM, then calls the
@@ -32,10 +39,13 @@ Run:
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 import uuid
 
 from mcp.server.fastmcp import FastMCP
@@ -86,6 +96,13 @@ _TTS_RATE = int(_cfg["tts_sample_rate"])
 _mcp_cfg = _cfg.get("mcp_server") or {}
 _HOST = str(_mcp_cfg.get("host", "127.0.0.1"))
 _PORT = int(_mcp_cfg.get("port", 9080))
+# Telegram bot token for the optional `send_voice_telegram` /
+# `say_to_telegram` tools. Empty string disables them (they raise on
+# call). Lives in the shared voice-bridge.secrets.json so all secrets
+# stay in one place. The default `chat_id` is plain config (non-secret),
+# in voice-bridge.json → `telegram.chat_id`; tool callers may override.
+_TG_TOKEN = str(_cfg.get("telegram_bot_token") or "")
+_TG_CHAT_ID = str(_cfg.get("telegram_chat_id") or "")
 # Where synthesized files land. Default to a per-run temp dir; the client is
 # expected to read the returned path (it shares the Pi's filesystem) and is
 # responsible for cleanup once the file has been relayed.
@@ -205,6 +222,193 @@ def text_to_speech(
     log.info("text_to_speech: %d chars -> %s (%d bytes, %s)",
              len(text), out_path, size, fmt)
     return {"path": out_path, "mime_type": mime, "format": fmt, "bytes": size}
+
+
+def _post_multipart(
+    url: str,
+    fields: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]],
+    timeout: float = 30.0,
+) -> dict:
+    """POST a multipart/form-data request and return the parsed JSON body.
+
+    Kept on `urllib.request` to match the rest of the codebase's "minimal
+    deps on ARM" preference (the bridge uses urllib for gateway/TTS HTTP).
+    `files` values are (filename, bytes, mime_type) tuples.
+    """
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        )
+        parts.append(str(value).encode("utf-8"))
+        parts.append(b"\r\n")
+    for name, (filename, content, mime) in files.items():
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"; '
+            f'filename="{filename}"\r\n'.encode()
+        )
+        parts.append(f"Content-Type: {mime}\r\n\r\n".encode())
+        parts.append(content)
+        parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _resolve_chat_id(chat_id: str | None) -> str:
+    """Pick the per-call `chat_id` override, else fall back to config."""
+    cid = (chat_id or "").strip() or _TG_CHAT_ID
+    if not cid:
+        raise ValueError(
+            "chat_id not provided and telegram.chat_id is empty in "
+            "voice-bridge.json — set one or pass chat_id explicitly"
+        )
+    return cid
+
+
+def _upload_voice_to_telegram(
+    audio_bytes: bytes,
+    filename: str,
+    chat_id: str,
+    caption: str | None,
+    *,
+    log_tag: str,
+) -> dict:
+    """POST `sendVoice` to the Telegram Bot API and shape the response.
+
+    Shared by `send_voice_telegram` (uploads an existing file) and
+    `say_to_telegram` (uploads freshly-synthesized PCM-turned-OGG bytes),
+    so the multipart + error handling + result shape stay in one place.
+    """
+    if not _TG_TOKEN:
+        raise RuntimeError(
+            "telegram_bot_token not set in voice-bridge.secrets.json"
+        )
+
+    fields = {"chat_id": str(chat_id)}
+    if caption:
+        fields["caption"] = caption
+    files = {"voice": (filename, audio_bytes, "audio/ogg")}
+
+    url = f"https://api.telegram.org/bot{_TG_TOKEN}/sendVoice"
+    try:
+        payload = _post_multipart(url, fields, files)
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", "replace").strip()
+        raise RuntimeError(
+            f"Telegram API HTTP {exc.code}: {err_body}"
+        ) from exc
+
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram API error: {payload}")
+    result = payload.get("result") or {}
+    log.info(
+        "%s: chat=%s file=%s (%d bytes) -> message_id=%s",
+        log_tag, chat_id, filename, len(audio_bytes), result.get("message_id"),
+    )
+    return {
+        "ok": True,
+        "message_id": result.get("message_id"),
+        "chat_id": (result.get("chat") or {}).get("id"),
+        "date": result.get("date"),
+    }
+
+
+@mcp.tool()
+def send_voice_telegram(
+    audio_path: str,
+    chat_id: str | None = None,
+    caption: str | None = None,
+) -> dict:
+    """Deliver an existing voice-note (.ogg Opus) to a Telegram chat.
+
+    Use this when you already have an OGG file on disk (e.g. one returned
+    by `text_to_speech`) and just want to send it. For the common case of
+    "synthesize then send", call `say_to_telegram` instead — it does both
+    in one MCP roundtrip and cleans up the temp file.
+
+    `chat_id` is optional: if omitted, falls back to `telegram.chat_id`
+    from voice-bridge.json (the bridge's bound recipient). Pass it
+    explicitly only to override that default. `caption` is optional plain
+    text. Returns `{ok, message_id, chat_id, date}` on success; raises
+    with the Telegram error body on failure.
+    """
+    if not os.path.isfile(audio_path):
+        raise FileNotFoundError(f"audio_path not found: {audio_path}")
+    cid = _resolve_chat_id(chat_id)
+    with open(audio_path, "rb") as f:
+        data = f.read()
+    filename = os.path.basename(audio_path) or "voice.ogg"
+    return _upload_voice_to_telegram(
+        data, filename, cid, caption, log_tag="send_voice_telegram",
+    )
+
+
+@mcp.tool()
+def say_to_telegram(
+    text: str,
+    chat_id: str | None = None,
+    caption: str | None = None,
+) -> dict:
+    """Synthesize `text` and deliver it as a Telegram voice-note in one shot.
+
+    Equivalent to `text_to_speech(text, format="ogg")` followed by
+    `send_voice_telegram(path, chat_id, caption)`, but a single MCP call
+    and the temp file is deleted after upload (success OR failure), so no
+    path ever leaks back to the client. This is the tool to use when
+    relaying a spoken reply on Telegram — the two-step variants exist for
+    when you need to inspect or re-use the audio.
+
+    `chat_id` is optional: defaults to `telegram.chat_id` from
+    voice-bridge.json. Returns `{ok, message_id, chat_id, date}` on
+    success.
+    """
+    if not _TG_TOKEN:
+        raise RuntimeError(
+            "telegram_bot_token not set in voice-bridge.secrets.json"
+        )
+    if not text or not text.strip():
+        raise ValueError("text is empty")
+    cid = _resolve_chat_id(chat_id)
+
+    pcm = _tts.synthesize(text)
+    if not pcm:
+        raise RuntimeError("TTS produced no audio (provider error — check logs)")
+
+    os.makedirs(_OUT_DIR, exist_ok=True)
+    out_path = os.path.join(_OUT_DIR, f"tts-{uuid.uuid4().hex}.ogg")
+    try:
+        _encode_from_pcm(pcm, _TTS_RATE, "ogg", out_path)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(f"ffmpeg encode failed: {stderr}") from exc
+
+    try:
+        with open(out_path, "rb") as f:
+            data = f.read()
+        return _upload_voice_to_telegram(
+            data,
+            os.path.basename(out_path),
+            cid,
+            caption,
+            log_tag=f"say_to_telegram[text={len(text)}c]",
+        )
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
