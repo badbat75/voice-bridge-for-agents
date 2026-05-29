@@ -42,6 +42,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import urllib.error
@@ -179,6 +180,51 @@ def speech_to_text(audio_path: str, mime_type: str | None = None) -> str:
     return text
 
 
+# Emoji + pittogrammi (range Unicode comuni) da togliere prima del TTS:
+# vengono pronunciati male o bloccano il flusso audio del provider.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # simboli & pittogrammi, emoticon, oggetti
+    "\U00002600-\U000027BF"  # misc symbols + dingbats
+    "\U0001F1E6-\U0001F1FF"  # bandiere
+    "\U0000FE00-\U0000FE0F"  # variation selectors
+    "\U00002190-\U000021FF"  # frecce
+    "\U00002B00-\U00002BFF"  # frecce/simboli misc
+    "\U0000200D"             # zero-width joiner
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _sanitize_for_tts(text: str) -> str:
+    """Toglie markdown ed emoji dal testo prima della sintesi vocale.
+
+    Il modello (deepseek) ogni tanto produce `**grassetto**`, `_corsivo_`,
+    `# titoli`, backtick ed emoji nonostante le istruzioni di prompt. Gli
+    asterischi in particolare mandano in errore / bloccano il flusso audio
+    del TTS. Qui li rimuoviamo in modo deterministico: il client può fidarsi
+    che qualunque testo passato a TTS venga ripulito.
+    """
+    if not text:
+        return text
+    t = text
+    # Rimuovi recinti di codice ``` e backtick singoli (tieni il contenuto).
+    t = t.replace("```", " ").replace("`", "")
+    # Grassetto/corsivo markdown: **x**, *x*, __x__, _x_, ~~x~~ -> x
+    t = re.sub(r"\*{1,3}([^*]+?)\*{1,3}", r"\1", t)
+    t = re.sub(r"_{1,3}([^_]+?)_{1,3}", r"\1", t)
+    t = re.sub(r"~~([^~]+?)~~", r"\1", t)
+    # Asterischi/underscore/tilde/cancelletti rimasti spaiati -> via.
+    t = re.sub(r"[*_~#`>]", "", t)
+    # Link markdown [testo](url) -> testo
+    t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
+    # Emoji e pittogrammi
+    t = _EMOJI_RE.sub("", t)
+    # Normalizza spazi multipli generati dalle sostituzioni
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+
 @mcp.tool()
 def text_to_speech(
     text: str,
@@ -201,6 +247,10 @@ def text_to_speech(
         )
     if not text or not text.strip():
         raise ValueError("text is empty")
+
+    text = _sanitize_for_tts(text)
+    if not text:
+        raise ValueError("text is empty after sanitization")
 
     pcm = _tts.synthesize(text)
     if not pcm:
@@ -381,6 +431,10 @@ def say_to_telegram(
     if not text or not text.strip():
         raise ValueError("text is empty")
     cid = _resolve_chat_id(chat_id)
+
+    text = _sanitize_for_tts(text)
+    if not text:
+        raise ValueError("text is empty after sanitization")
 
     pcm = _tts.synthesize(text)
     if not pcm:
