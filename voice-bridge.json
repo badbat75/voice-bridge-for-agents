@@ -7,7 +7,7 @@
   "chunk_size": 1024,
   "vad_rms_threshold": 1800000,
   "silence_timeout_ms": 1000,
-  "idle_timeout_ms": 5000,
+  "idle_timeout_ms": 3000,
   "output_device": "voice_out",
   "output_volume": {
     "control": "VoiceBridge",
@@ -45,7 +45,7 @@
   "deezer_connect": {
     "enabled": true,
     "base_url": "http://localhost:8980",
-    "default_volume_percent": 75,
+    "default_volume_percent": 100,
     "ducking_percent": 50,
     "request_timeout_s": 1.0
   },
