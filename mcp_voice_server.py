@@ -79,19 +79,15 @@ _OUTPUT_FORMATS = {
 
 # Runtime state, populated by `configure()`. Kept module-global because the
 # `@mcp.tool()` functions read them at call time. The bridge process calls
-# `configure(cfg, stt=..., tts=..., bridge=...)` to inject the same config and
-# provider instances it already built, then `serve_background()` — one
-# process, one config load, shared providers (see the bridge's main()).
+# `configure(cfg, stt=..., tts=..., bridge=...)` to inject the same config,
+# provider instances, and the running VoiceBridge (so `say_to_speaker` can
+# play through its player), then `serve_background()` — one process, one
+# config load, shared providers (see the bridge's main()).
 _bridge = None
 _cfg: dict = {}
 _stt = None
 _tts = None
 _TTS_RATE = 0
-# ALSA output PCM name for the `say_to_speaker` tool — the same
-# `output_device` the bridge plays replies through (e.g. `voice_out`).
-# Playback goes through sw_dmix, so it mixes with whatever the bridge is
-# already playing; the device's mic-mute state does not gate output.
-_OUT_DEVICE = ""
 _HOST = "127.0.0.1"
 _PORT = 9080
 # Telegram bot token for the optional `send_voice_telegram` /
@@ -118,10 +114,10 @@ def configure(cfg: dict, *, stt, tts, bridge) -> "FastMCP":
     `serve_background()`.
 
     The bridge injects the same `cfg` and `stt`/`tts` instances it uses, plus
-    the bridge module itself (which supplies `_aplay_popen` / `_drain_aplay`
-    for `say_to_speaker`). Returns the `mcp` app.
+    the running `VoiceBridge` (whose `play_pcm()` `say_to_speaker` uses to
+    speak through the bridge's player). Returns the `mcp` app.
     """
-    global _bridge, _cfg, _stt, _tts, _TTS_RATE, _OUT_DEVICE
+    global _bridge, _cfg, _stt, _tts, _TTS_RATE
     global _HOST, _PORT, _TG_TOKEN, _TG_CHAT_ID, _OUT_DIR
 
     # Each provider class constructs its own SDK client per call, so the
@@ -132,7 +128,6 @@ def configure(cfg: dict, *, stt, tts, bridge) -> "FastMCP":
     _stt = stt
     _tts = tts
     _TTS_RATE = int(_cfg["tts_sample_rate"])
-    _OUT_DEVICE = str(_cfg["output_device"])
 
     mcp_cfg = _cfg.get("mcp_server") or {}
     _HOST = str(mcp_cfg.get("host", "127.0.0.1"))
@@ -519,44 +514,17 @@ def say_to_telegram(
             pass
 
 
-def _play_pcm_blocking(pcm: bytes) -> float:
-    """Play raw S16LE mono PCM on the configured ALSA output device.
-
-    Reuses the bridge's `_aplay_popen` + `_drain_aplay`, so the wire format
-    (S16_LE mono @ `tts_sample_rate`) and the no-clip drain behaviour match
-    the bridge exactly. Network TTS feeds the whole buffer faster than
-    realtime; the `stdin.write` blocks until aplay has consumed it (i.e. for
-    the duration of playback), then `_drain_aplay` plays out the buffered
-    tail without chopping it. Returns the audio duration in seconds.
-    """
-    proc = _bridge._aplay_popen(_OUT_DEVICE, _TTS_RATE)
-    try:
-        proc.stdin.write(pcm)
-        proc.stdin.flush()
-    except BrokenPipeError:
-        # aplay died early (e.g. ALSA device busy/unavailable). Fall through
-        # to drain/reap so we can surface its exit status below.
-        pass
-    _bridge._drain_aplay(proc, _TTS_RATE)
-    if proc.returncode not in (0, None):
-        raise RuntimeError(
-            f"aplay exited with status {proc.returncode} "
-            f"(device={_OUT_DEVICE!r}) — is the ALSA output available?"
-        )
-    return len(pcm) / (_TTS_RATE * 2)
-
-
 @mcp.tool()
 def say_to_speaker(text: str) -> dict:
     """Synthesize `text` and play it aloud on the bridge's speaker in one shot.
 
-    The speaker-side analogue of `say_to_telegram`: synthesize -> play via
-    aplay on the configured ALSA output device (`output_device` in
-    voice-bridge.json, e.g. `voice_out`), straight from PCM. Playback goes
-    through sw_dmix, so it mixes with any reply the bridge is already
-    speaking; it is independent of the device's mic-mute state (mute silences
-    only capture). Blocks until playback finishes. Returns
-    `{ok, chars, seconds}`.
+    The speaker-side analogue of `say_to_telegram`: synthesize -> hand the
+    PCM to the bridge's player via `play_pcm()`, so it behaves exactly like a
+    normal spoken reply. The bridge unmutes (mic open, LED off) and ducks
+    deezer-connect for the playback window (ducking tracks mute state); after
+    the speech the usual idle timer re-mutes and unducks. The audio serializes
+    behind any reply already playing rather than overlapping it. Blocks until
+    playback finishes. Returns `{ok, chars, seconds}`.
     """
     if not text or not text.strip():
         raise ValueError("text is empty")
@@ -569,9 +537,8 @@ def say_to_speaker(text: str) -> dict:
     if not pcm:
         raise RuntimeError("TTS produced no audio (provider error — check logs)")
 
-    seconds = _play_pcm_blocking(pcm)
-    log.info("say_to_speaker: %d chars -> %.1fs on %s",
-             len(text), seconds, _OUT_DEVICE)
+    seconds = _bridge.play_pcm(pcm)
+    log.info("say_to_speaker: %d chars -> %.1fs", len(text), seconds)
     return {"ok": True, "chars": len(text), "seconds": round(seconds, 2)}
 
 

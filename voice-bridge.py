@@ -765,6 +765,17 @@ class _EndOfUtterance:
 _END_OF_UTTERANCE = _EndOfUtterance()
 
 
+# A whole externally-supplied utterance (the MCP `say_to_speaker` tool),
+# enqueued as ONE atomic item rather than chunk+marker so it can never
+# interleave with the worker's streamed reply chunks on `playback_q`. The
+# player plays `pcm` end-to-end as its own utterance and fires `done` when
+# the playback (and no-clip drain) finishes, releasing a blocked caller.
+class _ExternalUtterance:
+    def __init__(self, pcm: bytes, done: "threading.Event") -> None:
+        self.pcm = pcm
+        self.done = done
+
+
 class VoiceBridge:
     """Always-on mic + 4-stage async pipeline + HID hard-cancel toggle.
 
@@ -954,6 +965,53 @@ class VoiceBridge:
             self.hid.set_led(muted=False)
             # Unmute → duck deezer-connect for the whole listening window.
             self.deezer.duck()
+
+    def play_pcm(self, pcm: bytes, *, block: bool = True) -> float:
+        """Play externally-supplied PCM through the bridge's player so it
+        behaves like a normal spoken reply.
+
+        Used by the MCP `say_to_speaker` tool. The PCM (S16LE mono at
+        `tts_sample_rate`) is enqueued as one utterance under the current
+        generation, so it serializes behind any reply already playing and
+        reuses the player's no-clip drain and the `_is_playing()` guard (the
+        endpointer won't auto-idle mid-speech).
+
+        Like a real reply it runs through the unmute → duck transition: the
+        device unmutes (mic open, LED off) and deezer-connect ducks for the
+        playback window. Afterwards the player's end-of-playback reset starts
+        the idle window, so the usual `idle_timeout_ms` silence re-mutes and
+        unducks — exactly the tail of a normal speech. Ducking is a no-op
+        unless `deezer_connect` is enabled.
+
+        Returns the audio duration in seconds; when `block` (the default),
+        waits until the player has finished this utterance (bounded so a
+        stuck player can't pin the caller).
+        """
+        sample_rate = int(self.cfg["tts_sample_rate"])
+        seconds = len(pcm) / (sample_rate * 2) if pcm else 0.0
+        if not pcm:
+            return 0.0
+
+        # Unmute like a normal speech → duck. Mirrors `_on_hid_press` resume
+        # and the player's auto-resume; idempotent if already unmuted/ducked.
+        if not self.recording.is_set():
+            log.info("play_pcm: unmuting for external speech (mic open, LED off)")
+            self.recording.set()
+            self.hid.set_led(muted=False)
+        self._auto_idled.clear()
+        self.deezer.duck()
+
+        # One atomic item under the current gen → serializes behind any reply
+        # already playing, never interleaves with the worker's chunks. The
+        # player fires `done` when playback finishes (or immediately if a HID
+        # press bumps the gen and the item goes stale).
+        done = threading.Event()
+        self.playback_q.put((self._current_gen(), _ExternalUtterance(pcm, done)))
+
+        if block:
+            # Generous bound: playback is realtime, plus drain + margin.
+            done.wait(timeout=seconds + 15.0)
+        return seconds
 
     # -- thread loops --------------------------------------------------
     def _hid_loop(self) -> None:
@@ -1287,6 +1345,16 @@ class VoiceBridge:
                 gen, item = self.playback_q.get(timeout=0.2)
             except queue.Empty:
                 continue
+            # Externally-supplied speech (MCP say_to_speaker) arrives as one
+            # atomic item; play it as its own utterance via the same path,
+            # then release the blocked caller. play_pcm() already did the
+            # unmute → duck transition before enqueuing.
+            if isinstance(item, _ExternalUtterance):
+                if gen == self._current_gen():
+                    self._play_blob(item.pcm, device, sample_rate)
+                item.done.set()
+                continue
+
             # Skip end-of-utterance markers that arrive with no
             # preceding audio (e.g. worker bailed before producing any
             # PCM), and stale-gen anything.
@@ -1354,6 +1422,25 @@ class VoiceBridge:
                 self._idle_reset_pending.set()
                 with self._player_lock:
                     self._player_proc = None
+
+    def _play_blob(self, pcm: bytes, device: str, sample_rate: int) -> None:
+        """Play one complete PCM blob as a single utterance (external speech).
+
+        Mirrors the per-utterance body of `_player_loop`: registers the aplay
+        proc in `_player_proc` (so `_is_playing()` blocks auto-idle during the
+        speech), writes the whole blob, then runs the bounded no-clip drain
+        and starts the end-of-playback idle window via `_idle_reset_pending`.
+        """
+        proc = _aplay_popen(device, sample_rate, bufsize=0)
+        with self._player_lock:
+            self._player_proc = proc
+        try:
+            self._write_chunk(proc, pcm)
+        finally:
+            _drain_aplay(proc, sample_rate, abort=self.shutdown_event)
+            self._idle_reset_pending.set()
+            with self._player_lock:
+                self._player_proc = None
 
     @staticmethod
     def _write_chunk(proc: subprocess.Popen, chunk: bytes) -> bool:
@@ -1471,9 +1558,7 @@ def main() -> None:
     if (cfg.get("mcp_server") or {}).get("enabled"):
         try:
             import mcp_voice_server
-            mcp_voice_server.configure(
-                cfg, stt=stt, tts=tts, bridge=sys.modules[__name__]
-            )
+            mcp_voice_server.configure(cfg, stt=stt, tts=tts, bridge=bridge)
             mcp_voice_server.serve_background()
             log.info("MCP server: http://%s:%d",
                      mcp_voice_server._HOST, mcp_voice_server._PORT)
