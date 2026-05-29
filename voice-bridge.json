@@ -53,7 +53,7 @@
     "chat_id": "654854423"
   },
   "mcp_server": {
-    "embedded": true,
+    "enabled": true,
     "host": "127.0.0.1",
     "port": 9080
   }

@@ -1464,24 +1464,22 @@ def main() -> None:
     else:
         log.info("Ready — listening (always-on mic, HID button disabled)")
 
-    # Optionally serve the MCP voice tools from inside this process — one
-    # systemd unit, one config load, the SAME provider instances. Off unless
-    # `mcp_server.embedded` is true in voice-bridge.json (then the separate
-    # mcp-voice-server.service is redundant — disable it to free the port).
-    # Best-effort: a failure to start the MCP server must never take down the
-    # always-on voice client, so it's caught and logged, not fatal.
-    if (cfg.get("mcp_server") or {}).get("embedded"):
+    # Serve the MCP voice tools from inside this process when
+    # `mcp_server.enabled` is true, sharing this process's config and the
+    # same provider instances. Best-effort: a failure to start the MCP server
+    # is caught and logged so the always-on voice client keeps running.
+    if (cfg.get("mcp_server") or {}).get("enabled"):
         try:
             import mcp_voice_server
             mcp_voice_server.configure(
                 cfg, stt=stt, tts=tts, bridge=sys.modules[__name__]
             )
             mcp_voice_server.serve_background()
-            log.info("Embedded MCP server: http://%s:%d",
+            log.info("MCP server: http://%s:%d",
                      mcp_voice_server._HOST, mcp_voice_server._PORT)
         except Exception:
             log.exception(
-                "Embedded MCP server failed to start (continuing without it)"
+                "MCP server failed to start; voice client continues"
             )
 
     # Block here until SIGTERM/SIGINT. Worker threads do all the work;

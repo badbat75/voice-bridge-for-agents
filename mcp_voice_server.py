@@ -21,31 +21,29 @@ Output mixes through sw_dmix, so it coexists with whatever the bridge is
 playing; it needs `aplay` on PATH and `audio`-group access.
 
 Design notes:
+- **Embedded in the bridge process.** This module is a library. The bridge's
+  `main()` calls `configure(cfg, stt=..., tts=..., bridge=...)` then
+  `serve_background()` to run the MCP HTTP server in a daemon thread inside
+  the bridge process, so one process and one config load share the same
+  STT/TTS provider instances between the voice client and these tools.
+  `configure()` performs all setup; the import itself only defines the tools
+  and the `FastMCP` app. Toggle it with `mcp_server.enabled` in
+  `voice-bridge.json`.
 - **All container <-> PCM conversion goes through ffmpeg, uniformly.** STT
   decodes whatever the client sent to S16LE mono PCM, then calls the
   provider's `transcribe(pcm, rate)`. TTS calls `synthesize(text)` (which
   returns S16LE PCM at `tts_sample_rate`) and pipes that into ffmpeg to
-  produce the requested container. We do NOT rely on the provider/SDK to
-  emit mp3/ogg directly — ffmpeg (with libmp3lame + libopus) is the single,
-  tier-independent path.
-- **Config is shared, not duplicated.** `voice-bridge.py` owns
-  `load_config()` and `_build_voice_provider()`; we import that module by
-  path (its hyphenated filename blocks a normal `import`) so the secrets,
-  provider selection, and ElevenLabs/Deepgram settings come from the same
-  `voice-bridge.json` / `voice-bridge.secrets.json` the bridge reads.
-- **Transport is streamable-http** so zeroclaw connects by URL. Host/port
-  (and the output directory for synthesized files) come from an optional
-  `mcp_server` block in `voice-bridge.json`; sane localhost defaults
+  produce the requested container. ffmpeg (with libmp3lame + libopus) is the
+  single, tier-independent path for emitting mp3/ogg/wav.
+- **Transport is streamable-http** so an MCP client (e.g. zeroclaw) connects
+  by URL. Host/port (and the output directory for synthesized files) come
+  from the `mcp_server` block in `voice-bridge.json`; localhost defaults
   otherwise.
-
-Run:
-    .venv/bin/python mcp_voice_server.py
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import logging
 import os
@@ -65,8 +63,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("mcp_voice_server")
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
 # STT decode target. 16 kHz mono is plenty for both Scribe and nova-3 and
 # keeps the WAV the providers build internally small.
 _STT_RATE = 16000
@@ -81,25 +77,11 @@ _OUTPUT_FORMATS = {
 }
 
 
-def _load_bridge_module():
-    """Import voice-bridge.py by path (hyphen blocks `import voice-bridge`)."""
-    path = os.path.join(HERE, "voice-bridge.py")
-    spec = importlib.util.spec_from_file_location("voice_bridge", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 # Runtime state, populated by `configure()`. Kept module-global because the
-# `@mcp.tool()` functions read them at call time. The server can run two ways:
-#   - standalone (`python mcp_voice_server.py`): `configure()` loads its own
-#     config and builds its own providers.
-#   - embedded in the bridge process: the bridge calls `configure(cfg,
-#     stt=..., tts=..., bridge=...)` to inject the SAME config and provider
-#     instances it already built, then `serve_background()`. One process,
-#     one config load, shared providers — see the bridge's main().
+# `@mcp.tool()` functions read them at call time. The bridge process calls
+# `configure(cfg, stt=..., tts=..., bridge=...)` to inject the same config and
+# provider instances it already built, then `serve_background()` — one
+# process, one config load, shared providers (see the bridge's main()).
 _bridge = None
 _cfg: dict = {}
 _stt = None
@@ -125,31 +107,30 @@ _TG_CHAT_ID = ""
 _OUT_DIR = ""
 
 # The FastMCP app is created at import time (the `@mcp.tool()` decorators
-# below need it), but host/port are NOT bound here — `serve_*()` pass them
-# to uvicorn from the resolved config, so a single instance works for both
-# standalone and embedded modes.
+# below need it); `serve_background()` passes host/port to uvicorn from the
+# injected config.
 mcp = FastMCP("voice-bridge-voice")
 
 
-def configure(cfg: dict | None = None, *, stt=None, tts=None, bridge=None) -> "FastMCP":
-    """Resolve config + providers into the module globals the tools read.
+def configure(cfg: dict, *, stt, tts, bridge) -> "FastMCP":
+    """Resolve the injected config + providers into the module globals the
+    tools read. Called once by the bridge's `main()` before
+    `serve_background()`.
 
-    Standalone: call with no args — loads `voice-bridge.json` via the bridge
-    module and builds its own providers. Embedded: the bridge passes its
-    already-loaded `cfg` and built `stt`/`tts` instances (and itself as
-    `bridge`) so nothing is loaded or constructed twice. Idempotent enough
-    to call once at startup. Returns the configured `mcp` app.
+    The bridge injects the same `cfg` and `stt`/`tts` instances it uses, plus
+    the bridge module itself (which supplies `_aplay_popen` / `_drain_aplay`
+    for `say_to_speaker`). Returns the `mcp` app.
     """
     global _bridge, _cfg, _stt, _tts, _TTS_RATE, _OUT_DEVICE
     global _HOST, _PORT, _TG_TOKEN, _TG_CHAT_ID, _OUT_DIR
 
-    _bridge = bridge or _load_bridge_module()
-    _cfg = cfg if cfg is not None else _bridge.load_config()
-    # Build any provider not injected. Each provider class constructs its own
-    # SDK client per call, so a single shared instance is safe to use
-    # concurrently across FastMCP's threadpool-dispatched tool calls.
-    _stt = stt if stt is not None else _bridge._build_voice_provider("stt", _cfg)
-    _tts = tts if tts is not None else _bridge._build_voice_provider("tts", _cfg)
+    # Each provider class constructs its own SDK client per call, so the
+    # bridge's single shared instance is safe to use concurrently across
+    # FastMCP's threadpool-dispatched tool calls.
+    _bridge = bridge
+    _cfg = cfg
+    _stt = stt
+    _tts = tts
     _TTS_RATE = int(_cfg["tts_sample_rate"])
     _OUT_DEVICE = str(_cfg["output_device"])
 
@@ -169,25 +150,19 @@ def configure(cfg: dict | None = None, *, stt=None, tts=None, bridge=None) -> "F
     return mcp
 
 
-def _make_uvicorn_server():
-    """Build a uvicorn Server bound to the configured host/port for the
-    streamable-http ASGI app. Shared by both serve paths."""
-    import uvicorn  # lazy: only needed when actually serving
-
-    app = mcp.streamable_http_app()
-    config = uvicorn.Config(app, host=_HOST, port=_PORT, log_level="info")
-    return uvicorn.Server(config)
-
-
 def serve_background() -> threading.Thread:
-    """Run the MCP HTTP server in a daemon thread (embedded-in-bridge mode).
+    """Run the MCP HTTP server in a daemon thread inside the bridge process.
 
     uvicorn installs SIGINT/SIGTERM handlers, which only work in the main
     thread — so we disable them here and let the host process (the bridge)
     own the signals. The server runs its own asyncio loop inside the thread.
-    Returns the started thread.
+    Returns the started thread. Call `configure()` first.
     """
-    server = _make_uvicorn_server()
+    import uvicorn  # lazy: only needed when actually serving
+
+    app = mcp.streamable_http_app()
+    config = uvicorn.Config(app, host=_HOST, port=_PORT, log_level="info")
+    server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  # bridge owns the signals
 
     def _run() -> None:
@@ -196,16 +171,6 @@ def serve_background() -> threading.Thread:
     t = threading.Thread(target=_run, name="mcp-http", daemon=True)
     t.start()
     return t
-
-
-def serve_blocking() -> None:
-    """Run the MCP HTTP server in the foreground (standalone mode).
-
-    uvicorn owns SIGINT/SIGTERM and blocks until shutdown. This replaces the
-    old `mcp.run(transport="streamable-http")` so both serve paths share the
-    same host/port resolution.
-    """
-    _make_uvicorn_server().run()
 
 
 def _decode_to_pcm(path: str, rate: int = _STT_RATE) -> bytes:
@@ -587,10 +552,10 @@ def say_to_speaker(text: str) -> dict:
 
     The speaker-side analogue of `say_to_telegram`: synthesize -> play via
     aplay on the configured ALSA output device (`output_device` in
-    voice-bridge.json, e.g. `voice_out`). Nothing is written to disk.
-    Playback goes through sw_dmix, so it mixes with any reply the bridge is
-    already speaking, and the device's mic-mute state does NOT gate output
-    (mute only silences capture). Blocks until playback finishes. Returns
+    voice-bridge.json, e.g. `voice_out`), straight from PCM. Playback goes
+    through sw_dmix, so it mixes with any reply the bridge is already
+    speaking; it is independent of the device's mic-mute state (mute silences
+    only capture). Blocks until playback finishes. Returns
     `{ok, chars, seconds}`.
     """
     if not text or not text.strip():
@@ -611,8 +576,7 @@ def say_to_speaker(text: str) -> dict:
 
 
 if __name__ == "__main__":
-    # Standalone mode: load our own config + providers, then serve in the
-    # foreground. When embedded in the bridge process, the bridge calls
-    # configure(...) + serve_background() instead (see voice-bridge.py).
-    configure()
-    serve_blocking()
+    raise SystemExit(
+        "The MCP server runs inside the bridge process. Set "
+        "mcp_server.enabled: true in voice-bridge.json and start voice-bridge."
+    )
