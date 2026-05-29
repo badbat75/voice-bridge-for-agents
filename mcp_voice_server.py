@@ -44,6 +44,7 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import logging
@@ -51,6 +52,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -90,44 +92,120 @@ def _load_bridge_module():
     return mod
 
 
-_bridge = _load_bridge_module()
-_cfg = _bridge.load_config()
-
-# Build both providers up front. Each provider class constructs its own SDK
-# client per call, so a single shared instance is safe to use concurrently
-# across FastMCP's threadpool-dispatched tool calls.
-_stt = _bridge._build_voice_provider("stt", _cfg)
-_tts = _bridge._build_voice_provider("tts", _cfg)
-_TTS_RATE = int(_cfg["tts_sample_rate"])
+# Runtime state, populated by `configure()`. Kept module-global because the
+# `@mcp.tool()` functions read them at call time. The server can run two ways:
+#   - standalone (`python mcp_voice_server.py`): `configure()` loads its own
+#     config and builds its own providers.
+#   - embedded in the bridge process: the bridge calls `configure(cfg,
+#     stt=..., tts=..., bridge=...)` to inject the SAME config and provider
+#     instances it already built, then `serve_background()`. One process,
+#     one config load, shared providers — see the bridge's main().
+_bridge = None
+_cfg: dict = {}
+_stt = None
+_tts = None
+_TTS_RATE = 0
 # ALSA output PCM name for the `say_to_speaker` tool — the same
 # `output_device` the bridge plays replies through (e.g. `voice_out`).
 # Playback goes through sw_dmix, so it mixes with whatever the bridge is
 # already playing; the device's mic-mute state does not gate output.
-_OUT_DEVICE = str(_cfg["output_device"])
-
-_mcp_cfg = _cfg.get("mcp_server") or {}
-_HOST = str(_mcp_cfg.get("host", "127.0.0.1"))
-_PORT = int(_mcp_cfg.get("port", 9080))
+_OUT_DEVICE = ""
+_HOST = "127.0.0.1"
+_PORT = 9080
 # Telegram bot token for the optional `send_voice_telegram` /
 # `say_to_telegram` tools. Empty string disables them (they raise on
 # call). Lives in the shared voice-bridge.secrets.json so all secrets
 # stay in one place. The default `chat_id` is plain config (non-secret),
 # in voice-bridge.json → `telegram.chat_id`; tool callers may override.
-_TG_TOKEN = str(_cfg.get("telegram_bot_token") or "")
-_TG_CHAT_ID = str(_cfg.get("telegram_chat_id") or "")
+_TG_TOKEN = ""
+_TG_CHAT_ID = ""
 # Where synthesized files land. Default to a per-run temp dir; the client is
 # expected to read the returned path (it shares the Pi's filesystem) and is
 # responsible for cleanup once the file has been relayed.
-_OUT_DIR = os.path.abspath(
-    _mcp_cfg.get("out_dir") or os.path.join(tempfile.gettempdir(), "voice-bridge-mcp")
-)
+_OUT_DIR = ""
 
-log.info(
-    "providers: stt=%s tts=%s | tts_rate=%d | out_dir=%s | http=%s:%d",
-    _cfg["stt_provider"], _cfg["tts_provider"], _TTS_RATE, _OUT_DIR, _HOST, _PORT,
-)
+# The FastMCP app is created at import time (the `@mcp.tool()` decorators
+# below need it), but host/port are NOT bound here — `serve_*()` pass them
+# to uvicorn from the resolved config, so a single instance works for both
+# standalone and embedded modes.
+mcp = FastMCP("voice-bridge-voice")
 
-mcp = FastMCP("voice-bridge-voice", host=_HOST, port=_PORT)
+
+def configure(cfg: dict | None = None, *, stt=None, tts=None, bridge=None) -> "FastMCP":
+    """Resolve config + providers into the module globals the tools read.
+
+    Standalone: call with no args — loads `voice-bridge.json` via the bridge
+    module and builds its own providers. Embedded: the bridge passes its
+    already-loaded `cfg` and built `stt`/`tts` instances (and itself as
+    `bridge`) so nothing is loaded or constructed twice. Idempotent enough
+    to call once at startup. Returns the configured `mcp` app.
+    """
+    global _bridge, _cfg, _stt, _tts, _TTS_RATE, _OUT_DEVICE
+    global _HOST, _PORT, _TG_TOKEN, _TG_CHAT_ID, _OUT_DIR
+
+    _bridge = bridge or _load_bridge_module()
+    _cfg = cfg if cfg is not None else _bridge.load_config()
+    # Build any provider not injected. Each provider class constructs its own
+    # SDK client per call, so a single shared instance is safe to use
+    # concurrently across FastMCP's threadpool-dispatched tool calls.
+    _stt = stt if stt is not None else _bridge._build_voice_provider("stt", _cfg)
+    _tts = tts if tts is not None else _bridge._build_voice_provider("tts", _cfg)
+    _TTS_RATE = int(_cfg["tts_sample_rate"])
+    _OUT_DEVICE = str(_cfg["output_device"])
+
+    mcp_cfg = _cfg.get("mcp_server") or {}
+    _HOST = str(mcp_cfg.get("host", "127.0.0.1"))
+    _PORT = int(mcp_cfg.get("port", 9080))
+    _TG_TOKEN = str(_cfg.get("telegram_bot_token") or "")
+    _TG_CHAT_ID = str(_cfg.get("telegram_chat_id") or "")
+    _OUT_DIR = os.path.abspath(
+        mcp_cfg.get("out_dir") or os.path.join(tempfile.gettempdir(), "voice-bridge-mcp")
+    )
+
+    log.info(
+        "providers: stt=%s tts=%s | tts_rate=%d | out_dir=%s | http=%s:%d",
+        _cfg["stt_provider"], _cfg["tts_provider"], _TTS_RATE, _OUT_DIR, _HOST, _PORT,
+    )
+    return mcp
+
+
+def _make_uvicorn_server():
+    """Build a uvicorn Server bound to the configured host/port for the
+    streamable-http ASGI app. Shared by both serve paths."""
+    import uvicorn  # lazy: only needed when actually serving
+
+    app = mcp.streamable_http_app()
+    config = uvicorn.Config(app, host=_HOST, port=_PORT, log_level="info")
+    return uvicorn.Server(config)
+
+
+def serve_background() -> threading.Thread:
+    """Run the MCP HTTP server in a daemon thread (embedded-in-bridge mode).
+
+    uvicorn installs SIGINT/SIGTERM handlers, which only work in the main
+    thread — so we disable them here and let the host process (the bridge)
+    own the signals. The server runs its own asyncio loop inside the thread.
+    Returns the started thread.
+    """
+    server = _make_uvicorn_server()
+    server.install_signal_handlers = lambda: None  # bridge owns the signals
+
+    def _run() -> None:
+        asyncio.run(server.serve())
+
+    t = threading.Thread(target=_run, name="mcp-http", daemon=True)
+    t.start()
+    return t
+
+
+def serve_blocking() -> None:
+    """Run the MCP HTTP server in the foreground (standalone mode).
+
+    uvicorn owns SIGINT/SIGTERM and blocks until shutdown. This replaces the
+    old `mcp.run(transport="streamable-http")` so both serve paths share the
+    same host/port resolution.
+    """
+    _make_uvicorn_server().run()
 
 
 def _decode_to_pcm(path: str, rate: int = _STT_RATE) -> bytes:
@@ -533,4 +611,8 @@ def say_to_speaker(text: str) -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    # Standalone mode: load our own config + providers, then serve in the
+    # foreground. When embedded in the bridge process, the bridge calls
+    # configure(...) + serve_background() instead (see voice-bridge.py).
+    configure()
+    serve_blocking()
