@@ -30,6 +30,11 @@ class _FakeBff:
 
     def __init__(self, volume: int = 80) -> None:
         self.volume = volume
+        # When set, GET /status reports this value instead of `volume`,
+        # simulating the player's volume-write latency (a duck right after
+        # an unduck reads back the still-ducked level). POSTs still mutate
+        # `volume` for real.
+        self.report_override: int | None = None
         self.requests: list[tuple[str, str, dict | None]] = []
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
@@ -52,7 +57,9 @@ class _FakeBff:
                 if self.path == "/api/player/status":
                     with bff._lock:
                         bff.requests.append(("GET", self.path, None))
-                        body = json.dumps({"volume": bff.volume}).encode()
+                        reported = bff.volume if bff.report_override is None \
+                            else bff.report_override
+                        body = json.dumps({"volume": reported}).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
@@ -156,6 +163,37 @@ class EnabledPluginTests(unittest.TestCase):
             self.assertEqual(bff.volume, 40)
             plug.unduck()
             self.assertEqual(bff.volume, 80)
+        finally:
+            bff.stop()
+
+    def test_stale_read_after_unduck_does_not_compound(self):
+        # Regression: with several utterances queued, the bridge churns
+        # unduck (auto-idle) → duck (next reply playback). The player
+        # applies volume writes with latency, so the re-duck's GET can
+        # read back the still-ducked level. A naive duck would compound it
+        # (100 → 50 → 25); the plugin must instead re-arm the restore to
+        # the true baseline and leave the player at the ducked level.
+        bff = _FakeBff(volume=100)
+        url = bff.start()
+        try:
+            plug = self._plugin(url)
+            plug.duck()                       # 100 → 50
+            self.assertEqual(bff.volume, 50)
+            plug.unduck()                     # 50 → 100
+            self.assertEqual(bff.volume, 100)
+
+            # The restore hasn't propagated yet: GET still reports 50.
+            bff.report_override = 50
+            plug.duck()
+            # Must NOT have ducked again — volume stays at the (real,
+            # already-applied) baseline rather than dropping to 25.
+            self.assertEqual(bff.volume, 100)
+            self.assertNotIn({"volume": 25}, [b for _, _, b in bff.requests])
+
+            # And the restore must still target the true baseline.
+            bff.report_override = None
+            plug.unduck()
+            self.assertEqual(bff.volume, 100)
         finally:
             bff.stop()
 

@@ -34,6 +34,13 @@ class DeezerConnectPlugin:
     no-op if we're already ducked; `unduck()` is a no-op if we're not.
     The single lock makes start/stop pairs safe under rapid back-to-back
     playback cycles (each player loop iteration is one duck/unduck).
+
+    Because the player applies volume writes with latency, a `duck()`
+    fired right after an `unduck()` (the auto-idle → next-reply churn when
+    utterances are queued) can read back the still-ducked level and
+    compound it (100 → 50 → 25). `_last_ducked_to` / `_last_original`
+    guard that: if a duck reads back exactly the level it last ducked to,
+    it re-arms the restore to the true baseline instead of ducking again.
     """
 
     def __init__(self, cfg: dict | None) -> None:
@@ -57,6 +64,15 @@ class DeezerConnectPlugin:
 
         self._lock = threading.Lock()
         self._original_volume: int | None = None
+        # Remember the last (true baseline, ducked-to) pair so a re-duck
+        # can tell an already-ducked read apart from a genuine fresh
+        # volume. The deezer player applies volume writes with latency, so
+        # right after `unduck()` a `duck()` GET can still read back the old
+        # ducked level; without this it would duck *that* (100→50→25) when
+        # several utterances are queued. Survives the unduck (we only need
+        # `_original_volume` cleared to re-arm; these stay).
+        self._last_original: int | None = None
+        self._last_ducked_to: int | None = None
 
     # -- startup --------------------------------------------------------
     def apply_default_volume(self) -> None:
@@ -101,12 +117,26 @@ class DeezerConnectPlugin:
                 vol = int(status.get("volume", 0))
             except (TypeError, ValueError):
                 return
+            # If we read back exactly the level we last ducked to, the
+            # player is still (or already) ducked — either a stale read
+            # right after `unduck()` (the device applies volume with
+            # latency) or it never came back up. Ducking again would
+            # compound it (100 → 50 → 25) across queued utterances. Don't
+            # re-duck; just re-arm the restore to the true baseline so the
+            # next `unduck()` puts the user back where they started.
+            if self._last_ducked_to is not None and vol == self._last_ducked_to:
+                self._original_volume = self._last_original
+                log.info("deezer-connect: already ducked at %d, re-arm restore → %s",
+                         vol, self._last_original)
+                return
             ducked = max(0, min(100, int(round(vol * self.ducking_factor))))
             if ducked == vol:
                 return
             if self._request("POST", "/api/player/volume", {"volume": ducked}) is None:
                 return
             self._original_volume = vol
+            self._last_original = vol
+            self._last_ducked_to = ducked
             log.info("deezer-connect: ducked %d → %d", vol, ducked)
 
     def unduck(self) -> None:
