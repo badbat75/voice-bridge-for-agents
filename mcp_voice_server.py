@@ -14,6 +14,12 @@ because the bridge's TTS already produces the OGG, and a one-shot
 the 409 only applies to long-polling. Requires `telegram_bot_token` in
 voice-bridge.secrets.json.
 
+A `say_to_speaker` tool is the speaker-side analogue of `say_to_telegram`:
+it synthesizes text and plays it aloud on the bridge's ALSA output device
+(`output_device`) via aplay, reusing the bridge's own playback helpers.
+Output mixes through sw_dmix, so it coexists with whatever the bridge is
+playing; it needs `aplay` on PATH and `audio`-group access.
+
 Design notes:
 - **All container <-> PCM conversion goes through ffmpeg, uniformly.** STT
   decodes whatever the client sent to S16LE mono PCM, then calls the
@@ -93,6 +99,11 @@ _cfg = _bridge.load_config()
 _stt = _bridge._build_voice_provider("stt", _cfg)
 _tts = _bridge._build_voice_provider("tts", _cfg)
 _TTS_RATE = int(_cfg["tts_sample_rate"])
+# ALSA output PCM name for the `say_to_speaker` tool — the same
+# `output_device` the bridge plays replies through (e.g. `voice_out`).
+# Playback goes through sw_dmix, so it mixes with whatever the bridge is
+# already playing; the device's mic-mute state does not gate output.
+_OUT_DEVICE = str(_cfg["output_device"])
 
 _mcp_cfg = _cfg.get("mcp_server") or {}
 _HOST = str(_mcp_cfg.get("host", "127.0.0.1"))
@@ -463,6 +474,62 @@ def say_to_telegram(
             os.remove(out_path)
         except OSError:
             pass
+
+
+def _play_pcm_blocking(pcm: bytes) -> float:
+    """Play raw S16LE mono PCM on the configured ALSA output device.
+
+    Reuses the bridge's `_aplay_popen` + `_drain_aplay`, so the wire format
+    (S16_LE mono @ `tts_sample_rate`) and the no-clip drain behaviour match
+    the bridge exactly. Network TTS feeds the whole buffer faster than
+    realtime; the `stdin.write` blocks until aplay has consumed it (i.e. for
+    the duration of playback), then `_drain_aplay` plays out the buffered
+    tail without chopping it. Returns the audio duration in seconds.
+    """
+    proc = _bridge._aplay_popen(_OUT_DEVICE, _TTS_RATE)
+    try:
+        proc.stdin.write(pcm)
+        proc.stdin.flush()
+    except BrokenPipeError:
+        # aplay died early (e.g. ALSA device busy/unavailable). Fall through
+        # to drain/reap so we can surface its exit status below.
+        pass
+    _bridge._drain_aplay(proc, _TTS_RATE)
+    if proc.returncode not in (0, None):
+        raise RuntimeError(
+            f"aplay exited with status {proc.returncode} "
+            f"(device={_OUT_DEVICE!r}) — is the ALSA output available?"
+        )
+    return len(pcm) / (_TTS_RATE * 2)
+
+
+@mcp.tool()
+def say_to_speaker(text: str) -> dict:
+    """Synthesize `text` and play it aloud on the bridge's speaker in one shot.
+
+    The speaker-side analogue of `say_to_telegram`: synthesize -> play via
+    aplay on the configured ALSA output device (`output_device` in
+    voice-bridge.json, e.g. `voice_out`). Nothing is written to disk.
+    Playback goes through sw_dmix, so it mixes with any reply the bridge is
+    already speaking, and the device's mic-mute state does NOT gate output
+    (mute only silences capture). Blocks until playback finishes. Returns
+    `{ok, chars, seconds}`.
+    """
+    if not text or not text.strip():
+        raise ValueError("text is empty")
+
+    text = _sanitize_for_tts(text)
+    if not text:
+        raise ValueError("text is empty after sanitization")
+
+    pcm = _tts.synthesize(text)
+    if not pcm:
+        raise RuntimeError("TTS produced no audio (provider error — check logs)")
+
+    seconds = _play_pcm_blocking(pcm)
+    log.info("say_to_speaker: %d chars -> %.1fs on %s",
+             len(text), seconds, _OUT_DEVICE)
+    return {"ok": True, "chars": len(text), "seconds": round(seconds, 2)}
 
 
 if __name__ == "__main__":
