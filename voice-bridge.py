@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import array
 import contextlib
+import fcntl
 import json
 import logging
 import math
@@ -347,6 +348,55 @@ def _aplay_popen(device: str, sample_rate: int, *, bufsize: int = -1) -> subproc
     return proc
 
 
+def _drain_aplay(
+    proc: subprocess.Popen,
+    sample_rate: int,
+    abort: "threading.Event | None" = None,
+) -> None:
+    """Close aplay's stdin and wait for it to play out its buffered PCM,
+    then make sure it has exited.
+
+    Network TTS feeds PCM faster than realtime, so at stdin-close the
+    unplayed tail is the kernel pipe buffer (queried exactly via
+    `F_GETPIPE_SZ`) plus aplay's ALSA ring buffer. We derive a
+    generous-but-bounded drain budget from that buffer size and the stream
+    rate, then poll until aplay exits on its own — we never kill a
+    still-draining process, which would chop the reply's tail and, because
+    `voice_out` runs through `sw_dmix` (which *mixes* streams), briefly
+    overlap the next utterance's aplay. The budget scales with
+    `sample_rate`, so it stays correct if `tts_sample_rate` changes.
+
+    `abort`, if given, cuts the wait short (bridge shutdown). A genuinely
+    hung aplay is killed once the budget is spent, so the caller can never
+    block forever.
+    """
+    bytes_per_sec = sample_rate * 2  # S16LE mono
+    try:
+        pipe_bytes = fcntl.fcntl(proc.stdin.fileno(), fcntl.F_GETPIPE_SZ)
+    except Exception:
+        pipe_bytes = 65536  # Linux default pipe capacity
+    # pipe drain time + ALSA buffer headroom & safety margin.
+    drain_budget = pipe_bytes / bytes_per_sec + 2.0
+    with contextlib.suppress(Exception):
+        proc.stdin.close()
+    deadline = time.monotonic() + drain_budget
+    while abort is None or not abort.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            proc.wait(timeout=min(0.2, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if proc.poll() is None:
+        # Budget exhausted (hung aplay) or aborted — drop it so the
+        # caller can move on.
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=1.0)
+
+
 def _apply_output_volume(cfg: dict) -> None:
     """Re-assert the configured softvol level on the output control.
 
@@ -423,9 +473,9 @@ def play_audio_stream(device: str, audio_iter: Iterable[bytes], sample_rate: int
                 break
             wrote_any = True
     finally:
-        with contextlib.suppress(Exception):
-            proc.stdin.close()
-        proc.wait()
+        # Bounded drain (see `_drain_aplay`): play out the buffered tail
+        # without chopping it, but don't hang on a dead aplay.
+        _drain_aplay(proc, sample_rate)
     return wrote_any
 
 
@@ -1123,7 +1173,18 @@ class VoiceBridge:
                 if (not in_speech
                         and idle_chunks > 0
                         and silence_count >= idle_chunks
-                        and not self._is_playing()):
+                        and not self._is_playing()
+                        and not self._idle_reset_pending.is_set()):
+                    # The `_idle_reset_pending` guard closes a race at the
+                    # tail of a reply: the player clears `_player_proc`
+                    # (so `_is_playing()` flips False) and sets the reset
+                    # flag as a pair, but the endpointer could observe the
+                    # cleared proc one tick before consuming the reset —
+                    # with `silence_count` already past the threshold from
+                    # the whole playback — and fire idle the instant the
+                    # reply finished. Holding off while a reset is pending
+                    # lets the next loop tick zero the counter first, so
+                    # the idle window truly starts at end-of-playback.
                     self._enter_idle(source=f"silence>{idle_ms}ms")
                     silence_count = 0
                     buf = []
@@ -1272,32 +1333,27 @@ class VoiceBridge:
                     if not self._write_chunk(proc, item2):
                         break
             finally:
-                # Close stdin first so aplay knows there's no more PCM
-                # coming, then wait for it to drain its ALSA buffer.
-                # Crucially, keep `_player_proc` set throughout the wait:
-                # `_is_playing()` is the endpointer's guard against firing
-                # auto-idle prematurely, and clearing the handle before
-                # `proc.wait()` returns would let the idle timer fire
-                # during the audible tail of the reply (the mic would
-                # mute the instant the user hears the end of the message).
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    proc.wait(timeout=2.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    try:
-                        proc.wait(timeout=1.0)
-                    except Exception:
-                        pass
+                # Close stdin and play out aplay's buffered tail without
+                # chopping it (bounded so a hung aplay can't pin the
+                # thread). See `_drain_aplay`: a fixed timeout + kill would
+                # clip the reply's tail and, via `sw_dmix`'s mixing, overlap
+                # the next utterance. Crucially, `_player_proc` stays set
+                # throughout the drain — it's only cleared below, after the
+                # wait returns — so `_is_playing()` keeps the endpointer
+                # from firing auto-idle during the audible tail of the reply.
+                _drain_aplay(proc, sample_rate, abort=self.shutdown_event)
+                # Order matters: signal the end-of-playback idle reset
+                # BEFORE clearing the player handle. The endpointer's idle
+                # check also gates on `_idle_reset_pending`, so as long as
+                # the flag is already set whenever `_player_proc` becomes
+                # None, the endpointer can never see "not playing + stale
+                # silence_count" and auto-idle the instant the reply ends.
+                # The flag is consumed on the endpointer's next tick, which
+                # zeroes `silence_count` — restarting the idle window from
+                # here (end of playback), as intended.
+                self._idle_reset_pending.set()
                 with self._player_lock:
                     self._player_proc = None
-                self._idle_reset_pending.set()
 
     @staticmethod
     def _write_chunk(proc: subprocess.Popen, chunk: bytes) -> bool:
