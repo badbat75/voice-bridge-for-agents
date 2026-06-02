@@ -21,6 +21,7 @@
   "session_key": "agent:main:voice-bridge",
   "voice_model": "openclaw",
   "elevenlabs": {
+    "_voiceName": "Giusy Giarry (MBI) — Italian female, conversational, Sicilian accent",
     "voiceId": "8KInRSd4DtD5L5gK7itu",
     "modelId": "eleven_v3",
     "languageCode": "it",
