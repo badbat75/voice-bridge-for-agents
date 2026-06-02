@@ -15,8 +15,8 @@
     "percent": 100
   },
   "hid_mute_enabled": true,
-  "stt_provider": "deepgram",
-  "tts_provider": "deepgram",
+  "stt_provider": "elevenlabs",
+  "tts_provider": "elevenlabs",
   "tts_streaming_mode": "http_sentence",
   "session_key": "agent:main:voice-bridge",
   "voice_model": "openclaw",
