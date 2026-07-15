@@ -23,3 +23,8 @@ __pycache__/
 # Local secrets: API keys + gateway token. Keep this file out of the repo.
 # Copy resources/voice-bridge.secrets.example.json → voice-bridge.secrets.json and fill in.
 voice-bridge.secrets.json
+
+# Local provider-swap config variants (e.g. voice-bridge.json.deepgram): a saved
+# copy of voice-bridge.json to swap in. Personal working files that drift from
+# the tracked config — keep them out of the repo.
+voice-bridge.json.*

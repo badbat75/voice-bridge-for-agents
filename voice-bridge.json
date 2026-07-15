@@ -11,7 +11,7 @@
   "output_device": "voice_out",
   "output_volume": {
     "control": "VoiceBridge",
-    "card": 1,
+    "card": "USB",
     "percent": 100
   },
   "hid_mute_enabled": true,

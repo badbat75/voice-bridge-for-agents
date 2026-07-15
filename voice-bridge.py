@@ -158,10 +158,12 @@ def load_config() -> dict:
     # independent from deezer-connect's player gain. ALSA resets a softvol
     # control to 100% when it first re-creates it after a reboot, so the
     # bridge pins the configured level on every start. Missing block / keys
-    # default to 100% on the conventional VoiceBridge control / card 1.
+    # default to 100% on the conventional VoiceBridge control / card "USB".
+    # `card` is passed to `amixer -c` verbatim: use the Jabra's card *name*
+    # ("USB"), not an index — adding an HDMI display renumbers ALSA cards.
     ov = cfg.get("output_volume") or {}
     cfg["output_volume_control"] = ov.get("control", "VoiceBridge")
-    cfg["output_volume_card"] = ov.get("card", 1)
+    cfg["output_volume_card"] = ov.get("card", "USB")
     cfg["output_volume_percent"] = int(ov.get("percent", 100))
 
     cfg["voice_model"] = cfg.get("voice_model") or "openclaw"
@@ -1024,6 +1026,31 @@ class VoiceBridge:
         stream: pyaudio.Stream | None = None
         sr = self.cfg["sample_rate"]
         chunk = self.cfg["chunk_size"]
+
+        def _safe_terminate(inst) -> None:
+            if inst is None:
+                return
+            try:
+                inst.terminate()
+            except Exception:
+                pass
+
+        def _rebuild_pa(old):
+            # Tear the old PyAudio instance down and build a fresh one so a
+            # hot-plugged Jabra becomes visible (PyAudio snapshots its device
+            # list at construction). Both the teardown and the rebuild are
+            # guarded and the rebuild retries: a transient ALSA error during an
+            # unplug must not kill the recorder thread — that would leave the
+            # mic dead until a service restart. Returns the new instance, or
+            # None when shutdown is requested while retrying.
+            _safe_terminate(old)
+            while not self.shutdown_event.wait(1.0):
+                try:
+                    return pyaudio.PyAudio()
+                except Exception as exc:
+                    log.warning("Recorder: PyAudio rebuild failed: %s — retry in 1s", exc)
+            return None
+
         try:
             while not self.shutdown_event.is_set():
                 if not self.recording.is_set():
@@ -1041,6 +1068,15 @@ class VoiceBridge:
 
                 if stream is None:
                     idx = find_input_device(pa)
+                    if idx is None:
+                        # A Jabra plugged in after we started is invisible until
+                        # we rebuild the instance — same reconnect philosophy the
+                        # HID monitor uses, so a hot-plug needs no restart.
+                        log.warning("Recorder: Jabra input not found — retry in 1s")
+                        pa = _rebuild_pa(pa)
+                        if pa is None:
+                            return
+                        continue
                     try:
                         stream = pa.open(
                             format=pyaudio.paInt16,
@@ -1054,7 +1090,8 @@ class VoiceBridge:
                                  idx, sr, chunk)
                     except Exception as exc:
                         log.warning("Recorder: cannot open: %s — retry in 1s", exc)
-                        if self.shutdown_event.wait(1.0):
+                        pa = _rebuild_pa(pa)
+                        if pa is None:
                             return
                         continue
 
@@ -1075,10 +1112,7 @@ class VoiceBridge:
                     stream.close()
                 except Exception:
                     pass
-            try:
-                pa.terminate()
-            except Exception:
-                pass
+            _safe_terminate(pa)
 
     def _endpointer_loop(self) -> None:
         """RMS VAD. Two timers run off the same per-chunk silence count:

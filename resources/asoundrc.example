@@ -4,14 +4,16 @@
 #
 # Defines the `voice_out` PCM that voice-bridge.json points at via
 # `output_device`. The softvol gives the bridge its own "VoiceBridge" mixer
-# control (card 1) so TTS loudness is independent from deezer-connect's music
+# control (card USB) so TTS loudness is independent from deezer-connect's music
 # gain. softvol sits over the shared `sw_dmix` (defined in /etc/asound.conf,
 # managed by deezer-connect) so both can play concurrently; the outer plug
 # converts the bridge's 24 kHz mono PCM up to sw_dmix's 48 kHz stereo slave.
 #
 # If you are NOT running deezer-connect, replace `sw_dmix` below with a direct
-# dmix or `hw:1,0` slave of your own. Adjust `card` to your Jabra's card index
-# (check `aplay -l`); this template assumes card 1.
+# dmix or `hw:USB,0` slave of your own. Reference the Jabra by card *name*
+# (`card USB` / `hw:USB,0`, from `aplay -l`) rather than index: adding an HDMI
+# display renumbers the ALSA cards and an index like `card 1` starts pointing
+# at the wrong device.
 #
 # `max_dB` is the gain at the VoiceBridge control's 100% position. A positive
 # ceiling lets the control boost TTS *above unity* (TTS-only — music goes
@@ -28,7 +30,7 @@ pcm.voice_out {
         slave.pcm "sw_dmix"
         control {
             name "VoiceBridge"
-            card 1
+            card USB
         }
         min_dB -51.0
         max_dB 9.0
