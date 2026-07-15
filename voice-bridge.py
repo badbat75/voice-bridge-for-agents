@@ -243,6 +243,15 @@ def load_config() -> dict:
     # below-threshold audio and pastes it in at speech onset.
     cfg["pre_speech_keep_ms"] = int(cfg.get("pre_speech_keep_ms", 100))
 
+    # When utterances pile up in `utterance_q` while a previous turn is
+    # still being processed (STT → gateway → TTS in flight — often seconds
+    # while waiting on the gateway), the worker coalesces the whole backlog
+    # into a SINGLE turn instead of firing one gateway interaction per
+    # pause-separated phrase. `utterance_merge_gap_ms` is the silence padded
+    # between merged segments so STT keeps them as distinct phrases; set to
+    # 0 for a hard concatenation.
+    cfg["utterance_merge_gap_ms"] = int(cfg.get("utterance_merge_gap_ms", 300))
+
     # TTS streaming strategy. `http_sentence` (default) buffers gateway
     # deltas to sentence boundaries and calls the HTTP streaming endpoint
     # per sentence — works on every account tier. `websocket` feeds
@@ -1281,6 +1290,44 @@ class VoiceBridge:
                     silence_count = 0
                     buf = []
 
+    def _merge_pending_utterances(self, first_pcm: bytes, sr: int, gen: int) -> bytes:
+        """Coalesce utterances that piled up in `utterance_q` while a
+        previous turn was still being processed into one PCM blob.
+
+        When the worker is busy (STT → gateway → TTS in flight, often
+        seconds while waiting on the gateway), the user may keep talking;
+        the endpointer commits each pause-separated phrase as its own
+        utterance. Processing them one-by-one fires a separate gateway
+        interaction per phrase — so a follow-up spoken during the reply
+        becomes its own conversational turn. Instead we drain everything
+        currently queued (non-blocking) and concatenate it with
+        `first_pcm`, so the whole backlog is transcribed and sent as ONE
+        message.
+
+        Only same-gen segments are merged; a stale-gen item (a hard-cancel
+        resume bumped `_gen`) is dropped. A configurable silence pad
+        (`utterance_merge_gap_ms`) separates the segments so STT keeps them
+        as distinct phrases rather than running words together.
+        """
+        segments = [first_pcm]
+        while True:
+            try:
+                g, pcm, _sr = self.utterance_q.get_nowait()
+            except queue.Empty:
+                break
+            if g != gen:
+                continue  # stale generation — drop
+            segments.append(pcm)
+        if len(segments) == 1:
+            return first_pcm
+        gap_ms = int(self.cfg.get("utterance_merge_gap_ms", 300))
+        gap = b"\x00\x00" * int(sr * gap_ms / 1000) if gap_ms > 0 else b""
+        merged = gap.join(segments)
+        log.info("Worker: merged %d queued utterances into one turn "
+                 "(%d bytes ≈ %.2fs)",
+                 len(segments), len(merged), len(merged) / (sr * 2))
+        return merged
+
     def _worker_loop(self) -> None:
         while not self.shutdown_event.is_set():
             try:
@@ -1289,6 +1336,12 @@ class VoiceBridge:
                 continue
             if gen != self._current_gen():
                 continue
+
+            # Fold in any utterances that accumulated while the previous
+            # turn was being processed, so a burst of pause-separated
+            # phrases spoken during one reply becomes a single message
+            # rather than a chain of separate gateway interactions.
+            pcm = self._merge_pending_utterances(pcm, sr, gen)
 
             log.info("Worker: STT (%d bytes ≈ %.2fs)", len(pcm), len(pcm) / (sr * 2))
             text = self.stt.transcribe(pcm, sr)
