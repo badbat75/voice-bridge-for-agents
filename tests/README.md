@@ -9,6 +9,7 @@ needs to actually run.
 | `test_hid_interactive.py` | **Jabra plugged in** | no | Manual: prompts the operator to press the button N times and asserts edge counts. Run on the Pi. |
 | `test_voice_providers.py` | no | no | Provider interface/contract, defaults, config plumbing, factory wiring. Uses dummy API keys; no outbound calls. |
 | `test_streaming_pipeline.py` | no | loopback only | SSE parser + ElevenLabs / Deepgram `synthesize_stream` (SDK mocked) + `play_audio_stream` (Popen mocked) + a glue test that wires all three. |
+| `test_non_speech_filter.py` | no | no | `_is_non_speech` predicate + its `_worker_loop` wiring. Stubbed STT/TTS, gateway patched on the module; no PyAudio, no Jabra, no HTTP. |
 | `test_gateway_integration.py` | no | live gateway | Real round-trip against the OpenClaw gateway using the local `voice-bridge.json` + `voice-bridge.secrets.json`. Auto-skips if the gateway isn't reachable. |
 
 ## Running
@@ -19,6 +20,7 @@ Always use the local venv — none of the deps are installed system-wide:
 .venv/bin/python tests/test_hid_mute.py
 .venv/bin/python tests/test_voice_providers.py
 .venv/bin/python tests/test_streaming_pipeline.py
+.venv/bin/python tests/test_non_speech_filter.py
 .venv/bin/python tests/test_gateway_integration.py
 .venv/bin/python tests/test_hid_interactive.py [N]   # default N=3
 ```
@@ -73,6 +75,24 @@ the four hardware-free files.
   - End-to-end: real loopback gateway + fake TTS + fake aplay,
     verifying delta order is preserved and the first audio reaches
     aplay before the last gateway delta lands.
+
+- **`test_non_speech_filter.py`** — the guard that broke the
+  self-feeding noise loop of 2026-07-31. ElevenLabs STT transcribes
+  wordless audio as bracketed audio-event tags (`[click]`,
+  `[rumore di fogli]`, `[rumore di sottofondo]`) rather than an empty
+  string, so those used to pass the `if not text` check and reach the
+  gateway as a real turn — the agent answered "Sono qui.", the speaker
+  replayed it into the still-open mic, and the loop fed itself.
+  - `_is_non_speech` recognises the three real tags, their
+    parenthesised variants, several tags in one string, and
+    punctuation-only input as non-speech;
+  - it lets plain Italian speech, accented words, a tag glued to real
+    speech (`[click] accendi la luce`), and a sentence containing a
+    parenthetical pass through untouched;
+  - `_worker_loop` skips a non-speech transcription without ever
+    calling the gateway or enqueuing playback, while a genuine
+    transcript still reaches the gateway (positive control) — proving
+    the guard drops only noise and doesn't wedge every turn.
 
 - **`test_gateway_integration.py`** — the live-gateway leg of a turn.
   Runs `gateway_chat()` (non-streaming) and `gateway_chat_stream()`

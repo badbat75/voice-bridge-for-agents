@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -576,6 +577,24 @@ def _filter_no_reply(stream: Iterable[str]) -> Iterator[str]:
         if buf.strip() in NO_REPLY_SENTINELS:
             return
         yield buf
+
+
+# Non-verbal events an STT provider transcribes instead of returning an empty
+# string: ElevenLabs emits bracketed audio-event tags ("[click]", "[rumore di
+# fogli]", "[rumore di sottofondo]"), other engines use parentheses. They are
+# non-empty strings, so without this guard they reach the gateway as a real
+# user turn and the agent answers a noise — which the speaker replays into the
+# still-open mic (`play_pcm` unmutes for external speech), transcribes as more
+# noise, and the loop feeds itself. Same "nothing to say" decision as a
+# NO_REPLY reply, taken one stage earlier and without the round-trip.
+_NON_SPEECH_TAG_RE = re.compile(r"[\[(][^\])]*[\])]")
+
+
+def _is_non_speech(text: str) -> bool:
+    """True when `text` is only audio-event tags and punctuation, i.e. the
+    utterance carried no words at all. A tag mixed with real speech
+    ("[click] accendi la luce") is speech and passes through unchanged."""
+    return not any(ch.isalnum() for ch in _NON_SPEECH_TAG_RE.sub(" ", text))
 
 
 def gateway_chat_stream(
@@ -1355,6 +1374,9 @@ class VoiceBridge:
             text = self.stt.transcribe(pcm, sr)
             if not text:
                 log.info("Worker: empty transcription, skipping")
+                continue
+            if _is_non_speech(text):
+                log.info("Worker: non-speech transcription %s, skipping", text)
                 continue
             if gen != self._current_gen():
                 continue
