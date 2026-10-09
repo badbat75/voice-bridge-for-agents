@@ -514,9 +514,15 @@ class _FakePopen:
 
         return _Stdin()
 
-    def wait(self):
+    def wait(self, timeout=None):
         self.waited = True
         return 0
+
+    def poll(self):
+        return 0 if self.waited else None
+
+    def kill(self):
+        pass
 
 
 class PlayAudioStreamTest(unittest.TestCase):
