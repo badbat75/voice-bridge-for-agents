@@ -96,6 +96,14 @@ def _make_bridge(cfg: dict) -> "tuple":
     return bridge, vb
 
 
+def _recording(bridge) -> None:
+    """Put the bridge in RECORDING (as a resume would) and forget that LED
+    write, so a test asserts only the transitions it drives."""
+    bridge._set_state(type(bridge._state).RECORDING)
+    for attr in ("set_led_calls", "leds"):
+        getattr(bridge.hid, attr, []).clear()
+
+
 def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -196,7 +204,7 @@ class WorkerLoopGuardTest(unittest.TestCase):
         """STT returns "[click]" (the incident's first tag). The worker
         must skip the turn: gateway untouched, nothing on `playback_q`."""
         bridge, vb = _make_bridge(_cfg())
-        bridge.recording.set()
+        _recording(bridge)
         bridge.stt.transcribe = mock.Mock(return_value="[click]")
         gateway_mock = mock.Mock(name="gateway_chat_stream")
 
@@ -214,7 +222,7 @@ class WorkerLoopGuardTest(unittest.TestCase):
         gateway (and its reply reaches the player), proving the guard
         drops only non-speech and doesn't wedge every turn."""
         bridge, vb = _make_bridge(_cfg())
-        bridge.recording.set()
+        _recording(bridge)
         bridge.stt.transcribe = mock.Mock(return_value="accendi la luce")
         gateway_mock = mock.Mock(name="gateway_chat_stream",
                                  return_value=iter(["accendi", " la luce"]))

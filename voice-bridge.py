@@ -25,6 +25,7 @@ single RMS per ~64 ms chunk, worker/player are idle off-turn.
 from __future__ import annotations
 
 import contextlib
+import enum
 import functools
 import logging
 import queue
@@ -95,16 +96,34 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 # Async pipeline orchestrator
 # ---------------------------------------------------------------------------
+class State(enum.Enum):
+    """The bridge's mode. `VoiceBridge._set_state` derives everything else
+    from it: the `recording` / `_wake_armed` Events the recorder routes on,
+    and the LED / firmware capture mute. Transition table: AGENTS.md."""
+    RECORDING = "recording"            # mic → endpointer, LED off
+    PROCESSING = "processing"          # mic paused for the agent, LED off
+    IDLE_LISTENING = "idle_listening"  # wake word armed, LED off (mic open)
+    MUTED = "muted"                    # firmware-muted, LED red
+
+
+# Derived from the state: (records, wake armed, firmware-muted).
+_STATE_EFFECTS = {
+    State.RECORDING: (True, False, False),
+    State.PROCESSING: (False, False, False),
+    State.IDLE_LISTENING: (False, True, False),
+    State.MUTED: (False, False, True),
+}
+
+
 def _transition(method):
     """Run a `VoiceBridge` state transition under `_state_lock`.
 
-    The bridge state is a set of Events (`recording`, `_wake_armed`,
-    `_auto_idled`, `_processing`, …) plus plain fields (`_idle_window_ms`,
-    `_replies_since_resume`, `_quiet_idle`, `_reply_is_question`) written
-    from the HID, endpointer, worker, player and MCP threads. Each
-    transition reads several of them and then writes several; the lock
-    (re-entrant: transitions call each other) makes every such
-    check-then-act atomic. Transitions must not block while holding it."""
+    The bridge state is `_state` + `_auto_idled` plus plain fields
+    (`_idle_window_ms`, `_replies_since_resume`, `_quiet_idle`,
+    `_reply_is_question`) written from the HID, endpointer, worker, player
+    and MCP threads. Each transition reads several of them and then writes
+    several; the lock (re-entrant: transitions call each other) makes every
+    such check-then-act atomic. Transitions must not block while holding it."""
     @functools.wraps(method)
     def locked(self, *args, **kwargs):
         with self._state_lock:
@@ -274,17 +293,17 @@ class VoiceBridge:
         self.playback_q: "queue.Queue[tuple[int, bytes | _EndOfUtterance]]" = queue.Queue()
 
         self.shutdown_event = threading.Event()
-        # `recording` gates the recorder thread. With HID enabled (the
-        # canonical deployment), the bridge boots muted — the
-        # HidMuteMonitor's engage write puts the device into firmware-
-        # mute (LED red, USB capture silenced) and `recording` stays
-        # clear until the user presses the button. Cleared/set in pairs
-        # with `hid.set_led()` so device state always tracks `recording`.
+        # The bridge's mode; only `_set_state` writes it. With HID enabled
+        # (the canonical deployment) the bridge boots MUTED — the
+        # HidMuteMonitor's engage write puts the device into firmware-mute
+        # (LED red, USB capture silenced) until the user presses the button.
         # If HID is disabled, fall back to "always-on" boot so there's
         # still a way to use the bridge — without HID there's nothing to
-        # un-mute it from a muted boot.
+        # un-mute it from a muted boot. Wake mode boots IDLE_LISTENING
+        # (set below). `recording` is derived: it gates the recorder thread.
+        self._state = State.RECORDING if not cfg.get("hid_mute_enabled") else State.MUTED
         self.recording = threading.Event()
-        if not cfg.get("hid_mute_enabled"):
+        if self._state is State.RECORDING:
             self.recording.set()
 
         self._gen = 0
@@ -306,19 +325,13 @@ class VoiceBridge:
         # but stop listening for new input.
         self._force_commit = threading.Event()
 
-        # Set by `_enter_idle` (auto-idle on silence), cleared on the
-        # next user transition. The player checks it when the first PCM
-        # chunk of a reply arrives: if the bridge auto-idled mid-turn
-        # (silence timeout while the worker was still processing), the
-        # player un-idles itself so the user can talk back the moment
-        # the reply ends. If the user explicitly muted via HID, this
-        # flag stays clear and the player respects the press — playback
-        # happens but the mic stays muted afterwards.
-        self._auto_idled = threading.Event()
-        # Set from an utterance commit until the reply starts playing (or the
-        # turn ends without one): the mic is not recorded while the agent
-        # is processing, so nothing piles up behind the turn.
-        self._processing = threading.Event()
+        # Rides along with `_state` (set by `_set_state`): the bridge left
+        # RECORDING on its own — auto-idle on silence, or PROCESSING. The
+        # player checks it when the first PCM chunk of a reply arrives and
+        # un-idles so the user can talk back the moment the reply ends. If
+        # the user explicitly muted via HID it is clear and the player
+        # respects the press — playback happens, the mic stays muted.
+        self._auto_idled = False
 
         # The active aplay process, if any. Held under `_player_lock`
         # so a hard-cancel from the HID thread can `kill()` it without
@@ -326,11 +339,10 @@ class VoiceBridge:
         self._player_proc: subprocess.Popen | None = None
         self._player_lock = threading.Lock()
 
-        # Wake-word activation. `_wake_armed` set = idle but listening for
-        # the wake phrase: the firmware mic stays unmuted and the recorder
-        # routes chunks to `wake_q` instead of `audio_q`. Cleared by an HID
-        # mute (privacy: firmware-muted, only the button resumes) and while
-        # recording. Always clear in "button" mode.
+        # Wake-word activation. `_wake_armed` (derived: set exactly in
+        # IDLE_LISTENING) = idle but listening for the wake phrase: the
+        # firmware mic stays unmuted and the recorder routes chunks to
+        # `wake_q` instead of `audio_q`. Always clear in "button" mode.
         self.wake_mode = cfg.get("activation") == "wake_word"
         # Bounded: if the wake loop stalls or dies, the recorder drops the
         # oldest audio instead of growing the queue until the OOM killer.
@@ -356,7 +368,8 @@ class VoiceBridge:
             self._wake_acks = wake_word.AckBank(cfg, w["acks"], voice, ack_dir, tts, kind="wake")
             self._sleep_acks = wake_word.AckBank(
                 cfg, w["sleep_acks"], voice, ack_dir, tts, kind="sleep")
-            if not self.recording.is_set():
+            if self._state is State.MUTED:
+                self._state = State.IDLE_LISTENING
                 self._wake_armed.set()
 
         # Spoken "un attimo" clips for the thinking cue (any activation mode).
@@ -485,6 +498,27 @@ class VoiceBridge:
             self._duck_release(reason)
 
     @_transition
+    def _set_state(self, new: State, *, auto_idled: bool = False) -> None:
+        """Enter `new` and derive the rest: `recording`, `_wake_armed` and
+        the LED / firmware mute (written only when it changes).
+
+        Event order keeps every mic chunk on one route: entering RECORDING
+        sets `recording` before clearing `_wake_armed` (the recorder checks
+        `recording` first), leaving it arms the wake word before clearing
+        `recording`."""
+        old_muted = _STATE_EFFECTS[self._state][2]
+        self._state = new
+        self._auto_idled = auto_idled
+        records, armed, muted = _STATE_EFFECTS[new]
+        if records:
+            self.recording.set()
+        (self._wake_armed.set if armed else self._wake_armed.clear)()
+        if not records:
+            self.recording.clear()
+        if muted != old_muted:
+            self.hid.set_led(muted=muted)
+
+    @_transition
     def _enter_idle(self, source: str) -> None:
         """Hard idle: close mic, firmware-mute, LED red.
 
@@ -502,18 +536,17 @@ class VoiceBridge:
         the outcome; sparing the endpointer the work of filtering it
         out chunk-by-chunk on resume.
         """
-        if not self.recording.is_set():
+        if self._state is not State.RECORDING:
             return
         log.info("Idle (%s): closing mic, in-flight pipeline continues", source)
-        self.recording.clear()
+        # auto_idled: the player un-idles when the in-flight reply starts
+        # playing — see `_player_loop`. In wake mode idle-but-listening:
+        # the firmware mic must stay open or the wake loop would hear only
+        # zeros, so the LED stays off too.
+        self._set_state(State.IDLE_LISTENING if self.wake_mode else State.MUTED,
+                        auto_idled=True)
         self._drain_queue(self.audio_q)
-        # Mark this idle as auto so the player un-idles itself when the
-        # in-flight reply starts playing — see `_player_loop`.
-        self._auto_idled.set()
         if self.wake_mode:
-            # Idle-but-listening: the firmware mic must stay open or the
-            # wake loop would hear only zeros, so the LED stays off too.
-            self._wake_armed.set()
             # Say goodbye — unless a reply is still on its way, in which
             # case the player un-idles for it and "a dopo" would be a lie.
             # Only after a conversation, though: a wake that got no reply
@@ -531,8 +564,6 @@ class VoiceBridge:
                     clip = ("tone", "(sleep tone)", _make_sleep_tone_pcm(rate))
                 threading.Thread(target=self._say_goodbye, args=(clip,),
                                  name="vb-goodbye", daemon=True).start()
-        else:
-            self.hid.set_led(muted=True)
 
     def _turn_in_flight(self) -> bool:
         """A turn is being processed, waiting, or its reply is playing."""
@@ -586,16 +617,13 @@ class VoiceBridge:
 
     @_transition
     def _on_hid_press(self) -> None:
-        if self._processing.is_set():
+        if self._state is State.PROCESSING:
             # Mic is only paused for the agent; a press here means "mute".
             # No gen bump, so the reply still plays — the mic stays muted.
             log.info("HID press while processing: mute (reply still plays)")
-            self._processing.clear()
-            self._auto_idled.clear()
-            self._wake_armed.clear()
-            self.hid.set_led(muted=True)
+            self._set_state(State.MUTED)
             return
-        if self.recording.is_set():
+        if self._state is State.RECORDING:
             if self._reply_playing():
                 self._stop_reply()
                 return
@@ -609,11 +637,9 @@ class VoiceBridge:
             # No queue drain, no gen bump, no aplay kill — those would
             # discard the very thing the user pressed mute to send.
             self._force_commit.set()
-            self.recording.clear()
             # An explicit mute is a privacy mute in wake mode too: firmware
             # silenced, wake word off, only the button resumes.
-            self._wake_armed.clear()
-            self.hid.set_led(muted=True)
+            self._set_state(State.MUTED)
         elif self._reply_playing():
             # Muted earlier (press while processing) and the reply is now
             # playing: a second press means "stop talking, I'm listening".
@@ -631,8 +657,6 @@ class VoiceBridge:
         # Bump gen so any stragglers from before (e.g. an old
         # in-progress speech buffer the endpointer might have under
         # the previous gen) are shed by downstream stages.
-        self._auto_idled.clear()
-        self._processing.clear()
         self._replies_since_resume = 0
         self._quiet_idle = False
         self._set_idle_window("idle_after_resume_ms")
@@ -641,11 +665,7 @@ class VoiceBridge:
         # recorder's first live chunk.
         for chunk in prefill:
             self.audio_q.put((gen, chunk))
-        # `recording` before clearing `_wake_armed`: the recorder checks
-        # `recording` first, so no chunk falls between the two routes.
-        self.recording.set()
-        self._wake_armed.clear()
-        self.hid.set_led(muted=False)
+        self._set_state(State.RECORDING)
 
     @_transition
     def _on_wake(self, text: str, segment: bytes = b"", backlog: "Iterable[bytes]" = (),
@@ -658,7 +678,7 @@ class VoiceBridge:
         wake segment itself) too when Whistle heard words after the phrase
         (`command`) — STT then gets the whole sentence. With a command under
         way a soft tick replaces the spoken ack, so it doesn't talk over it."""
-        if not self._wake_armed.is_set() or self.recording.is_set():
+        if self._state is not State.IDLE_LISTENING:
             return
         log.info("Wake word: %r%s", text, f" + command {command!r}" if command else "")
         prefill = list(self._split_chunks(segment)) if command else []
@@ -859,9 +879,8 @@ class VoiceBridge:
         open (and recorded into `wake_q`) for a wake word nobody can hear."""
         self.wake_mode = False
         self._drain_queue(self.wake_q)
-        if self._wake_armed.is_set():
-            self._wake_armed.clear()
-            self.hid.set_led(muted=True)
+        if self._state is State.IDLE_LISTENING:
+            self._set_state(State.MUTED, auto_idled=self._auto_idled)
 
     def _wake_loop(self) -> None:
         """Idle wake-word spotting: gate chunks on energy, Whistle the rest."""
@@ -1012,27 +1031,20 @@ class VoiceBridge:
         """A reply's first audio is about to play: if the bridge went idle
         on its own meanwhile (auto-idle, or the pause for processing), open
         the mic again so the user can talk back the moment it ends."""
-        if not self._auto_idled.is_set():
+        if not self._auto_idled:
             return  # an explicit HID mute wins: play, but stay muted
         log.info("Player: un-idling for playback (auto-idle, "
                  "resume mic + LED off)")
-        self._auto_idled.clear()
-        self._processing.clear()
-        self.recording.set()
-        self.hid.set_led(muted=False)
+        self._set_state(State.RECORDING)
         self._idle_reset_pending.set()
 
     @_transition
     def _unmute_for_external(self) -> None:
         """say_to_speaker: unmute like a normal speech (mirrors the HID
         resume and the player's auto-resume); idempotent if unmuted."""
-        if not self.recording.is_set():
+        if self._state is not State.RECORDING:
             log.info("play_pcm: unmuting for external speech (mic open, LED off)")
-            self._wake_armed.clear()
-            self.recording.set()
-            self.hid.set_led(muted=False)
-        self._auto_idled.clear()
-        self._processing.clear()
+        self._set_state(State.RECORDING)
 
     @_transition
     def _pause_for_processing(self) -> None:
@@ -1041,26 +1053,22 @@ class VoiceBridge:
         The player resumes the mic when the reply starts (via `_auto_idled`,
         same as an auto-idle), and the worker resumes it if the turn ends
         without a reply (noise, empty STT, gateway error). The LED and
-        firmware mute are left alone: this is not a mute, just not listening.
+        firmware mute stay off: this is not a mute, just not listening.
         """
-        if not self.recording.is_set():
+        if self._state is not State.RECORDING:
             return
         log.info("Processing: mic paused until the reply starts")
-        self.recording.clear()
+        self._set_state(State.PROCESSING, auto_idled=True)
         self._drain_queue(self.audio_q)
-        self._processing.set()
-        self._auto_idled.set()
 
     @_transition
     def _resume_after_processing(self) -> None:
         """Turn ended with nothing to play: listen again."""
-        if not self._processing.is_set():
+        if self._state is not State.PROCESSING:
             return
-        self._processing.clear()
-        self._auto_idled.clear()
         log.info("Processing: no reply, resuming mic")
         self._idle_reset_pending.set()
-        self.recording.set()
+        self._set_state(State.RECORDING)
 
     def _discard_utterances(self, gen: int) -> int:
         """Drop every queued utterance; returns how many were under `gen`
@@ -1078,7 +1086,7 @@ class VoiceBridge:
             # Every `continue` below lands back here, so busy spans exactly
             # pick-up → reply handed to the player (or turn dropped).
             self._worker_busy.clear()
-            if (self._processing.is_set() and self.utterance_q.empty()
+            if (self._state is State.PROCESSING and self.utterance_q.empty()
                     and not self._reply_playing()):
                 self._resume_after_processing()
             try:
@@ -1447,7 +1455,7 @@ class VoiceBridge:
         if self.wake_mode:
             # Boot idle-but-listening: firmware mic open (the HID monitor
             # boots muted), acks synthesized/loaded off the hot path.
-            if self._wake_armed.is_set():
+            if self._state is State.IDLE_LISTENING:
                 self.hid.set_led(muted=False)
             loops += [("wake", self._wake_loop),
                       ("wake-acks", lambda: self._wake_acks.prepare(self.shutdown_event)),

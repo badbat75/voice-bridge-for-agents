@@ -265,6 +265,14 @@ def _bridge(activation: str):
     return bridge, hid, vb
 
 
+def _recording(bridge) -> None:
+    """Put the bridge in RECORDING (as a resume would) and forget that LED
+    write, so a test asserts only the transitions it drives."""
+    bridge._set_state(type(bridge._state).RECORDING)
+    for attr in ("set_led_calls", "leds"):
+        getattr(bridge.hid, attr, []).clear()
+
+
 class SpokenTagsTest(unittest.TestCase):
     def _bank(self, **cfg):
         return wake_word.AckBank(cfg, [], "elevenlabs", "/nonexistent", None)
@@ -326,7 +334,9 @@ class WakeTransitionsTest(unittest.TestCase):
         self.assertEqual(recording_during_ack, [True], "mic must be open while the ack plays")
         self.assertFalse(bridge._wake_armed.is_set())
         self.assertEqual(bridge._current_gen(), gen + 1)
-        self.assertEqual(hid.leds[-1], False)
+        # Idle-listening already had the LED off: nothing to write.
+        self.assertEqual(bridge._state, vb.State.RECORDING)
+        self.assertEqual(hid.leds, [])
 
     def test_wake_without_acks_beeps(self):
         bridge, _, vb = _bridge("wake_word")
@@ -362,7 +372,7 @@ class WakeTransitionsTest(unittest.TestCase):
 
     def test_wake_ignored_when_disarmed(self):
         bridge, _, vb = _bridge("wake_word")
-        bridge._wake_armed.clear()
+        bridge._set_state(vb.State.MUTED)
         with mock.patch.object(vb, "play_beep") as beep:
             bridge._on_wake("hey binary")
         beep.assert_not_called()

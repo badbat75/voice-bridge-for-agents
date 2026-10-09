@@ -141,6 +141,14 @@ def _make_bridge(cfg: dict) -> "tuple":
     return bridge, hid, vb
 
 
+def _recording(bridge) -> None:
+    """Put the bridge in RECORDING (as a resume would) and forget that LED
+    write, so a test asserts only the transitions it drives."""
+    bridge._set_state(type(bridge._state).RECORDING)
+    for attr in ("set_led_calls", "leds"):
+        getattr(bridge.hid, attr, []).clear()
+
+
 def _start_endpointer(bridge) -> threading.Thread:
     t = threading.Thread(target=bridge._endpointer_loop, daemon=True)
     t.start()
@@ -181,7 +189,7 @@ class SoundGateTest(unittest.TestCase):
         queue empty."""
         cfg = _cfg(idle_timeout_ms=0)  # disable idle so silence just sits
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             _push(bridge, bridge._current_gen(), [_silence_chunk()] * 30)
@@ -197,7 +205,7 @@ class SoundGateTest(unittest.TestCase):
         utterance queue, with non-empty PCM tagged with the right gen."""
         cfg = _cfg(idle_timeout_ms=0)
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             gen = bridge._current_gen()
@@ -224,32 +232,32 @@ class SoundGateTest(unittest.TestCase):
         that ends with nothing to play resumes the mic."""
         cfg = _cfg(idle_timeout_ms=0)
         bridge, hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             _push(bridge, bridge._current_gen(), [_speech_chunk()] * 4 + [_silence_chunk()] * 5)
             self.assertTrue(_wait_until(lambda: not bridge.utterance_q.empty()))
-            self.assertTrue(_wait_until(lambda: bridge._processing.is_set()))
+            self.assertTrue(_wait_until(lambda: bridge._state.name == "PROCESSING"))
             self.assertFalse(bridge.recording.is_set(), "mic must pause while processing")
-            self.assertTrue(bridge._auto_idled.is_set(), "player must resume on playback")
+            self.assertTrue(bridge._auto_idled, "player must resume on playback")
             self.assertEqual(hid.set_led_calls, [], "pausing is not a mute")
             bridge.utterance_q.get_nowait()
             bridge._resume_after_processing()
             self.assertTrue(bridge.recording.is_set())
-            self.assertFalse(bridge._processing.is_set())
+            self.assertFalse(bridge._state.name == "PROCESSING")
         finally:
             _stop_endpointer(bridge, t)
 
     def test_press_while_processing_mutes_without_gen_bump(self):
         cfg = _cfg(idle_timeout_ms=0)
         bridge, hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         bridge._pause_for_processing()
         gen = bridge._current_gen()
         bridge._on_hid_press()
         self.assertEqual(bridge._current_gen(), gen, "the reply must still play")
         self.assertFalse(bridge.recording.is_set())
-        self.assertFalse(bridge._auto_idled.is_set(), "player must not un-mute")
+        self.assertFalse(bridge._auto_idled, "player must not un-mute")
         self.assertEqual(hid.set_led_calls, [True])
 
     def test_burst_shorter_than_min_speech_is_dropped(self):
@@ -257,7 +265,7 @@ class SoundGateTest(unittest.TestCase):
         never reaches the utterance queue; a 4-chunk burst still does."""
         cfg = _cfg(idle_timeout_ms=0, min_speech_ms=192)
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             gen = bridge._current_gen()
@@ -278,7 +286,7 @@ class SoundGateTest(unittest.TestCase):
         no in_speech transition, no commit."""
         cfg = _cfg(idle_timeout_ms=0)
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             _push(bridge, bridge._current_gen(),
@@ -310,7 +318,7 @@ class ActivationTimingsTest(unittest.TestCase):
         accidentally halve the commit pause."""
         cfg = _cfg(silence_timeout_ms=192, idle_timeout_ms=0)
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             gen = bridge._current_gen()
@@ -336,7 +344,7 @@ class ActivationTimingsTest(unittest.TestCase):
         `recording` and writes the LED to muted=True via the stub."""
         cfg = _cfg(idle_timeout_ms=192)  # 3 chunks
         bridge, hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             _push(bridge, bridge._current_gen(), [_silence_chunk()] * 8)
@@ -357,7 +365,7 @@ class ActivationTimingsTest(unittest.TestCase):
         Mock in `_player_proc`."""
         cfg = _cfg(idle_timeout_ms=128)  # 2 chunks
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         bridge._player_proc = mock.Mock()  # _is_playing() → True
         t = _start_endpointer(bridge)
         try:
@@ -377,7 +385,7 @@ class ActivationTimingsTest(unittest.TestCase):
         silence_timeout_ms ≤ idle_timeout_ms)."""
         cfg = _cfg(silence_timeout_ms=128, idle_timeout_ms=320)
         bridge, hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             gen = bridge._current_gen()
@@ -389,7 +397,7 @@ class ActivationTimingsTest(unittest.TestCase):
             # Right after commit the mic is paused for processing — not
             # idled: no firmware mute (idle starts after the turn, not at
             # the speech onset 200 ms ago).
-            self.assertTrue(_wait_until(bridge._processing.is_set))
+            self.assertTrue(_wait_until(lambda: bridge._state.name == "PROCESSING"))
             self.assertFalse(bridge._wake_armed.is_set())
             self.assertEqual(hid.set_led_calls, [], "commit must not idle/mute")
         finally:
@@ -419,14 +427,14 @@ class MuteTriggerTest(unittest.TestCase):
         self.assertFalse(bridge.recording.is_set())
         gen0 = bridge._current_gen()
         # Pretend the bridge had auto-idled — the resume must clear it.
-        bridge._auto_idled.set()
+        bridge._auto_idled = True
 
         bridge._on_hid_press()
 
         self.assertTrue(bridge.recording.is_set())
         self.assertGreater(bridge._current_gen(), gen0,
                            "press-to-resume must bump the generation counter")
-        self.assertFalse(bridge._auto_idled.is_set(),
+        self.assertFalse(bridge._auto_idled,
                          "press-to-resume must clear the auto-idle flag")
         self.assertEqual(hid.set_led_calls[-1], False,
                          "LED must turn off when bridge resumes recording")
@@ -438,7 +446,7 @@ class MuteTriggerTest(unittest.TestCase):
         must be set (endpointer will flush its in-progress buffer), and
         the LED must be back on."""
         bridge, hid, _vb = _make_bridge(_cfg())
-        bridge.recording.set()
+        _recording(bridge)
         gen0 = bridge._current_gen()
 
         # Pre-load the input queues so we can prove they were NOT drained.
@@ -469,7 +477,7 @@ class MuteTriggerTest(unittest.TestCase):
         whatever the user just finished saying gets dropped on press."""
         cfg = _cfg(idle_timeout_ms=0)
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         gen0 = bridge._current_gen()
         t = _start_endpointer(bridge)
         try:
@@ -505,7 +513,7 @@ class MuteTriggerTest(unittest.TestCase):
         remain (recording cleared, LED on)."""
         cfg = _cfg(idle_timeout_ms=0)
         bridge, hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             # Push only silence so the endpointer never enters in_speech.
@@ -531,15 +539,15 @@ class MuteTriggerTest(unittest.TestCase):
         first PCM."""
         cfg = _cfg(idle_timeout_ms=192)
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
-        self.assertFalse(bridge._auto_idled.is_set())
+        _recording(bridge)
+        self.assertFalse(bridge._auto_idled)
         t = _start_endpointer(bridge)
         try:
             _push(bridge, bridge._current_gen(), [_silence_chunk()] * 8)
             self.assertTrue(_wait_until(lambda: not bridge.recording.is_set(),
                                         timeout=2.0),
                             "auto-idle never fired")
-            self.assertTrue(bridge._auto_idled.is_set(),
+            self.assertTrue(bridge._auto_idled,
                             "auto-idle must set the _auto_idled flag")
         finally:
             _stop_endpointer(bridge, t)
@@ -549,12 +557,12 @@ class MuteTriggerTest(unittest.TestCase):
         not later re-open the mic mid-playback. Only the timeout-driven
         path sets the flag."""
         bridge, _hid, _vb = _make_bridge(_cfg())
-        bridge.recording.set()
-        self.assertFalse(bridge._auto_idled.is_set())
+        _recording(bridge)
+        self.assertFalse(bridge._auto_idled)
 
         bridge._on_hid_press()
 
-        self.assertFalse(bridge._auto_idled.is_set(),
+        self.assertFalse(bridge._auto_idled,
                          "press-to-mute must not set the auto-idle flag")
 
     def test_press_toggles_back_and_forth(self):
@@ -591,7 +599,7 @@ class MuteTriggerTest(unittest.TestCase):
         before the cancel."""
         cfg = _cfg(idle_timeout_ms=0)
         bridge, _hid, _vb = _make_bridge(cfg)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             stale = bridge._current_gen()
@@ -638,7 +646,7 @@ class DuckingTest(unittest.TestCase):
 
     def test_speech_ducks_on_onset_and_unducks_at_commit(self):
         bridge, events = self._bridge()
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             gen = bridge._current_gen()
@@ -655,7 +663,7 @@ class DuckingTest(unittest.TestCase):
 
     def test_dropped_burst_unducks(self):
         bridge, events = self._bridge(min_speech_ms=192)
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             _push(bridge, bridge._current_gen(),
@@ -667,7 +675,7 @@ class DuckingTest(unittest.TestCase):
 
     def test_force_commit_unducks(self):
         bridge, events = self._bridge()
-        bridge.recording.set()
+        _recording(bridge)
         t = _start_endpointer(bridge)
         try:
             _push(bridge, bridge._current_gen(), [_speech_chunk()] * 3)

@@ -109,6 +109,14 @@ def _bridge(**over):
     return bridge, hid
 
 
+def _recording(bridge) -> None:
+    """Put the bridge in RECORDING (as a resume would) and forget that LED
+    write, so a test asserts only the transitions it drives."""
+    bridge._set_state(type(bridge._state).RECORDING)
+    for attr in ("set_led_calls", "leds"):
+        getattr(bridge.hid, attr, []).clear()
+
+
 class _FakeAplay:
     """Records writes; `wait` returns at once unless `hold` is set (then it
     blocks until kill(), like a real aplay still draining audio)."""
@@ -360,7 +368,7 @@ class PrebufferTest(unittest.TestCase):
 class BargeInTest(unittest.TestCase):
     def test_press_while_reply_plays_stops_it_and_listens(self):
         bridge, hid = _bridge()
-        bridge.recording.set()  # player un-idled for the reply
+        _recording(bridge)  # player un-idled for the reply
         proc = _FakeAplay()
         bridge._player_proc = proc
         gen0 = bridge._current_gen()
@@ -378,7 +386,8 @@ class BargeInTest(unittest.TestCase):
         self.assertTrue(ext.done.is_set(), "a blocked say_to_speaker must be released")
         self.assertTrue(bridge.recording.is_set(), "mic open right away")
         self.assertFalse(bridge._force_commit.is_set())
-        self.assertEqual(hid.leds[-1], False)
+        self.assertEqual(bridge._state, VB.State.RECORDING)
+        self.assertEqual(hid.leds, [], "LED was already off")
 
     def test_press_while_muted_and_reply_plays_also_stops(self):
         bridge, hid = _bridge()
@@ -389,7 +398,7 @@ class BargeInTest(unittest.TestCase):
 
     def test_press_while_processing_still_mutes(self):
         bridge, hid = _bridge()
-        bridge._processing.set()
+        bridge._set_state(VB.State.PROCESSING, auto_idled=True)
         bridge._player_proc = _FakeAplay()  # a thinking tick is audible
         gen0 = bridge._current_gen()
         bridge._on_hid_press()
@@ -460,7 +469,7 @@ class SpeechFilterTest(unittest.TestCase):
         bridge._speech_vad = mock.Mock()
         bridge._speech_vad.is_speech.return_value = voiced
         bridge.cfg["speech_filter"]["min_voiced_ms"] = 200
-        bridge.recording.set()
+        _recording(bridge)
         t = threading.Thread(target=bridge._endpointer_loop, daemon=True)
         t.start()
         gen = bridge._current_gen()
@@ -604,7 +613,7 @@ class IdleWindowTest(unittest.TestCase):
 
     def test_endpointer_waits_for_the_widened_window(self):
         bridge, _ = _bridge(idle_timeout_ms=320, idle_after_reply_ms=960)
-        bridge.recording.set()
+        _recording(bridge)
         bridge._idle_window_ms = 960  # a reply just finished
         t = threading.Thread(target=bridge._endpointer_loop, daemon=True)
         t.start()
@@ -623,7 +632,7 @@ class IdleWindowTest(unittest.TestCase):
 class MaxUtteranceTest(unittest.TestCase):
     def test_side_conversation_is_dropped_and_goes_idle(self):
         bridge, hid = _bridge(max_utterance_ms=640, idle_timeout_ms=0)  # 10 chunks
-        bridge.recording.set()
+        _recording(bridge)
         t = threading.Thread(target=bridge._endpointer_loop, daemon=True)
         t.start()
         gen = bridge._current_gen()
@@ -637,7 +646,7 @@ class MaxUtteranceTest(unittest.TestCase):
 
     def test_short_request_is_committed(self):
         bridge, _ = _bridge(max_utterance_ms=640, idle_timeout_ms=0)
-        bridge.recording.set()
+        _recording(bridge)
         t = threading.Thread(target=bridge._endpointer_loop, daemon=True)
         t.start()
         gen = bridge._current_gen()

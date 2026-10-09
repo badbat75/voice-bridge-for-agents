@@ -11,6 +11,7 @@ needs to actually run.
 | `test_streaming_pipeline.py` | no | loopback only | SSE parser + ElevenLabs / Deepgram `synthesize_stream` (SDK mocked) + `play_audio_stream` (Popen mocked) + a glue test that wires all three. |
 | `test_non_speech_filter.py` | no | no | `_is_non_speech` predicate + its `_worker_loop` wiring. Stubbed STT/TTS, gateway patched on the module; no PyAudio, no Jabra, no HTTP. |
 | `test_wake_word.py` | no | no | Wake-word activation: `SpeechGate` energy gate, phrase matcher, and the armed/muted/recording transitions on a real `VoiceBridge` with a stub HID. Whistle is never loaded. |
+| `test_state_machine.py` | no | no | The bridge's state × event → state table (same as AGENTS.md *State machine*): end state, `auto_idled`, derived Events and LED writes per row. |
 | `test_stt_compare.py` | no | no | Shadow STT comparison: `submit()` never blocks (drops when full), one flattened TSV row per utterance. Whistle patched out. |
 | `test_ux_improvements.py` | no | no | 2026-10-09 review fixes: thinking cue, hybrid first-sentence TTS, playback pre-buffer, HID barge-in, webrtcvad speech filter (real module + fake VAD), `... NO_REPLY`, fuzzy wake word + aliases, idle windows after replies/questions, WS retry/fallback rules, turn timing log. aplay, gateway and providers faked. |
 | `test_gateway_integration.py` | no | live gateway | Real round-trip against the OpenClaw gateway using the local `voice-bridge.json` + `voice-bridge.secrets.json`. Auto-skips if the gateway isn't reachable. |
@@ -25,6 +26,7 @@ Always use the local venv — none of the deps are installed system-wide:
 .venv/bin/python tests/test_streaming_pipeline.py
 .venv/bin/python tests/test_non_speech_filter.py
 .venv/bin/python tests/test_wake_word.py
+.venv/bin/python tests/test_state_machine.py
 .venv/bin/python tests/test_stt_compare.py
 .venv/bin/python tests/test_ux_improvements.py
 .venv/bin/python tests/test_gateway_integration.py
