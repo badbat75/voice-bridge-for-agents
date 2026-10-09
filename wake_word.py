@@ -141,7 +141,7 @@ def _rms(pcm: bytes) -> float:
     samples = array.array("h", pcm)
     if not samples:
         return 0.0
-    return math.sqrt(sum(s * s for s in samples) / len(samples))
+    return math.sqrt(math.sumprod(samples, samples) / len(samples))
 
 
 class SpeechGate:
@@ -215,15 +215,32 @@ def load_whistle() -> None:
             _whistle = Whistle()
 
 
+_S16_SCALE = 1.0 / 32768.0
+
+
+def _to_float(samples: "array.array") -> "array.array":
+    """S16 samples → float32 in [-1, 1), the format Whistle takes as-is.
+
+    A list comprehension is the fastest pure-Python form on the Pi (~20%
+    faster than a generator; numpy is not in the venv)."""
+    k = _S16_SCALE
+    return array.array("f", [s * k for s in samples])
+
+
 def whistle_transcribe(pcm: bytes, language: str | None = None, keywords=None) -> str:
-    """Transcribe 16 kHz S16LE mono PCM; longer than 30 s is split into passes."""
+    """Transcribe 16 kHz S16LE mono PCM; longer than 30 s is split into passes.
+
+    Each pass is converted to float on its own, outside the lock, so the
+    float copy never exceeds one 30 s pass and the wake loop is not held
+    up by a long comparison's conversion."""
     load_whistle()
-    samples = array.array("f", (s / 32768.0 for s in array.array("h", pcm)))
+    shorts = array.array("h", pcm)
     texts = []
-    with _whistle_lock:
-        for i in range(0, len(samples), _MAX_PASS):
-            result = _whistle.transcribe(samples[i:i + _MAX_PASS], language=language, keywords=keywords)
-            texts.append((result.get("text") or "").strip())
+    for i in range(0, len(shorts), _MAX_PASS):
+        samples = _to_float(shorts[i:i + _MAX_PASS])
+        with _whistle_lock:
+            result = _whistle.transcribe(samples, language=language, keywords=keywords)
+        texts.append((result.get("text") or "").strip())
     return " ".join(t for t in texts if t)
 
 

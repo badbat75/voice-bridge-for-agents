@@ -45,6 +45,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import bridge_config  # noqa: E402
 import wake_word  # noqa: E402
 from elevenlabs_voice import ElevenLabsVoice  # noqa: E402
 
@@ -589,8 +590,8 @@ class IdleWindowTest(unittest.TestCase):
             path = os.path.join(d, "vb.json")
             with open(path, "w") as f:
                 json.dump({"idle_timeout_ms": 3000}, f)
-            with mock.patch.object(VB, "CONFIG_PATH", path), \
-                    mock.patch.object(VB, "SECRETS_PATH", os.path.join(d, "none")):
+            with mock.patch.object(bridge_config, "CONFIG_PATH", path), \
+                    mock.patch.object(bridge_config, "SECRETS_PATH", os.path.join(d, "none")):
                 cfg = VB.load_config()
         self.assertEqual(cfg["idle_after_reply_ms"], 3000)
         self.assertEqual(cfg["idle_after_question_ms"], 3000)

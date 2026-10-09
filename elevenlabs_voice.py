@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+import threading
 import wave
 from typing import Iterable, Iterator
 
@@ -105,6 +106,19 @@ class ElevenLabsVoice:
         self._tts_first_sentence_early = bool(tts_first_sentence_early)
         self._stt_model = stt_model
         self._stt_language = stt_language
+        # One SDK client per instance, built on first use and reused: each
+        # client owns an httpx connection pool, so reusing it keeps the TLS
+        # session to api.elevenlabs.io alive between STT and TTS calls
+        # (~0.1 s saved per request on the Pi). httpx.Client is
+        # thread-safe, so the bridge worker and the MCP tools can share it.
+        self._client_obj = None
+        self._client_lock = threading.Lock()
+
+    def _client(self):
+        with self._client_lock:
+            if self._client_obj is None:
+                self._client_obj = elevenlabs.ElevenLabs(api_key=self._api_key)
+            return self._client_obj
 
     def transcribe(self, pcm: bytes, sample_rate: int) -> str:
         """Transcribe S16LE mono PCM via Scribe. Returns "" on empty input
@@ -118,7 +132,7 @@ class ElevenLabsVoice:
                 w.setsampwidth(2)
                 w.setframerate(sample_rate)
                 w.writeframes(pcm)
-            client = elevenlabs.ElevenLabs(api_key=self._api_key)
+            client = self._client()
             result = client.speech_to_text.convert(
                 model_id=self._stt_model,
                 file=("audio.wav", buf.getvalue(), "audio/wav"),
@@ -153,7 +167,7 @@ class ElevenLabsVoice:
             if self._tts_text_normalization is not None:
                 kwargs["apply_text_normalization"] = self._tts_text_normalization
 
-            client = elevenlabs.ElevenLabs(api_key=self._api_key)
+            client = self._client()
             chunks = client.text_to_speech.convert(**kwargs)
             return b"".join(chunks)
         except Exception as exc:
@@ -206,7 +220,7 @@ class ElevenLabsVoice:
         if not text:
             return
         try:
-            client = elevenlabs.ElevenLabs(api_key=self._api_key)
+            client = self._client()
             yield from self._stream_sentence(client, text)
         except Exception as exc:
             log.error("TTS streaming error: %s", exc)
@@ -220,7 +234,7 @@ class ElevenLabsVoice:
         synthesized in a single call, like `tts_whole_reply`. A reply with
         no boundary at all is synthesized once at the end."""
         try:
-            client = elevenlabs.ElevenLabs(api_key=self._api_key)
+            client = self._client()
             buf = ""
             first_done = False
             for delta in text_iter:
@@ -264,7 +278,7 @@ class ElevenLabsVoice:
                 from elevenlabs.types.voice_settings import VoiceSettings
                 kwargs["voice_settings"] = VoiceSettings(**self._tts_voice_settings)
 
-            client = elevenlabs.ElevenLabs(api_key=self._api_key)
+            client = self._client()
             for chunk in client.text_to_speech.convert_realtime(**kwargs):
                 if chunk:
                     yield chunk
@@ -286,7 +300,7 @@ class ElevenLabsVoice:
         `apply_text_normalization` if they were configured (the HTTP
         endpoint accepts them, unlike the websocket path).
         """
-        client = elevenlabs.ElevenLabs(api_key=self._api_key)
+        client = self._client()
         buf = ""
         try:
             for delta in text_iter:

@@ -458,5 +458,27 @@ class WakeTransitionsTest(unittest.TestCase):
         self.assertEqual(hid.leds[-1], True)
 
 
+class WhistleTranscribeTest(unittest.TestCase):
+    """PCM reaches Whistle as float32 in [-1, 1), one ≤30 s pass at a time."""
+
+    def test_float_conversion_and_passes(self):
+        calls = []
+
+        class _FakeWhistle:
+            def transcribe(self, samples, language=None, keywords=None):
+                calls.append(samples)
+                return {"text": f"p{len(calls)}"}
+
+        shorts = array.array("h", [0, 16384, -32768, 32767]) * 1
+        n = wake_word._MAX_PASS + 3
+        pcm = (shorts * (n // 4 + 1))[:n].tobytes()
+        with mock.patch.object(wake_word, "_whistle", _FakeWhistle()):
+            text = wake_word.whistle_transcribe(pcm, "it")
+        self.assertEqual(text, "p1 p2")
+        self.assertEqual([len(c) for c in calls], [wake_word._MAX_PASS, 3])
+        self.assertEqual(calls[0].typecode, "f")
+        self.assertEqual(list(calls[0][:4]), [0.0, 0.5, -1.0, 32767 / 32768])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

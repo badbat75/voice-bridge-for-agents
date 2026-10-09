@@ -20,8 +20,9 @@ state on replug.
 Idle CPU is ~0 by design. The reconnect backoff blocks in
 `threading.Event.wait()`, not `time.sleep()`, so the thread is parked
 on the kernel wait-queue and `stop()` wakes it immediately. While the
-device is attached, the read loop's BlockingIOError sleep is also a
-short event-wait, for the same reason.
+device is attached, the read loop blocks in `select()` until the device
+has a report (or `_READ_IDLE_S` passes, to notice `stop()`), so an idle
+button costs no wakeups beyond that timeout.
 
 The mute button is a *momentary* HID Telephony button (bit 4 of byte 1
 of report 0x03, usage 0x2F "Mic Mute") — high while held, low when
@@ -48,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import os
+import select
 import threading
 
 log = logging.getLogger(__name__)
@@ -58,10 +60,10 @@ log = logging.getLogger(__name__)
 # listdir) every 2 s — effectively zero CPU. `stop()` sets the event
 # and the thread returns immediately.
 _RECONNECT_BACKOFF_S = 2.0
-# Idle wait between non-blocking read attempts when the fd is open but
-# has no data. Same Event-based wait (kernel-blocked, not spin) so
-# stop() wakes it instantly.
-_READ_IDLE_S = 0.05
+# Upper bound on one `select()` wait for a report while the device is
+# attached. A report wakes it at once; the timeout only bounds how long
+# `stop()` (and a stuck fd) can go unnoticed.
+_READ_IDLE_S = 0.5
 
 
 class HidMuteMonitor:
@@ -101,6 +103,13 @@ class HidMuteMonitor:
     def consume_unmute_event(self) -> bool:
         """Non-blocking check: was the mute button pressed since last call?"""
         if self._unmute_event.is_set():
+            self._unmute_event.clear()
+            return True
+        return False
+
+    def wait_press(self, timeout: float) -> bool:
+        """Block up to `timeout` s for a button press; consume it if one came."""
+        if self._unmute_event.wait(timeout):
             self._unmute_event.clear()
             return True
         return False
@@ -234,13 +243,16 @@ class HidMuteMonitor:
                     self._button_down = False
 
             try:
+                # Sleep in the kernel until a report arrives. An unplug
+                # makes the fd readable too (POLLHUP/POLLERR), so the read
+                # below sees the error and the reconnect path runs.
+                ready, _, _ = select.select([self._fd], [], [], _READ_IDLE_S)
+                if not ready:
+                    continue
                 n = os.read(self._fd, 64)
             except BlockingIOError:
-                # No data available — non-blocking fd, normal idle.
-                if self._shutdown.wait(_READ_IDLE_S):
-                    return
-                continue
-            except OSError as exc:
+                continue  # spurious wakeup on the non-blocking fd
+            except (OSError, ValueError) as exc:
                 if not self._shutdown.is_set():
                     log.warning("HID read failed: %s — reconnecting", exc)
                 self._close_fd()

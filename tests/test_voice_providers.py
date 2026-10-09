@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deepgram_voice import DeepgramVoice  # noqa: E402
@@ -158,8 +159,9 @@ class ProviderSelectionTest(unittest.TestCase):
             )
             vb = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(vb)
-            vb.CONFIG_PATH = tmp
-            return vb.load_config()
+            # load_config() lives in bridge_config and reads its path there.
+            with mock.patch("bridge_config.CONFIG_PATH", tmp):
+                return vb.load_config()
         finally:
             os.unlink(tmp)
 
@@ -265,6 +267,23 @@ class ProviderFactoryTest(unittest.TestCase):
         }
         provider = vb._build_voice_provider("tts", cfg)
         self.assertIsInstance(provider, DeepgramVoice)
+
+
+class ElevenLabsClientReuseTest(unittest.TestCase):
+    """One SDK client per provider instance: STT and TTS calls share its
+    connection pool instead of paying a TLS handshake each."""
+
+    def test_client_built_once_across_calls(self):
+        client = mock.Mock()
+        client.speech_to_text.convert.return_value = mock.Mock(text="ciao")
+        client.text_to_speech.convert.return_value = [b"pcm"]
+        with mock.patch("elevenlabs_voice.elevenlabs.ElevenLabs",
+                        return_value=client) as ctor:
+            el = ElevenLabsVoice(api_key="k", voice_id="v")
+            self.assertEqual(el.transcribe(b"\x00\x00" * 160, 16000), "ciao")
+            self.assertEqual(el.synthesize("ciao"), b"pcm")
+            self.assertEqual(el.transcribe(b"\x00\x00" * 160, 16000), "ciao")
+        self.assertEqual(ctor.call_count, 1)
 
 
 if __name__ == "__main__":

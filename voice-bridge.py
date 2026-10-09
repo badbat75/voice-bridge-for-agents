@@ -26,13 +26,10 @@ from __future__ import annotations
 
 import array
 import contextlib
-import fcntl
-import json
+import functools
 import logging
 import math
-import os
 import queue
-import re
 import signal
 import subprocess
 import sys
@@ -43,12 +40,48 @@ from typing import Iterable, Iterator
 
 import pyaudio
 
-from deepgram_voice import DeepgramVoice
-from deezer_connect_plugin import DeezerConnectPlugin
-from elevenlabs_voice import ElevenLabsVoice
-from jabra_hid import HidMuteMonitor
 import wake_word
+from deezer_connect_plugin import DeezerConnectPlugin
+from jabra_hid import HidMuteMonitor
 from stt_compare import SttComparer
+
+# The helpers live in their own modules; they are imported by name here so
+# `VoiceBridge` resolves them through this module (tests patch them on it)
+# and so `voice-bridge.py` keeps exposing the same surface for ad-hoc use.
+from audio_io import (  # noqa: F401  (re-exported)
+    _aplay_popen,
+    _apply_output_volume,
+    _drain_aplay,
+    _make_beep_pcm,
+    _make_sleep_tone_pcm,
+    _make_speech_vad,
+    _make_tick_pcm,
+    _voiced_ms,
+    find_input_device,
+    play_audio,
+    play_audio_stream,
+    play_beep,
+)
+from bridge_config import (  # noqa: F401  (re-exported)
+    CONFIG_PATH,
+    SECRETS_PATH,
+    _HERE,
+    _build_voice_provider,
+    load_config,
+)
+from gateway import (  # noqa: F401  (re-exported)
+    GATEWAY_FALLBACK_REPLY,
+    GATEWAY_LOST_REPLY,
+    GATEWAY_UNREACHABLE_REPLY,
+    _expects_answer,
+    _filter_no_reply,
+    _is_no_reply,
+    _is_non_speech,
+    gateway_chat,
+    gateway_chat_stream,
+    gateway_chat_stream_zeroclaw,
+    gateway_chat_stream_zeroclaw_ws,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -60,922 +93,25 @@ logging.basicConfig(
 )
 
 # ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-_HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(_HERE, "voice-bridge.json")
-# Local, gitignored secrets file (API keys + gateway token). The bridge
-# is self-contained: everything it needs lives in this folder. See
-# resources/voice-bridge.secrets.example.json for the expected shape.
-SECRETS_PATH = os.path.join(_HERE, "voice-bridge.secrets.json")
-
-VALID_PROVIDERS = ("elevenlabs", "deepgram")
-VALID_TTS_STREAM_MODES = ("http_sentence", "websocket")
-VALID_GATEWAY_BACKENDS = ("openclaw", "zeroclaw", "zeroclaw_ws")
-VALID_ACTIVATIONS = ("button", "wake_word")
-
-
-def _camel_to_snake_keys(d: dict | None) -> dict | None:
-    """Convert camelCase dict keys to snake_case (one level deep).
-
-    The openclaw gateway config uses camelCase (`similarityBoost`,
-    `useSpeakerBoost`) but the ElevenLabs Python SDK expects snake_case
-    (`similarity_boost`, `use_speaker_boost`). We translate at the
-    config-loading boundary so the rest of the code never has to think
-    about it.
-    """
-    import re
-    if not d:
-        return d
-    out = {}
-    for k, v in d.items():
-        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", k).lower()
-        out[snake] = v
-    return out
-
-
-def _read_json(path: str) -> dict:
-    """Read a JSON object from `path`, or {} if it's missing/unreadable.
-
-    Used for the optional local secrets file, which is allowed to be
-    absent (e.g. a fresh checkout before keys are filled in).
-    """
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        cfg = json.load(f)
-
-    # Self-contained config: secrets live in a local, gitignored file in
-    # this folder. Everything else is in voice-bridge.json above.
-    secrets = _read_json(SECRETS_PATH)
-
-    # --- Secrets: local file first, env override for Deepgram ---
-    cfg["gateway_token"] = secrets.get("gateway_token", "")
-    cfg["deepgram_key"] = (
-        os.environ.get("DEEPGRAM_API_KEY", "")
-        or secrets.get("deepgram_api_key", "")
-    )
-    # Telegram bot token, used only by the MCP sidecar's `send_voice_telegram`
-    # / `say_to_telegram` tools. The bridge itself ignores it; loaded here so
-    # the same shared `load_config()` keeps every secret in one place. The
-    # default destination chat_id is non-secret config (`telegram.chat_id` in
-    # voice-bridge.json) and exposed as `telegram_chat_id` — callers may still
-    # override per-tool-call.
-    cfg["telegram_bot_token"] = secrets.get("telegram_bot_token", "")
-    tg_local = cfg.get("telegram") or {}
-    cfg["telegram_chat_id"] = str(tg_local.get("chat_id") or "").strip()
-
-    # --- Deepgram STT/TTS settings ---
-    # The `deepgram` block in voice-bridge.json: `sttOptions` are extra
-    # kwargs (smart_format, punctuate, ...) passed verbatim, `sttModel`
-    # is the STT model name, `ttsModel` is the Aura TTS voice model.
-    # Deepgram TTS has no separate `language` param — the language is
-    # baked into the voice model name (e.g. `aura-2-thalia-en` is English,
-    # `aura-2-livia-it` is Italian), so picking an Italian voice IS how you
-    # get Italian speech. Only used if a Deepgram provider is selected.
-    dg_local = cfg.get("deepgram") or {}
-    cfg["deepgram_stt_options"] = dg_local.get("sttOptions") or {}
-    cfg["deepgram_stt_model"] = dg_local.get("sttModel") or ""
-    cfg["deepgram_tts_model"] = dg_local.get("ttsModel") or ""
-
-    # --- ElevenLabs TTS settings ---
-    # The `elevenlabs` block in voice-bridge.json holds the non-secret
-    # bits (voice id, model, language, voice_settings, text
-    # normalization); the API key comes from the secrets file. Keys stay
-    # camelCase here (`modelId`, not `model`); voiceSettings are
-    # translated to the SDK's snake_case at this boundary.
-    el = cfg.get("elevenlabs") or {}
-    cfg["elevenlabs_key"] = secrets.get("elevenlabs_api_key", "")
-    cfg["elevenlabs_voice"] = el.get("voiceId", "") or ""
-    cfg["elevenlabs_model"] = el.get("modelId", "") or ""
-    cfg["elevenlabs_language"] = el.get("languageCode")
-    cfg["elevenlabs_voice_settings"] = _camel_to_snake_keys(el.get("voiceSettings")) or None
-    cfg["elevenlabs_text_normalization"] = el.get("applyTextNormalization")
-
-    # Output softvol level re-asserted at startup (see `_apply_output_volume`).
-    # The `output_volume` block targets the `voice_out` softvol control —
-    # independent from deezer-connect's player gain. ALSA resets a softvol
-    # control to 100% when it first re-creates it after a reboot, so the
-    # bridge pins the configured level on every start. Missing block / keys
-    # default to 100% on the conventional VoiceBridge control / card "USB".
-    # `card` is passed to `amixer -c` verbatim: use the Jabra's card *name*
-    # ("USB"), not an index — adding an HDMI display renumbers ALSA cards.
-    ov = cfg.get("output_volume") or {}
-    cfg["output_volume_control"] = ov.get("control", "VoiceBridge")
-    cfg["output_volume_card"] = ov.get("card", "USB")
-    cfg["output_volume_percent"] = int(ov.get("percent", 100))
-
-    cfg["voice_model"] = cfg.get("voice_model") or "openclaw"
-
-    # Which gateway protocol the worker speaks. `openclaw` (default) posts
-    # to `/v1/chat/completions` with OpenAI-style SSE; `zeroclaw` posts to
-    # `/webhook` and parses a single non-streaming JSON reply; `zeroclaw_ws`
-    # streams over the `/ws/chat` WebSocket and consumes only `chunk` frames
-    # (the reasoning arrives in separate `thinking` frames and is dropped —
-    # this is why `zeroclaw_ws` keeps deepseek-reasoner's chain-of-thought
-    # out of TTS, where the lossy `/webhook` leg cannot). Selecting a backend
-    # also implies which gateway `gateway_base_url`/`gateway_token` point at —
-    # they are not interchangeable.
-    cfg["gateway_backend"] = str(cfg.get("gateway_backend", "openclaw")).strip().lower()
-    if cfg["gateway_backend"] not in VALID_GATEWAY_BACKENDS:
-        raise ValueError(
-            f"voice-bridge.json: unknown gateway_backend "
-            f"{cfg['gateway_backend']!r}; valid: {VALID_GATEWAY_BACKENDS}"
-        )
-
-    # Agent alias for the `/ws/chat` WebSocket leg (`zeroclaw_ws` backend
-    # only). zeroclaw requires an explicit `?agent=<alias>`; the runtime
-    # synthesizes a `default` agent even when `[agents]` is empty in its
-    # config, so `default` is the safe fallback. Ignored by other backends.
-    cfg["gateway_agent"] = (cfg.get("gateway_agent") or "default").strip()
-
-    # Session key for the voice bridge: from voice-bridge.json, with a
-    # literal fallback.
-    cfg["session_key"] = cfg.get("session_key") or "voice-bridge"
-
-    # Provider selection lives in voice-bridge.json itself
-    # (`stt_provider`, `tts_provider`). Missing keys → default to
-    # ElevenLabs for both roles.
-    cfg["stt_provider"] = str(cfg.get("stt_provider", "elevenlabs")).strip().lower()
-    cfg["tts_provider"] = str(cfg.get("tts_provider", "elevenlabs")).strip().lower()
-    for role in ("stt", "tts"):
-        if cfg[f"{role}_provider"] not in VALID_PROVIDERS:
-            raise ValueError(
-                f"voice-bridge.json: unknown {role}_provider "
-                f"{cfg[f'{role}_provider']!r}; valid: {VALID_PROVIDERS}"
-            )
-
-    # How an idle bridge comes back: "button" (HID press) or "wake_word"
-    # (mic stays open while idle; the `wake_word` block configures it).
-    cfg["activation"] = str(cfg.get("activation", "button")).strip().lower()
-    if cfg["activation"] not in VALID_ACTIVATIONS:
-        raise ValueError(
-            f"voice-bridge.json: unknown activation {cfg['activation']!r}; "
-            f"valid: {VALID_ACTIVATIONS}"
-        )
-
-    # Whistle settings fail at load, not on the first wake/utterance.
-    if cfg["activation"] == "wake_word":
-        wcfg = wake_word.wake_config(cfg)
-        if not wcfg["phrases"]:
-            raise ValueError("voice-bridge.json: wake_word.phrases is empty")
-        wake_word.validate_language("wake_word.language", wcfg["language"])
-    if (cfg.get("stt_compare") or {}).get("enabled"):
-        wake_word.validate_language("stt_compare.language", cfg["stt_compare"].get("language", "it"))
-
-    # Output sample rate must be agreed upon by TTS request, the
-    # synth library, and the aplay invocation. One number, one place.
-    cfg["tts_sample_rate"] = int(cfg.get("tts_sample_rate", 22050))
-
-    # Endpointer / VAD knobs. All configurable so the bridge can be
-    # retuned per environment without touching code.
-    #
-    # - `vad_rms_threshold`: per-chunk energy above which a chunk is
-    #   counted as speech. Same dimensionless metric the legacy
-    #   `record_until_silence` used (sum(s²)/sqrt(N), not true RMS) so
-    #   prior calibrations carry over. Quiet rooms typically need ~300;
-    #   noisy ones higher.
-    # - `silence_timeout_ms`: pause after speech that ends an utterance
-    #   and pushes it down the pipeline. Don't push this below ~600 ms
-    #   or natural between-word pauses get split into separate turns.
-    # - `idle_timeout_ms`: total silence (no speech) after which the
-    #   recording stream is closed entirely. Set to 0 to disable
-    #   auto-idle (mic stays open until SIGTERM or HID press).
-    cfg["vad_rms_threshold"] = float(cfg.get("vad_rms_threshold", 300))
-    cfg["silence_timeout_ms"] = int(cfg.get("silence_timeout_ms", 800))
-    cfg["idle_timeout_ms"] = int(cfg.get("idle_timeout_ms", 10000))
-    # Trailing silence preserved in the committed PCM. The full
-    # silence_timeout_ms window is captured to *detect* end-of-speech,
-    # but only `silence_keep_ms` of it is included in the audio handed
-    # to STT — the rest is trimmed. Keeping a small tail (default
-    # 500 ms) helps STT models that use trailing silence as a
-    # word-boundary cue without bloating each utterance with the full
-    # detection window.
-    cfg["silence_keep_ms"] = int(cfg.get("silence_keep_ms", 500))
-    # Minimum above-threshold audio for an utterance to reach STT. A key
-    # click, a bump or a speaker echo crosses the threshold for one or two
-    # chunks; real speech stays above it far longer. Shorter bursts are
-    # dropped at commit time (no STT call, no idle-timer reset). 0 = off.
-    cfg["min_speech_ms"] = int(cfg.get("min_speech_ms", 0))
-    # Pre-roll: how much audio captured *before* the threshold-crossing
-    # to prepend to the committed PCM. Helps STT catch the very first
-    # phoneme, which often dips below the VAD threshold (the leading
-    # consonant of a word can be quieter than its vowel). The bridge
-    # keeps a rolling window of the last `pre_speech_keep_ms` of
-    # below-threshold audio and pastes it in at speech onset.
-    cfg["pre_speech_keep_ms"] = int(cfg.get("pre_speech_keep_ms", 100))
-
-    # TTS streaming strategy. `http_sentence` (default) buffers gateway
-    # deltas to sentence boundaries and calls the HTTP streaming endpoint
-    # per sentence — works on every account tier. `websocket` feeds
-    # deltas straight into ElevenLabs' realtime websocket for token-level
-    # latency, but requires a paid tier (free accounts get HTTP 403 on
-    # the upgrade). Only consulted when tts_provider == "elevenlabs".
-    cfg["tts_streaming_mode"] = str(
-        cfg.get("tts_streaming_mode", "http_sentence")
-    ).strip().lower()
-    if cfg["tts_streaming_mode"] not in VALID_TTS_STREAM_MODES:
-        raise ValueError(
-            f"voice-bridge.json: unknown tts_streaming_mode "
-            f"{cfg['tts_streaming_mode']!r}; valid: {VALID_TTS_STREAM_MODES}"
-        )
-    # `tts_whole_reply: true` disables per-sentence splitting on the HTTP
-    # path: the whole gateway reply is buffered and sent to TTS in ONE
-    # call, so tone/prosody stay consistent (eleven_v3 rejects request
-    # stitching, so this is the only consistency lever there). Trades
-    # first-audio latency for it. Default false = split per sentence.
-    cfg["tts_whole_reply"] = bool(cfg.get("tts_whole_reply", False))
-    # With `tts_whole_reply`, speak the first sentence as soon as it is
-    # complete and the rest in one call (ElevenLabs only).
-    cfg["tts_first_sentence_early"] = bool(cfg.get("tts_first_sentence_early", False))
-
-    # Idle window after a reply finished playing. Defaults to the plain
-    # idle window; a reply ending in "?" gets the (usually longer)
-    # question window, since the user is expected to answer.
-    cfg["idle_after_reply_ms"] = int(cfg.get("idle_after_reply_ms", cfg["idle_timeout_ms"]))
-    cfg["idle_after_question_ms"] = int(
-        cfg.get("idle_after_question_ms", cfg["idle_after_reply_ms"]))
-    # Idle window right after a wake word / button resume: time to start
-    # talking after "Dimmi". Defaults to the plain idle window.
-    cfg["idle_after_resume_ms"] = int(cfg.get("idle_after_resume_ms", cfg["idle_timeout_ms"]))
-    # An utterance still going after this long is people talking among
-    # themselves, not a request: it is dropped and the bridge goes idle.
-    # 0 = no limit.
-    cfg["max_utterance_ms"] = int(cfg.get("max_utterance_ms", 0))
-
-    # PCM buffered before the first write to aplay, so a TTS stream that
-    # stalls right after its first chunk doesn't underrun (audible click).
-    cfg["playback_prebuffer_ms"] = int(cfg.get("playback_prebuffer_ms", 0))
-
-    # Frame-level voice check (webrtcvad) at commit: utterances with less
-    # than `min_voiced_ms` of voiced frames are dropped before STT.
-    sf = cfg.get("speech_filter") or {}
-    cfg["speech_filter"] = {
-        "enabled": bool(sf.get("enabled", False)),
-        "aggressiveness": int(sf.get("aggressiveness", 2)),
-        "min_voiced_ms": int(sf.get("min_voiced_ms", 200)),
-    }
-    if not 0 <= cfg["speech_filter"]["aggressiveness"] <= 3:
-        raise ValueError("voice-bridge.json: speech_filter.aggressiveness must be 0..3")
-
-    # "Still working" feedback between commit and the first reply audio.
-    tc = cfg.get("thinking_cue") or {}
-    cfg["thinking_cue"] = {
-        "enabled": bool(tc.get("enabled", False)),
-        "delay_ms": int(tc.get("delay_ms", 3000)),
-        "repeat_ms": int(tc.get("repeat_ms", 5000)),
-        "phrases": list(tc.get("phrases") or []),
-    }
-
-    return cfg
-
-
-def _build_voice_provider(role: str, cfg: dict):
-    """Construct the provider class chosen for `role` ('stt' or 'tts').
-
-    Both classes expose the same transcribe/synthesize surface, so the
-    caller doesn't have to care which one came back. The full TTS-side
-    settings (voice id, model, voice_settings, language, text
-    normalization) come straight from the openclaw config — we don't
-    invent defaults beyond what the SDK itself uses.
-    """
-    name = cfg[f"{role}_provider"]
-    if name == "elevenlabs":
-        return ElevenLabsVoice(
-            api_key=cfg["elevenlabs_key"],
-            voice_id=cfg["elevenlabs_voice"],
-            tts_model=cfg["elevenlabs_model"],
-            tts_sample_rate=cfg["tts_sample_rate"],
-            tts_language=cfg.get("elevenlabs_language"),
-            tts_voice_settings=cfg.get("elevenlabs_voice_settings"),
-            tts_text_normalization=cfg.get("elevenlabs_text_normalization"),
-            tts_stream_mode=cfg.get("tts_streaming_mode", "http_sentence"),
-            tts_whole_reply=cfg.get("tts_whole_reply", False),
-            tts_first_sentence_early=cfg.get("tts_first_sentence_early", False),
-        )
-    if name == "deepgram":
-        kwargs = {
-            "api_key": cfg["deepgram_key"],
-            "stt_options": cfg.get("deepgram_stt_options") or {},
-            "tts_sample_rate": cfg["tts_sample_rate"],
-        }
-        if cfg.get("deepgram_stt_model"):
-            kwargs["stt_model"] = cfg["deepgram_stt_model"]
-        if cfg.get("deepgram_tts_model"):
-            kwargs["tts_model"] = cfg["deepgram_tts_model"]
-        return DeepgramVoice(**kwargs)
-    raise ValueError(f"unknown provider: {name}")
-
-
-# ---------------------------------------------------------------------------
-# Audio helpers
-# ---------------------------------------------------------------------------
-def find_input_device(pa: pyaudio.PyAudio) -> int | None:
-    """Find Jabra SPEAK 510 input device index."""
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        if "jabra" in info["name"].lower() and info["maxInputChannels"] > 0:
-            return i
-    return None
-
-
-_AUDIO_DEBUG = os.environ.get("VOICE_BRIDGE_DEBUG_AUDIO") == "1"
-
-
-def _drain_aplay_stderr(stream) -> None:
-    """Forward aplay's stderr line-by-line to the Python logger.
-
-    Runs as a daemon thread; exits when aplay closes stderr.
-    """
-    try:
-        for raw in iter(stream.readline, b""):
-            line = raw.decode("utf-8", errors="replace").rstrip()
-            if line:
-                log.warning("aplay: %s", line)
-    except ValueError:
-        pass  # the stream was closed under us when aplay was reaped
-    finally:
-        with contextlib.suppress(Exception):
-            stream.close()
-
-
-def _aplay_popen(device: str, sample_rate: int, *, bufsize: int = -1) -> subprocess.Popen:
-    """Spawn aplay for raw S16LE mono PCM at `sample_rate`.
-
-    With `VOICE_BRIDGE_DEBUG_AUDIO=1`, drops `-q` and forwards aplay's
-    stderr to the logger — that's where ALSA prints `underrun!!!` lines.
-    """
-    cmd = ["aplay", "-D", device, "-f", "S16_LE", "-r", str(sample_rate), "-c", "1"]
-    if not _AUDIO_DEBUG:
-        cmd.insert(1, "-q")
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stderr=subprocess.PIPE if _AUDIO_DEBUG else subprocess.DEVNULL,
-        bufsize=bufsize,
-    )
-    if _AUDIO_DEBUG and proc.stderr is not None:
-        threading.Thread(
-            target=_drain_aplay_stderr,
-            args=(proc.stderr,),
-            daemon=True,
-        ).start()
-    return proc
-
-
-def _drain_aplay(
-    proc: subprocess.Popen,
-    sample_rate: int,
-    abort: "threading.Event | None" = None,
-) -> None:
-    """Close aplay's stdin and wait for it to play out its buffered PCM,
-    then make sure it has exited.
-
-    Network TTS feeds PCM faster than realtime, so at stdin-close the
-    unplayed tail is the kernel pipe buffer (queried exactly via
-    `F_GETPIPE_SZ`) plus aplay's ALSA ring buffer. We derive a
-    generous-but-bounded drain budget from that buffer size and the stream
-    rate, then poll until aplay exits on its own — we never kill a
-    still-draining process, which would chop the reply's tail and, because
-    `voice_out` runs through `sw_dmix` (which *mixes* streams), briefly
-    overlap the next utterance's aplay. The budget scales with
-    `sample_rate`, so it stays correct if `tts_sample_rate` changes.
-
-    `abort`, if given, cuts the wait short (bridge shutdown). A genuinely
-    hung aplay is killed once the budget is spent, so the caller can never
-    block forever.
-    """
-    bytes_per_sec = sample_rate * 2  # S16LE mono
-    try:
-        pipe_bytes = fcntl.fcntl(proc.stdin.fileno(), fcntl.F_GETPIPE_SZ)
-    except Exception:
-        pipe_bytes = 65536  # Linux default pipe capacity
-    # pipe drain time + ALSA buffer headroom & safety margin.
-    drain_budget = pipe_bytes / bytes_per_sec + 2.0
-    with contextlib.suppress(Exception):
-        proc.stdin.close()
-    deadline = time.monotonic() + drain_budget
-    while abort is None or not abort.is_set():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        try:
-            proc.wait(timeout=min(0.2, remaining))
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    if proc.poll() is None:
-        # Budget exhausted (hung aplay) or aborted — drop it so the
-        # caller can move on.
-        with contextlib.suppress(Exception):
-            proc.kill()
-            proc.wait(timeout=1.0)
-
-
-def _apply_output_volume(cfg: dict) -> None:
-    """Re-assert the configured softvol level on the output control.
-
-    The `voice_out` softvol control gives the bridge a volume independent
-    from deezer-connect's player gain. ALSA creates that control lazily on
-    first PCM open and resets it to 100% after a reboot, so we (1) open the
-    device with a brief silent buffer to instantiate the control, then
-    (2) set it with `amixer`. Best-effort: any failure is logged and
-    swallowed — a missing mixer must never take the bridge down (it just
-    means the level stays at ALSA's 100% default)."""
-    control = cfg.get("output_volume_control")
-    card = cfg.get("output_volume_card")
-    percent = int(cfg.get("output_volume_percent", 100))
-    if not control or card is None:
-        return
-    device = cfg["output_device"]
-    rate = int(cfg["tts_sample_rate"])
-    # ~50 ms of silence: enough to make ALSA open the PCM and create the
-    # softvol control element, inaudible since every sample is zero.
-    silence = b"\x00\x00" * (rate // 20)
-    try:
-        proc = _aplay_popen(device, rate)
-        proc.communicate(input=silence, timeout=5)
-    except Exception as exc:
-        log.warning("output volume: could not prime %s (%s); "
-                    "amixer set may fail", device, exc)
-    try:
-        subprocess.run(
-            ["amixer", "-c", str(card), "sset", control, f"{percent}%"],
-            check=True, capture_output=True, timeout=5,
-        )
-        log.info("Output volume: %s on card %s → %d%%", control, card, percent)
-    except Exception as exc:
-        log.warning("output volume: amixer set %s on card %s failed: %s",
-                    control, card, exc)
-
-
-def play_audio(device: str, audio_data: bytes, sample_rate: int) -> None:
-    """Play raw S16LE mono PCM bytes through aplay at `sample_rate`.
-
-    `sample_rate` MUST match what the TTS provider produced (we ask it
-    for `pcm_<rate>` / `linear16` at the same number) — otherwise aplay
-    plays back at the wrong speed/pitch."""
-    proc = _aplay_popen(device, sample_rate)
-    # Not `communicate()`: with VOICE_BRIDGE_DEBUG_AUDIO=1 a drain thread
-    # already owns aplay's stderr, and two readers race to EBADF.
-    with contextlib.suppress(BrokenPipeError):
-        proc.stdin.write(audio_data)
-    _drain_aplay(proc, sample_rate)
-
-
-def play_audio_stream(device: str, audio_iter: Iterable[bytes], sample_rate: int) -> bool:
-    """Pipe audio chunks through aplay as they arrive.
-
-    aplay is started immediately (so ALSA acquires the device early) and
-    each chunk is written to its stdin the moment it's pulled from
-    `audio_iter`. ALSA's own period buffer absorbs short pauses in the
-    producer (e.g. waiting on the next sentence from TTS). With
-    `bufsize=0`, every write goes straight to the pipe — no Python-level
-    buffering between TTS chunks and ALSA.
-
-    Returns True if at least one chunk was written (i.e. something was
-    actually played), so callers can distinguish "speech happened" from
-    "stream produced nothing".
-    """
-    proc = _aplay_popen(device, sample_rate, bufsize=0)
-    wrote_any = False
-    try:
-        for chunk in audio_iter:
-            if not chunk:
-                continue
-            try:
-                proc.stdin.write(chunk)
-            except BrokenPipeError:
-                # aplay died (device gone, ALSA error). Stop pulling
-                # from the upstream iterators — still need to drain the
-                # process below.
-                break
-            wrote_any = True
-    finally:
-        # Bounded drain (see `_drain_aplay`): play out the buffered tail
-        # without chopping it, but don't hang on a dead aplay.
-        _drain_aplay(proc, sample_rate)
-    return wrote_any
-
-
-def _make_beep_pcm(sample_rate: int, freq: float, duration: float, amplitude: int = 16000) -> bytes:
-    """Generate a fade-out sine beep as S16LE mono PCM bytes."""
-    n_samples = int(sample_rate * duration)
-    buf = array.array("h")
-    for i in range(n_samples):
-        env = 1.0 - (i / n_samples)
-        val = int(amplitude * env * (0.5 + 0.5 * math.sin(2 * math.pi * freq * i / sample_rate)))
-        buf.append(max(-32768, min(32767, val)))
-    return buf.tobytes()
-
-
-def _make_tick_pcm(sample_rate: int) -> bytes:
-    """Soft, short "still working" tick — quiet enough to sit under music."""
-    return _make_beep_pcm(sample_rate, freq=520, duration=0.06, amplitude=4000)
-
-
-def _make_sleep_tone_pcm(sample_rate: int) -> bytes:
-    """Two soft falling notes: the bridge dozed off without a conversation."""
-    return (_make_beep_pcm(sample_rate, freq=660, duration=0.09, amplitude=6000)
-            + _make_beep_pcm(sample_rate, freq=440, duration=0.12, amplitude=6000))
-
-
-def play_beep(device: str, sample_rate: int) -> None:
-    """Play a short ~80 ms 880 Hz beep at the given output sample rate."""
-    play_audio(device, _make_beep_pcm(sample_rate, freq=880, duration=0.08), sample_rate)
-
-
-# ---------------------------------------------------------------------------
-# Gateway — send transcript, get response
-# ---------------------------------------------------------------------------
-def gateway_chat(base_url: str, token: str, text: str, voice_model: str, session_key: str = "voice-bridge") -> str:
-    """Send user transcript to OpenClaw gateway and get response text."""
-    import urllib.request
-
-    url = f"{base_url}/v1/chat/completions"
-    payload = json.dumps({
-        "model": voice_model,
-        "messages": [{"role": "user", "content": text}],
-        "max_tokens": 500,
-        "stream": False,
-    }).encode()
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    if session_key:
-        headers["X-OpenClaw-Session-Key"] = session_key
-
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers=headers,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', url, resp.status, resp.reason)
-            result = json.loads(resp.read())
-            return result["choices"][0]["message"]["content"]
-    except Exception as exc:
-        log.error("Gateway error: %s", exc)
-        return "Mi dispiace, ho avuto un problema di connessione."
-
-
-GATEWAY_FALLBACK_REPLY = "Mi dispiace, ho avuto un problema di connessione."
-
-# Tokens the agent emits to signal "stay silent on this turn" (e.g. when the
-# user utterance was just background noise). The bridge intercepts these
-# before they hit TTS and plays a short low beep instead.
-NO_REPLY_SENTINELS: frozenset[str] = frozenset({"NO_REPLY", "NOREPLY", "NO-REPLY"})
-_NO_REPLY_MAX_LEN = max(len(s) for s in NO_REPLY_SENTINELS)
-
-
-# The voice agent opens every spoken reply with "... " (a silent breath for
-# eleven_v3, see the voice-reply-style skill), so "... NO_REPLY" must count.
-_NO_REPLY_LEAD = " \t\n.…"
-
-
-def _is_no_reply(text: str) -> bool:
-    return (text or "").strip().lstrip(_NO_REPLY_LEAD).strip() in NO_REPLY_SENTINELS
-
-
-def _filter_no_reply(stream: Iterable[str]) -> Iterator[str]:
-    """Wrap a delta stream and swallow it entirely if it strips to a
-    NO_REPLY sentinel. Otherwise yield deltas unchanged.
-
-    Buffers up to a few characters (enough to distinguish a sentinel from
-    a real reply) before it commits to a passthrough — this only delays
-    first-audio by one or two SSE deltas in the normal case, and avoids a
-    wasted TTS HTTP call when the agent decided to stay silent.
-    """
-    buf = ""
-    holding = True
-    for delta in stream:
-        if not holding:
-            yield delta
-            continue
-        buf += delta
-        if len(buf.lstrip(_NO_REPLY_LEAD)) > _NO_REPLY_MAX_LEN + 2:
-            yield buf
-            buf = ""
-            holding = False
-    if holding and buf:
-        if _is_no_reply(buf):
-            return
-        yield buf
-
-
-# Non-verbal events an STT provider transcribes instead of returning an empty
-# string: ElevenLabs emits bracketed audio-event tags ("[click]", "[rumore di
-# fogli]", "[rumore di sottofondo]"), other engines use parentheses. They are
-# non-empty strings, so without this guard they reach the gateway as a real
-# user turn and the agent answers a noise — which the speaker replays into the
-# still-open mic (`play_pcm` unmutes for external speech), transcribes as more
-# noise, and the loop feeds itself. Same "nothing to say" decision as a
-# NO_REPLY reply, taken one stage earlier and without the round-trip.
-_NON_SPEECH_TAG_RE = re.compile(r"[\[(][^\])]*[\])]")
-
-
-def _is_non_speech(text: str) -> bool:
-    """True when `text` is only audio-event tags and punctuation, i.e. the
-    utterance carried no words at all. A tag mixed with real speech
-    ("[click] accendi la luce") is speech and passes through unchanged."""
-    return not any(ch.isalnum() for ch in _NON_SPEECH_TAG_RE.sub(" ", text))
-
-
-# Closing invitations that expect an answer without a "?": "Dimmi tu il
-# titolo e la metto!", "Rifammi il pensiero, che ci sono."
-_INVITE_RE = re.compile(
-    r"\b(dimmi|ditemi|dimmelo|ditemelo|raccontami|fammi sapere|fatemi sapere|"
-    r"rifammi|ripetimi|ripeti|riprova\w*|prova a)\b", re.IGNORECASE)
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
-
-
-def _expects_answer(text: str) -> bool:
-    """True when the spoken reply leaves the user something to answer: a "?"
-    in its last two sentences ("Vuoi la remix? Te la metto se dici sì.") or
-    an invitation in the last one ("Dimmi tu il titolo!"). eleven_v3 tone
-    tags ("[warm]") are ignored."""
-    stripped = _NON_SPEECH_TAG_RE.sub(" ", text or "")
-    sentences = [s for s in _SENTENCE_SPLIT_RE.split(stripped.strip())
-                 if any(ch.isalnum() for ch in s)]
-    if not sentences:
-        return False
-    return any("?" in s for s in sentences[-2:]) or bool(_INVITE_RE.search(sentences[-1]))
-
-
-_VAD_RATES = (8000, 16000, 32000, 48000)
-_VAD_FRAME_MS = 30
-
-
-def _voiced_ms(pcm: bytes, sample_rate: int, vad) -> int | None:
-    """Milliseconds of voiced 30 ms frames in S16LE mono `pcm`, per a
-    `webrtcvad.Vad`. None when the rate is one webrtcvad can't take, so the
-    caller can skip the check instead of dropping speech."""
-    if sample_rate not in _VAD_RATES:
-        return None
-    frame_bytes = sample_rate * _VAD_FRAME_MS // 1000 * 2
-    voiced = 0
-    for i in range(0, len(pcm) - frame_bytes + 1, frame_bytes):
-        if vad.is_speech(pcm[i:i + frame_bytes], sample_rate):
-            voiced += _VAD_FRAME_MS
-    return voiced
-
-
-def _make_speech_vad(cfg: dict):
-    """A `webrtcvad.Vad` when `speech_filter.enabled`, else None. A missing
-    module only logs: the filter is an optimization, never a hard dep."""
-    sf = cfg.get("speech_filter") or {}
-    if not sf.get("enabled"):
-        return None
-    try:
-        import webrtcvad
-    except ImportError:
-        log.warning("speech_filter enabled but webrtcvad is not installed — filter off")
-        return None
-    return webrtcvad.Vad(int(sf.get("aggressiveness", 2)))
-
-
-def gateway_chat_stream(
-    base_url: str,
-    token: str,
-    text: str,
-    voice_model: str,
-    session_key: str = "voice-bridge",
-) -> Iterator[str]:
-    """Same shape as `gateway_chat`, but yields content deltas as they arrive.
-
-    Posts with `stream: true` and parses the OpenAI-style SSE response
-    (`data: {...}\\n\\n`, terminated by `data: [DONE]`). Yields each
-    `choices[0].delta.content` string. Malformed or non-data lines are
-    skipped silently — the OpenAI spec allows comments and keep-alives.
-
-    On transport error this yields the same fallback string `gateway_chat`
-    returns, so the downstream TTS still has *something* to speak. This
-    means an empty stream really does mean "no content" (the model said
-    nothing), distinct from "the request blew up."
-    """
-    import urllib.request
-
-    url = f"{base_url}/v1/chat/completions"
-    payload = json.dumps({
-        "model": voice_model,
-        "messages": [{"role": "user", "content": text}],
-        "max_tokens": 500,
-        "stream": True,
-    }).encode()
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-        "Accept": "text/event-stream",
-    }
-    if session_key:
-        headers["X-OpenClaw-Session-Key"] = session_key
-
-    req = urllib.request.Request(url, data=payload, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', url, resp.status, resp.reason)
-            for raw in resp:
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].lstrip()
-                if data == "[DONE]":
-                    return
-                try:
-                    ev = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                try:
-                    delta = ev["choices"][0].get("delta", {}).get("content")
-                except (KeyError, IndexError, TypeError):
-                    delta = None
-                if delta:
-                    yield delta
-    except Exception as exc:
-        log.error("Gateway streaming error: %s", exc)
-        yield GATEWAY_FALLBACK_REPLY
-
-
-def gateway_chat_stream_zeroclaw(
-    base_url: str,
-    token: str,
-    text: str,
-) -> Iterator[str]:
-    """zeroclaw gateway leg — same iterator contract as `gateway_chat_stream`.
-
-    zeroclaw's gateway is NOT OpenAI-compatible: it exposes `POST /webhook`
-    expecting ``{"message": "..."}`` with ``Authorization: Bearer <token>``
-    and replies with a single, non-streaming JSON ``{"model": ..., "response":
-    "..."}``. There is no SSE and no session header — conversational context
-    is keyed by the bearer token itself (the paired token *is* the session),
-    so `voice_model` and `session_key` have no place here.
-
-    The whole reply text is yielded as one delta; the downstream sentence
-    buffer (`http_sentence` TTS mode) splits it for synthesis. On transport
-    error this yields the same fallback string the OpenClaw leg uses, so the
-    TTS stage always has something to speak.
-    """
-    import urllib.request
-
-    url = f"{base_url}/webhook"
-    payload = json.dumps({"message": text}).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    req = urllib.request.Request(url, data=payload, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', url, resp.status, resp.reason)
-            body = resp.read().decode("utf-8", errors="replace")
-        try:
-            reply = (json.loads(body).get("response") or "").strip()
-        except json.JSONDecodeError:
-            log.error("zeroclaw gateway: non-JSON body: %.200s", body)
-            reply = ""
-        if reply:
-            yield reply
-    except Exception as exc:
-        log.error("Gateway streaming error: %s", exc)
-        yield GATEWAY_FALLBACK_REPLY
-
-
-# Spoken when the WS dropped AFTER the message reached the agent: it may
-# already have acted (started a song, sent a mail), so don't pretend
-# nothing happened and don't silently retry (that would act twice).
-GATEWAY_LOST_REPLY = ("Ho perso la risposta per strada. Se mi avevi chiesto di fare "
-                      "qualcosa, controlla se è partita.")
-# Spoken when the agent could not be reached at all, even after a retry.
-GATEWAY_UNREACHABLE_REPLY = "Non riesco a raggiungere l'assistente in questo momento. Riprova tra poco."
-
-
-def gateway_chat_stream_zeroclaw_ws(
-    base_url: str,
-    token: str,
-    text: str,
-    agent: str = "default",
-    session_id: str = "voice-bridge",
-    on_event=None,
-    connect_fn=None,
-) -> Iterator[str]:
-    """zeroclaw `/ws/chat` WebSocket leg — same iterator contract as the others.
-
-    Unlike `/webhook` (non-streaming, which returns the tool loop's whole
-    `accumulated_display_text` — for a reasoning model that string is the
-    chain-of-thought narration *concatenated* with the answer), the WS leg
-    streams typed frames and keeps reasoning separate:
-      - ``{"type":"chunk","content":...}``    → the actual answer (yielded)
-      - ``{"type":"thinking","content":...}`` → reasoning (dropped — never TTS'd)
-      - ``tool_call`` / ``tool_result``       → tool activity (dropped)
-      - ``approval_request``                   → auto-denied (voice can't approve)
-      - ``done``                               → end of turn (its `full_response`
-                                                 is the same lossy string; ignored)
-
-    Every non-chunk frame is also reported to `on_event(type, frame)` if
-    given (the bridge plays a "un attimo" cue on the first `tool_call`).
-
-    Failure handling depends on how far the turn got:
-      - before the message was sent (connect/upgrade failed): retried once,
-        then `GATEWAY_UNREACHABLE_REPLY` — nothing reached the agent, so a
-        retry can't make it act twice;
-      - after the message was sent but before any answer text:
-        `GATEWAY_LOST_REPLY`, no retry (the agent may already have acted);
-      - after some answer text was yielded: stop quietly, the user already
-        heard part of the answer and an apology tacked on would be noise.
-
-    Connects to ``ws(s)://<host>/ws/chat?agent=<agent>&session_id=<id>`` with
-    the paired token as the ``?token=`` query param. Conversational context is
-    keyed by ``session_id`` (the gateway namespaces it as ``gw_<id>``), so a
-    stable id keeps every turn in the same session. `connect_fn` is injectable
-    for tests (defaults to ``websockets.sync.client.connect``).
-    """
-    from urllib.parse import urlsplit, urlunsplit, urlencode
-    if connect_fn is None:
-        from websockets.sync.client import connect as connect_fn
-
-    parts = urlsplit(base_url)
-    ws_scheme = "wss" if parts.scheme == "https" else "ws"
-    query = urlencode({"agent": agent, "session_id": session_id, "token": token})
-    url = urlunsplit((ws_scheme, parts.netloc, "/ws/chat", query, ""))
-
-    for attempt in (1, 2):
-        sent = yielded = False
-        try:
-            # open_timeout caps the upgrade; the per-recv timeout below caps
-            # each frame wait so a stalled turn can't hang the worker forever.
-            with connect_fn(url, max_size=None, open_timeout=30) as ws:
-                log.info("WS connect: %s/ws/chat (agent=%s session=%s)",
-                         base_url, agent, session_id)
-                ws.send(json.dumps({"type": "message", "content": text}))
-                sent = True
-                while True:
-                    raw = ws.recv(timeout=120)
-                    try:
-                        frame = json.loads(raw)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    ftype = frame.get("type")
-                    if ftype == "chunk":
-                        delta = frame.get("content")
-                        if delta:
-                            yielded = True
-                            yield delta
-                        continue
-                    if on_event is not None:
-                        try:
-                            on_event(ftype, frame)
-                        except Exception:
-                            log.exception("WS on_event callback failed")
-                    if ftype == "done":
-                        return
-                    elif ftype == "error":
-                        log.error("WS gateway error frame: %s",
-                                  frame.get("message", str(raw)[:200]))
-                        if not yielded:
-                            yield GATEWAY_LOST_REPLY
-                        return
-                    elif ftype == "approval_request":
-                        # Voice has no interactive approval path; deny so the
-                        # turn finishes instead of blocking on a prompt.
-                        log.info("WS approval_request for tool %r → auto-deny",
-                                 frame.get("tool"))
-                        ws.send(json.dumps({
-                            "type": "approval_response",
-                            "request_id": frame.get("request_id"),
-                            "decision": "deny",
-                        }))
-                    # thinking / tool_call / tool_result / session_start /
-                    # chunk_reset / agent_end etc. are intentionally dropped.
-        except Exception as exc:
-            log.error("Gateway WS streaming error (attempt %d, sent=%s, answered=%s): %s",
-                      attempt, sent, yielded, exc)
-            if yielded:
-                return
-            if sent:
-                yield GATEWAY_LOST_REPLY
-                return
-            if attempt == 1:
-                log.info("WS: message never reached the agent — retrying once")
-                continue
-            yield GATEWAY_UNREACHABLE_REPLY
-            return
-        return
-
-
-# ---------------------------------------------------------------------------
 # Async pipeline orchestrator
 # ---------------------------------------------------------------------------
+def _transition(method):
+    """Run a `VoiceBridge` state transition under `_state_lock`.
+
+    The bridge state is a set of Events (`recording`, `_wake_armed`,
+    `_auto_idled`, `_processing`, …) plus plain fields (`_idle_window_ms`,
+    `_replies_since_resume`, `_quiet_idle`, `_reply_is_question`) written
+    from the HID, endpointer, worker, player and MCP threads. Each
+    transition reads several of them and then writes several; the lock
+    (re-entrant: transitions call each other) makes every such
+    check-then-act atomic. Transitions must not block while holding it."""
+    @functools.wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 # Sentinel pushed into `playback_q` after each utterance's audio chunks
 # so the player thread knows to close the current aplay process and
 # wait for the next utterance. Plain None would conflict with empty-
@@ -1077,7 +213,7 @@ class _ThinkingCue:
 
 
 class VoiceBridge:
-    """Always-on mic + 4-stage async pipeline + HID hard-cancel toggle.
+    """Always-on mic + 4-stage async pipeline + HID mute/resume button.
 
     Threads (all daemons):
 
@@ -1088,19 +224,14 @@ class VoiceBridge:
       - `_worker_loop`     STT → gateway SSE → TTS streaming
       - `_player_loop`     one aplay subprocess per utterance
 
-    Cancellation has two grades:
-
-      - **Hard cancel** (HID press while recording): bumps `_gen`,
-        drains every queue, kills the active aplay. Pipeline items
-        carry the generation they were produced under; downstream
-        stages drop anything whose generation has been superseded.
-      - **Soft idle** (silence > `idle_timeout_ms`): clears `recording`
-        (closes the mic stream) but does NOT bump `_gen`. Anything
-        already queued continues to flow — the user gets the reply they
-        were waiting for even though the mic is now idle.
-
-    Resuming from idle/cancel is always an HID press: it sets
-    `recording` and bumps `_gen` so any leftover stale chunks are shed.
+    Pipeline items carry the generation (`_gen`) they were produced
+    under; downstream stages drop anything whose generation has been
+    superseded. Only a resume (`_resume`: HID press, wake word) or a
+    barge-in on a playing reply (`_stop_reply`, which also drains the
+    player queues and kills aplay) bumps it. Every other stop is soft:
+    an HID press while recording commits what was said and mutes, and
+    auto-idle closes the mic — neither bumps `_gen`, so the reply the
+    user was waiting for still plays.
     """
 
     def __init__(self, cfg: dict, stt, tts, hid: HidMuteMonitor,
@@ -1142,6 +273,8 @@ class VoiceBridge:
 
         self._gen = 0
         self._gen_lock = threading.Lock()
+        # Serializes the state transitions — see `_transition`.
+        self._state_lock = threading.RLock()
 
         # Set by the player after a playback completes so the endpointer
         # resets its silence counter — otherwise the 10s playback eats
@@ -1315,6 +448,7 @@ class VoiceBridge:
         finally:
             self._duck_release(reason)
 
+    @_transition
     def _enter_idle(self, source: str) -> None:
         """Hard idle: close mic, firmware-mute, LED red.
 
@@ -1413,6 +547,7 @@ class VoiceBridge:
         self._drain_queue(self.utterance_q)
         self._kill_player()
 
+    @_transition
     def _on_hid_press(self) -> None:
         if self._processing.is_set():
             # Mic is only paused for the agent; a press here means "mute".
@@ -1450,6 +585,7 @@ class VoiceBridge:
             log.info("HID press: resume recording")
             self._resume()
 
+    @_transition
     def _resume(self, prefill: "Iterable[bytes]" = ()) -> None:
         """Idle/muted → recording. Shared by HID press and wake word.
 
@@ -1462,8 +598,7 @@ class VoiceBridge:
         self._processing.clear()
         self._replies_since_resume = 0
         self._quiet_idle = False
-        self._idle_window_ms = int(self.cfg.get(
-            "idle_after_resume_ms", self.cfg.get("idle_timeout_ms", 0)))
+        self._set_idle_window("idle_after_resume_ms")
         gen = self._bump_gen()
         # Queued before `recording` is set, so they land ahead of the
         # recorder's first live chunk.
@@ -1475,6 +610,7 @@ class VoiceBridge:
         self._wake_armed.clear()
         self.hid.set_led(muted=False)
 
+    @_transition
     def _on_wake(self, text: str, segment: bytes = b"", backlog: "Iterable[bytes]" = (),
                  command: str = "") -> None:
         """Wake phrase heard while idle: listen at once, ack in parallel.
@@ -1546,15 +682,7 @@ class VoiceBridge:
         if not pcm:
             return 0.0
 
-        # Unmute like a normal speech. Mirrors `_on_hid_press` resume and
-        # the player's auto-resume; idempotent if already unmuted.
-        if not self.recording.is_set():
-            log.info("play_pcm: unmuting for external speech (mic open, LED off)")
-            self._wake_armed.clear()
-            self.recording.set()
-            self.hid.set_led(muted=False)
-        self._auto_idled.clear()
-        self._processing.clear()
+        self._unmute_for_external()
 
         # One atomic item under the current gen → serializes behind any reply
         # already playing, never interleaves with the worker's chunks. The
@@ -1571,8 +699,10 @@ class VoiceBridge:
 
     # -- thread loops --------------------------------------------------
     def _hid_loop(self) -> None:
-        while not self.shutdown_event.wait(0.05):
-            if self.hid.consume_unmute_event():
+        # Blocks on the monitor's press event; the timeout only bounds how
+        # long a shutdown can go unnoticed.
+        while not self.shutdown_event.is_set():
+            if self.hid.wait_press(0.5):
                 self._on_hid_press()
 
     def _recorder_loop(self) -> None:
@@ -1761,6 +891,24 @@ class VoiceBridge:
                 ducked = False
                 self._duck_release(reason)
 
+        def discard(reason: str) -> None:
+            """End the utterance in progress without sending it (also the
+            tail of a commit, once its PCM has been taken)."""
+            nonlocal buf, in_speech
+            unduck_speech(reason)
+            buf = []
+            in_speech = False
+
+        def speech_pcm() -> "tuple[bytes, int, int]":
+            """The utterance as PCM, keeping only `keep_chunks` of the
+            trailing silence: the rest of the detection window is trimmed so
+            STT doesn't see a full silence_timeout_ms tail (keep_chunks=0
+            cuts exactly at the last above-threshold chunk). Returns
+            (pcm, chunks kept, chunks trimmed)."""
+            trim = max(0, min(silence_count - keep_chunks, len(buf)))
+            kept = buf[:-trim] if trim > 0 else buf
+            return b"".join(kept), len(kept), trim
+
         def level_stats() -> str:
             if not levels:
                 return "n/a"
@@ -1774,10 +922,8 @@ class VoiceBridge:
             # captured under the old gen must be discarded.
             cur_gen = self._current_gen()
             if cur_gen != seen_gen:
-                unduck_speech("speech discarded")
-                in_speech = False
+                discard("speech discarded")
                 silence_count = 0
-                buf.clear()
                 if prebuf is not None:
                     prebuf.clear()
                 seen_gen = cur_gen
@@ -1802,20 +948,15 @@ class VoiceBridge:
             # commit it now (don't wait for silence_timeout_ms); the
             # worker will pick it up off utterance_q normally. If
             # there's nothing in flight, the press is just a soft mute.
+            # No voice check here: the user asked for this to be sent.
             if self._force_commit.is_set():
                 self._force_commit.clear()
                 if in_speech and buf:
-                    trim = max(0, min(silence_count - keep_chunks, len(buf)))
-                    speech_buf = buf[:-trim] if trim > 0 else buf
-                    pcm = b"".join(speech_buf)
-                    duration_s = len(speech_buf) * chunk_ms / 1000.0
+                    pcm, kept, _trim = speech_pcm()
                     log.info("Endpointer: force-commit on HID press "
-                             "(%d chunks ≈ %.2fs)",
-                             len(speech_buf), duration_s)
-                    unduck_speech("speech committed")
+                             "(%d chunks ≈ %.2fs)", kept, kept * chunk_ms / 1000.0)
+                    discard("speech committed")
                     self._enqueue_utterance(gen_at_start, pcm, sr)
-                    buf = []
-                    in_speech = False
                     silence_count = 0
 
             try:
@@ -1829,11 +970,10 @@ class VoiceBridge:
             if not samples:
                 continue
             # Same not-quite-RMS metric the legacy `record_until_silence`
-            # used: `sum(s²) / sqrt(N)`. Operator precedence makes this
-            # `sum(s²) / len(samples)**0.5`. Keeping the formula as-is
-            # so the threshold default (`vad_rms_threshold`) carries
-            # over from prior calibrations.
-            rms = sum(s * s for s in samples) / len(samples) ** 0.5
+            # used: `sum(s²) / sqrt(N)`. Keeping the formula as-is so the
+            # threshold default (`vad_rms_threshold`) carries over from
+            # prior calibrations.
+            rms = math.sumprod(samples, samples) / len(samples) ** 0.5
 
             if rms >= rms_threshold:
                 if not in_speech:
@@ -1863,104 +1003,88 @@ class VoiceBridge:
                     # in wake mode only the wake word brings it back.
                     log.info("Endpointer: utterance over max_utterance_ms=%d — side "
                              "conversation, dropped; going idle", max_utt_ms)
-                    unduck_speech("utterance too long")
-                    buf = []
-                    in_speech = False
+                    discard("utterance too long")
                     silence_count = 0
                     self._enter_idle(source=f"utterance>{max_utt_ms}ms")
-                    continue
-            else:
-                if in_speech:
-                    buf.append(data)
-                    if silence_count < commit_chunks:
-                        levels.append(rms)
-                    if silence_count == 0:
-                        log.info("Endpointer: silence onset (rms=%.0f < %g, "
-                                 "need %d chunks ≈ %dms to commit)",
-                                 rms, rms_threshold, commit_chunks,
-                                 self.cfg["silence_timeout_ms"])
-                elif prebuf is not None:
-                    # Rolling pre-roll window for the next utterance.
-                    prebuf.append(data)
-                silence_count += 1
+                continue
 
-                if in_speech and silence_count >= commit_chunks and speech_tick < min_speech_chunks:
+            if in_speech:
+                buf.append(data)
+                if silence_count < commit_chunks:
+                    levels.append(rms)
+                if silence_count == 0:
+                    log.info("Endpointer: silence onset (rms=%.0f < %g, "
+                             "need %d chunks ≈ %dms to commit)",
+                             rms, rms_threshold, commit_chunks,
+                             self.cfg["silence_timeout_ms"])
+            elif prebuf is not None:
+                # Rolling pre-roll window for the next utterance.
+                prebuf.append(data)
+            silence_count += 1
+
+            if in_speech and silence_count >= commit_chunks:
+                if speech_tick < min_speech_chunks:
                     # Too short to be speech (click, bump, echo blip):
                     # drop it before STT. silence_count keeps running, so
                     # noise never postpones auto-idle.
                     log.info("Endpointer: dropped %d-chunk burst (< min_speech_ms=%d) levels %s",
                              speech_tick, self.cfg["min_speech_ms"], level_stats())
-                    unduck_speech("burst dropped")
-                    buf = []
-                    in_speech = False
-                elif (in_speech and silence_count >= commit_chunks
-                        and self._speech_vad is not None
-                        and self._too_little_voice(buf, sr, min_voiced_ms, level_stats)):
-                    # Loud, long enough, but not a voice (keyboard, TV hum,
-                    # a door): dropped like a burst, no STT call, no pause.
-                    unduck_speech("no voice")
-                    buf = []
-                    in_speech = False
-                elif in_speech and silence_count >= commit_chunks:
-                    # Keep only `keep_chunks` of the trailing silence
-                    # in the committed audio: the rest of the detection
-                    # window is trimmed so STT doesn't see a full
-                    # silence_timeout_ms tail. With keep_chunks=0 the
-                    # cut is exactly at the last above-threshold chunk.
-                    trim = max(0, min(silence_count - keep_chunks, len(buf)))
-                    speech_buf = buf[:-trim] if trim > 0 else buf
-                    pcm = b"".join(speech_buf)
-                    duration_s = len(speech_buf) * chunk_ms / 1000.0
-                    log.info("Endpointer: commit (%d chunks ≈ %.2fs, "
-                             "kept %d trailing silence, trimmed %d) levels %s",
-                             len(speech_buf), duration_s,
-                             min(keep_chunks, silence_count), trim, level_stats())
-                    unduck_speech("speech committed")
-                    self._idle_window_ms = int(self.cfg.get("idle_timeout_ms", 0))
-                    if self._enqueue_utterance(gen_at_start, pcm, sr):
-                        self._pause_for_processing()
-                    buf = []
-                    in_speech = False
-                    # Treat commit as a "transaction" boundary: the
-                    # idle 10 s window starts counting from here, not
-                    # from the trailing-silence chunks already absorbed
-                    # to detect end-of-speech. (Playback end resets it
-                    # again via _idle_reset_pending — whichever lands
-                    # later wins.)
-                    silence_count = 0
+                    discard("burst dropped")
+                else:
+                    pcm, kept, trim = speech_pcm()
+                    if (self._speech_vad is not None
+                            and self._too_little_voice(pcm, sr, min_voiced_ms, level_stats)):
+                        # Loud, long enough, but not a voice (keyboard, TV
+                        # hum, a door): dropped like a burst, no STT call.
+                        discard("no voice")
+                    else:
+                        log.info("Endpointer: commit (%d chunks ≈ %.2fs, "
+                                 "kept %d trailing silence, trimmed %d) levels %s",
+                                 kept, kept * chunk_ms / 1000.0,
+                                 min(keep_chunks, silence_count), trim, level_stats())
+                        discard("speech committed")
+                        self._set_idle_window("idle_timeout_ms")
+                        if self._enqueue_utterance(gen_at_start, pcm, sr):
+                            self._pause_for_processing()
+                        # Treat commit as a "transaction" boundary: the idle
+                        # window starts counting from here, not from the
+                        # trailing-silence chunks already absorbed to detect
+                        # end-of-speech. (Playback end resets it again via
+                        # _idle_reset_pending — whichever lands later wins.)
+                        silence_count = 0
 
-                idle_ms = self._idle_window_ms
-                idle_chunks = int(idle_ms / chunk_ms) if idle_enabled and idle_ms > 0 else 0
-                if (not in_speech
-                        and idle_chunks > 0
-                        and silence_count >= idle_chunks
-                        and not self._is_playing()
-                        and not self._idle_reset_pending.is_set()):
-                    # The `_idle_reset_pending` guard closes a race at the
-                    # tail of a reply: the player clears `_player_proc`
-                    # (so `_is_playing()` flips False) and sets the reset
-                    # flag as a pair, but the endpointer could observe the
-                    # cleared proc one tick before consuming the reset —
-                    # with `silence_count` already past the threshold from
-                    # the whole playback — and fire idle the instant the
-                    # reply finished. Holding off while a reset is pending
-                    # lets the next loop tick zero the counter first, so
-                    # the idle window truly starts at end-of-playback.
-                    self._enter_idle(source=f"silence>{idle_ms}ms")
-                    silence_count = 0
-                    buf = []
+            idle_ms = self._idle_window_ms
+            idle_chunks = int(idle_ms / chunk_ms) if idle_enabled and idle_ms > 0 else 0
+            if (not in_speech
+                    and idle_chunks > 0
+                    and silence_count >= idle_chunks
+                    and not self._is_playing()
+                    and not self._idle_reset_pending.is_set()):
+                # The `_idle_reset_pending` guard closes a race at the
+                # tail of a reply: the player clears `_player_proc`
+                # (so `_is_playing()` flips False) and sets the reset
+                # flag as a pair, but the endpointer could observe the
+                # cleared proc one tick before consuming the reset —
+                # with `silence_count` already past the threshold from
+                # the whole playback — and fire idle the instant the
+                # reply finished. Holding off while a reset is pending
+                # lets the next loop tick zero the counter first, so
+                # the idle window truly starts at end-of-playback.
+                self._enter_idle(source=f"silence>{idle_ms}ms")
+                silence_count = 0
+                buf = []
 
-    def _too_little_voice(self, buf: list[bytes], sr: int, min_voiced_ms: int,
+    def _too_little_voice(self, pcm: bytes, sr: int, min_voiced_ms: int,
                           level_stats) -> bool:
         """webrtcvad check at commit. Logs the voiced ms of every commit so
         `speech_filter.min_voiced_ms` can be tuned from the journal."""
-        voiced = _voiced_ms(b"".join(buf), sr, self._speech_vad)
+        voiced = _voiced_ms(pcm, sr, self._speech_vad)
         if voiced is None:
             return False
         if voiced < min_voiced_ms:
             log.info("Endpointer: dropped %.2fs utterance, only %d ms voiced "
                      "(< speech_filter.min_voiced_ms=%d) levels %s",
-                     len(buf) * len(buf[0]) / (2 * sr) if buf else 0.0,
+                     len(pcm) / (2 * sr),
                      voiced, min_voiced_ms, level_stats())
             return True
         log.info("Endpointer: %d ms voiced", voiced)
@@ -1979,6 +1103,34 @@ class VoiceBridge:
         self.utterance_q.put((gen, pcm, sr))
         return True
 
+    @_transition
+    def _unidle_for_reply(self) -> None:
+        """A reply's first audio is about to play: if the bridge went idle
+        on its own meanwhile (auto-idle, or the pause for processing), open
+        the mic again so the user can talk back the moment it ends."""
+        if not self._auto_idled.is_set():
+            return  # an explicit HID mute wins: play, but stay muted
+        log.info("Player: un-idling for playback (auto-idle, "
+                 "resume mic + LED off)")
+        self._auto_idled.clear()
+        self._processing.clear()
+        self.recording.set()
+        self.hid.set_led(muted=False)
+        self._idle_reset_pending.set()
+
+    @_transition
+    def _unmute_for_external(self) -> None:
+        """say_to_speaker: unmute like a normal speech (mirrors the HID
+        resume and the player's auto-resume); idempotent if unmuted."""
+        if not self.recording.is_set():
+            log.info("play_pcm: unmuting for external speech (mic open, LED off)")
+            self._wake_armed.clear()
+            self.recording.set()
+            self.hid.set_led(muted=False)
+        self._auto_idled.clear()
+        self._processing.clear()
+
+    @_transition
     def _pause_for_processing(self) -> None:
         """Stop recording while the committed utterance is processed.
 
@@ -1995,6 +1147,7 @@ class VoiceBridge:
         self._processing.set()
         self._auto_idled.set()
 
+    @_transition
     def _resume_after_processing(self) -> None:
         """Turn ended with nothing to play: listen again."""
         if not self._processing.is_set():
@@ -2178,6 +1331,12 @@ class VoiceBridge:
             return self._player_backlog.popleft()
         return self.playback_q.get(timeout=timeout)
 
+    def _set_idle_window(self, key: str) -> None:
+        """Put the idle window named by config `key` in force (any of the
+        `idle_*_ms` keys); a missing key falls back to `idle_timeout_ms`."""
+        self._idle_window_ms = int(self.cfg.get(key, self.cfg.get("idle_timeout_ms", 0)))
+
+    @_transition
     def _after_reply(self, *, cue: bool = False) -> None:
         """A reply (or say_to_speaker speech) finished playing: widen the
         idle window so the user has time to answer — more if it asked."""
@@ -2185,12 +1344,11 @@ class VoiceBridge:
             return
         self._replies_since_resume += 1
         self._quiet_idle = False
-        self._idle_window_ms = int(
-            self.cfg.get("idle_after_question_ms" if self._reply_is_question
-                         else "idle_after_reply_ms",
-                         self.cfg.get("idle_timeout_ms", 0)))
+        self._set_idle_window("idle_after_question_ms" if self._reply_is_question
+                              else "idle_after_reply_ms")
         self._reply_is_question = False
 
+    @_transition
     def _after_external(self, question: bool) -> None:
         """say_to_speaker finished. A question opens a conversation: the
         answer window, and a goodbye later if nobody answers. A plain
@@ -2200,10 +1358,9 @@ class VoiceBridge:
         if question:
             self._replies_since_resume += 1
             self._quiet_idle = False
-            self._idle_window_ms = int(self.cfg.get(
-                "idle_after_question_ms", self.cfg.get("idle_timeout_ms", 0)))
+            self._set_idle_window("idle_after_question_ms")
             return
-        self._idle_window_ms = int(self.cfg.get("idle_timeout_ms", 0))
+        self._set_idle_window("idle_timeout_ms")
         if not self._replies_since_resume:
             self._quiet_idle = True
 
@@ -2243,14 +1400,7 @@ class VoiceBridge:
             # from end-of-playback. Only fires for *auto*-idle — if the
             # user explicitly pressed HID to mute, `_auto_idled` is
             # clear and we leave the mic muted (the press wins).
-            if self._auto_idled.is_set():
-                log.info("Player: un-idling for playback (auto-idle, "
-                         "resume mic + LED off)")
-                self._auto_idled.clear()
-                self._processing.clear()
-                self.recording.set()
-                self.hid.set_led(muted=False)
-                self._idle_reset_pending.set()
+            self._unidle_for_reply()
 
             with self._ducked("reply"):
                 if self._play_streamed(item, device, sample_rate, gen):
@@ -2302,18 +1452,14 @@ class VoiceBridge:
         chunks, ended, stale = self._prebuffer(item, gen, sample_rate)
         if stale:
             return False
-        proc = _aplay_popen(device, sample_rate, bufsize=0)
-        with self._player_lock:
-            self._player_proc = proc
-        if self._turn_t0 is not None:
-            log.info("Turn: first audio %.2fs after pick-up", time.monotonic() - self._turn_t0)
-            self._turn_t0 = None
         completed = False
-        try:
+        with self._aplay_session(device, sample_rate) as proc:
+            if self._turn_t0 is not None:
+                log.info("Turn: first audio %.2fs after pick-up", time.monotonic() - self._turn_t0)
+                self._turn_t0 = None
             if not self._write_chunk(proc, b"".join(chunks)):
                 return False
             if ended:
-                completed = True
                 return True
             while not self.shutdown_event.is_set():
                 try:
@@ -2337,43 +1483,37 @@ class VoiceBridge:
                     continue
                 if not self._write_chunk(proc, item2):
                     break
-        finally:
-            # Close stdin and play out aplay's buffered tail without
-            # chopping it (bounded so a hung aplay can't pin the
-            # thread). See `_drain_aplay`: a fixed timeout + kill would
-            # clip the reply's tail and, via `sw_dmix`'s mixing, overlap
-            # the next utterance. Crucially, `_player_proc` stays set
-            # throughout the drain — it's only cleared below, after the
-            # wait returns — so `_is_playing()` keeps the endpointer
-            # from firing auto-idle during the audible tail of the reply.
-            _drain_aplay(proc, sample_rate, abort=self.shutdown_event)
-            # Order matters: signal the end-of-playback idle reset
-            # BEFORE clearing the player handle. The endpointer's idle
-            # check also gates on `_idle_reset_pending`, so as long as
-            # the flag is already set whenever `_player_proc` becomes
-            # None, the endpointer can never see "not playing + stale
-            # silence_count" and auto-idle the instant the reply ends.
-            # The flag is consumed on the endpointer's next tick, which
-            # zeroes `silence_count` — restarting the idle window from
-            # here (end of playback), as intended.
-            self._idle_reset_pending.set()
-            with self._player_lock:
-                self._player_proc = None
         return completed and gen == self._current_gen()
 
     def _play_blob(self, pcm: bytes, device: str, sample_rate: int) -> None:
-        """Play one complete PCM blob as a single utterance (external speech).
+        """Play one complete PCM blob as a single utterance (external
+        speech, thinking cues) — same aplay session as a streamed reply."""
+        with self._aplay_session(device, sample_rate) as proc:
+            self._write_chunk(proc, pcm)
 
-        Mirrors the per-utterance body of `_player_loop`: registers the aplay
-        proc in `_player_proc` (so `_is_playing()` blocks auto-idle during the
-        speech), writes the whole blob, then runs the bounded no-clip drain
-        and starts the end-of-playback idle window via `_idle_reset_pending`.
-        """
+    @contextlib.contextmanager
+    def _aplay_session(self, device: str, sample_rate: int):
+        """One aplay for one utterance, registered as `_player_proc`.
+
+        While registered, `_is_playing()` is true, so the endpointer can't
+        auto-idle and a barge-in can `_kill_player()` it. On exit the tail is
+        played out without chopping it (bounded so a hung aplay can't pin
+        the thread — see `_drain_aplay`: a fixed timeout + kill would clip
+        the reply and, via `sw_dmix`'s mixing, overlap the next utterance).
+        `_player_proc` stays set throughout the drain, so the audible tail
+        still counts as playing.
+
+        Order matters at the end: the idle reset is signalled BEFORE the
+        handle is cleared. The endpointer's idle check also gates on
+        `_idle_reset_pending`, so whenever `_player_proc` becomes None the
+        flag is already set and the endpointer can never see "not playing +
+        stale silence_count" and auto-idle the instant the reply ends; its
+        next tick zeroes `silence_count`, restarting the idle window here."""
         proc = _aplay_popen(device, sample_rate, bufsize=0)
         with self._player_lock:
             self._player_proc = proc
         try:
-            self._write_chunk(proc, pcm)
+            yield proc
         finally:
             _drain_aplay(proc, sample_rate, abort=self.shutdown_event)
             self._idle_reset_pending.set()

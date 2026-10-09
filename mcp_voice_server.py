@@ -120,9 +120,9 @@ def configure(cfg: dict, *, stt, tts, bridge) -> "FastMCP":
     global _bridge, _cfg, _stt, _tts, _TTS_RATE
     global _HOST, _PORT, _TG_TOKEN, _TG_CHAT_ID, _OUT_DIR
 
-    # Each provider class constructs its own SDK client per call, so the
-    # bridge's single shared instance is safe to use concurrently across
-    # FastMCP's threadpool-dispatched tool calls.
+    # The providers are safe to share with FastMCP's threadpool-dispatched
+    # tool calls: ElevenLabsVoice reuses one thread-safe httpx-backed SDK
+    # client, DeepgramVoice builds a fresh async client per call.
     _bridge = bridge
     _cfg = cfg
     _stt = stt
