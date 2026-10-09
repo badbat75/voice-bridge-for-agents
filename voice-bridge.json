@@ -10,7 +10,17 @@
   "pre_speech_keep_ms": 250,
   "silence_timeout_ms": 1000,
   "idle_timeout_ms": 3000,
+  "idle_after_reply_ms": 8000,
+  "idle_after_question_ms": 12000,
+  "idle_after_resume_ms": 6000,
+  "max_utterance_ms": 18000,
+  "speech_filter": {
+    "enabled": true,
+    "aggressiveness": 2,
+    "min_voiced_ms": 200
+  },
   "output_device": "voice_out",
+  "playback_prebuffer_ms": 500,
   "output_volume": {
     "control": "VoiceBridge",
     "card": "USB",
@@ -51,7 +61,13 @@
       "[soft] Sono qui se serve.",
       "[relaxed] Ok, a dopo.",
       "[cheerful] Va bene, ciao!"
-    ]
+    ],
+    "fuzzy_threshold": 0.8,
+    "aliases": [
+      "hey bye harry",
+      "hey bye ali"
+    ],
+    "goodbye_after_turn_only": true
   },
   "stt_provider": "elevenlabs",
   "tts_provider": "elevenlabs",
@@ -62,6 +78,18 @@
   },
   "tts_streaming_mode": "http_sentence",
   "tts_whole_reply": true,
+  "tts_first_sentence_early": true,
+  "thinking_cue": {
+    "enabled": true,
+    "delay_ms": 3000,
+    "repeat_ms": 5000,
+    "phrases": [
+      "[calm] Un attimo.",
+      "[warm] Ci sto lavorando.",
+      "[calm] Dammi un secondo.",
+      "[warm] Ci penso io."
+    ]
+  },
   "session_key": "agent:main:voice-bridge",
   "voice_model": "openclaw",
   "elevenlabs": {

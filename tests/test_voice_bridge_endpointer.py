@@ -441,10 +441,11 @@ class MuteTriggerTest(unittest.TestCase):
         bridge.recording.set()
         gen0 = bridge._current_gen()
 
-        # Pre-load each queue so we can prove they were NOT drained.
+        # Pre-load the input queues so we can prove they were NOT drained.
+        # (Nothing is playing: a press while a reply plays or is queued
+        # stops the reply instead — see test_barge_in.py.)
         bridge.audio_q.put((gen0, b"audio"))
         bridge.utterance_q.put((gen0, b"utt", _SAMPLE_RATE))
-        bridge.playback_q.put((gen0, b"pcm"))
 
         bridge._on_hid_press()
 
@@ -457,8 +458,6 @@ class MuteTriggerTest(unittest.TestCase):
                          "audio_q must NOT be drained on press-to-mute")
         self.assertFalse(bridge.utterance_q.empty(),
                          "utterance_q must NOT be drained on press-to-mute")
-        self.assertFalse(bridge.playback_q.empty(),
-                         "playback_q must NOT be drained on press-to-mute")
         self.assertEqual(hid.set_led_calls[-1], True,
                          "LED must turn on (firmware mute) on press-to-mute")
 

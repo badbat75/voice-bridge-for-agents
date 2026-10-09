@@ -35,6 +35,22 @@ VALID_TTS_STREAM_MODES = ("http_sentence", "websocket")
 # we accept the rare false positive (e.g. "Sig. Rossi") in exchange for
 # starting playback as soon as the first sentence is complete.
 _SENT_END_RE = re.compile(r"[.!?…]+\s+")
+# eleven_v3 tone tags ("[calm]") carry no words of their own.
+_TONE_TAG_RE = re.compile(r"\[[^\]]*\]")
+
+
+def _sentence_end(buf: str) -> "re.Match | None":
+    """First sentence boundary in `buf` that closes an actual sentence.
+
+    The agent opens every reply with "... " (a breath for v3), which the
+    regex alone would take as a complete first sentence — one TTS call for
+    three dots and the real first sentence waiting for the whole reply.
+    A boundary only counts once the text before it has a word in it (tone
+    tags stripped), so the prefix rides along with the first sentence."""
+    for m in _SENT_END_RE.finditer(buf):
+        if any(ch.isalnum() for ch in _TONE_TAG_RE.sub(" ", buf[: m.start()])):
+            return m
+    return None
 
 
 class ElevenLabsVoice:
@@ -57,6 +73,7 @@ class ElevenLabsVoice:
         tts_text_normalization: str | None = None,
         tts_stream_mode: str = "http_sentence",
         tts_whole_reply: bool = False,
+        tts_first_sentence_early: bool = False,
         stt_model: str = "scribe_v1",
         stt_language: str = "ita",
     ) -> None:
@@ -81,6 +98,11 @@ class ElevenLabsVoice:
         # prosody consistent across the reply — on models like eleven_v3
         # that reject request stitching, this is the only way to get it.
         self._tts_whole_reply = bool(tts_whole_reply)
+        # Hybrid on top of whole-reply: the first sentence is synthesized
+        # the moment it is complete (the agent's "ci penso io" is heard
+        # while it works), the rest of the reply in ONE more call. One tone
+        # seam instead of one per sentence.
+        self._tts_first_sentence_early = bool(tts_first_sentence_early)
         self._stt_model = stt_model
         self._stt_language = stt_language
 
@@ -167,6 +189,8 @@ class ElevenLabsVoice:
         """
         if self._tts_stream_mode == "websocket":
             yield from self._synthesize_stream_websocket(text_iter)
+        elif self._tts_whole_reply and self._tts_first_sentence_early:
+            yield from self._synthesize_stream_http_hybrid(text_iter)
         elif self._tts_whole_reply:
             yield from self._synthesize_stream_http_whole(text_iter)
         else:
@@ -184,6 +208,36 @@ class ElevenLabsVoice:
         try:
             client = elevenlabs.ElevenLabs(api_key=self._api_key)
             yield from self._stream_sentence(client, text)
+        except Exception as exc:
+            log.error("TTS streaming error: %s", exc)
+
+    def _synthesize_stream_http_hybrid(self, text_iter: Iterable[str]) -> Iterator[bytes]:
+        """First sentence early, rest of the reply in one call.
+
+        Deltas are buffered until the first sentence boundary; that
+        sentence is streamed right away (while the gateway keeps working),
+        then everything after it is buffered to the end of the stream and
+        synthesized in a single call, like `tts_whole_reply`. A reply with
+        no boundary at all is synthesized once at the end."""
+        try:
+            client = elevenlabs.ElevenLabs(api_key=self._api_key)
+            buf = ""
+            first_done = False
+            for delta in text_iter:
+                if not delta:
+                    continue
+                buf += delta
+                if not first_done:
+                    m = _sentence_end(buf)
+                    if m:
+                        first = buf[: m.end()].strip()
+                        buf = buf[m.end():]
+                        first_done = True
+                        if first:
+                            yield from self._stream_sentence(client, first)
+            rest = buf.strip()
+            if rest:
+                yield from self._stream_sentence(client, rest)
         except Exception as exc:
             log.error("TTS streaming error: %s", exc)
 
@@ -240,7 +294,7 @@ class ElevenLabsVoice:
                     continue
                 buf += delta
                 while True:
-                    m = _SENT_END_RE.search(buf)
+                    m = _sentence_end(buf)
                     if not m:
                         break
                     sentence = buf[: m.end()].strip()

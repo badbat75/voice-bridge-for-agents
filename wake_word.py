@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import array
 import contextlib
+import difflib
 import hashlib
 import json
 import logging
@@ -54,6 +55,16 @@ DEFAULTS = {
     "hang_ms": 300,
     "pre_roll_ms": 300,
     "max_segment_ms": 3000,
+    # Whistle often hears a non-native "hey binary" as "hey binally" or
+    # "okay binary". A heard window whose letters are at least this similar
+    # (difflib ratio, spaces removed) to a phrase counts as a hit. 0 = exact only.
+    "fuzzy_threshold": 0.8,
+    # Extra phrases that count as a hit but are NOT passed to Whistle as
+    # keyword bias (biasing towards a mishearing would make it more likely).
+    "aliases": [],
+    # Speak a `sleep_acks` goodbye only if a reply was played since the last
+    # wake/resume; an unanswered wake dozes off with a soft tone instead.
+    "goodbye_after_turn_only": True,
     "acks": [],
     "sleep_acks": [],
     "ack_cache_dir": "~/.cache/voice-bridge/acks",
@@ -64,6 +75,8 @@ def wake_config(cfg: dict) -> dict:
     """`cfg["wake_word"]` merged over DEFAULTS, phrases lower-cased."""
     out = {**DEFAULTS, **(cfg.get("wake_word") or {})}
     out["phrases"] = [normalize(p) for p in out["phrases"] if normalize(p)]
+    out["aliases"] = [normalize(p) for p in out.get("aliases") or [] if normalize(p)]
+    out["fuzzy_threshold"] = float(out.get("fuzzy_threshold") or 0.0)
     return out
 
 
@@ -72,9 +85,56 @@ def normalize(text: str) -> str:
     return " ".join(re.sub(r"[^\w\s]|_", " ", text.lower()).split())
 
 
-def matches(text: str, phrases: list[str]) -> bool:
+def fuzzy_score(text: str, phrase: str) -> float:
+    """Best similarity between `phrase` and any window of 1..n+1 heard words.
+
+    Spaces are dropped on both sides, so a split mishearing ("hey bin ally")
+    scores like a joined one ("hey binally")."""
+    words = normalize(text).split()
+    target = normalize(phrase).replace(" ", "")
+    if not words or not target:
+        return 0.0
+    n_max = len(normalize(phrase).split()) + 1
+    best = 0.0
+    for n in range(1, n_max + 1):
+        for i in range(len(words) - n + 1):
+            cand = "".join(words[i:i + n])
+            best = max(best, difflib.SequenceMatcher(None, cand, target).ratio())
+    return best
+
+
+def matches(text: str, phrases: list[str], aliases=(), fuzzy: float = 0.0) -> bool:
+    """Exact word-boundary match on phrases + aliases, else a fuzzy match
+    on the phrases when `fuzzy` > 0."""
     heard = f" {normalize(text)} "
-    return any(f" {p} " in heard for p in phrases)
+    if any(f" {p} " in heard for p in (*phrases, *aliases)):
+        return True
+    return fuzzy > 0 and any(fuzzy_score(text, p) >= fuzzy for p in phrases)
+
+
+def command_after(text: str, phrases: list[str], aliases=(), fuzzy: float = 0.0) -> str:
+    """Words heard after the wake phrase — "hey binary metti la musica" →
+    "metti la musica" — or "" when there are none (or no match at all).
+
+    Same matching as `matches`: an exact phrase/alias first, else the
+    window of heard words that scores best (≥ `fuzzy`) against a phrase."""
+    words = normalize(text).split()
+    for p in (*phrases, *aliases):
+        pw = p.split()
+        for i in range(len(words) - len(pw) + 1):
+            if words[i:i + len(pw)] == pw:
+                return " ".join(words[i + len(pw):])
+    if fuzzy <= 0:
+        return ""
+    best, end = 0.0, None
+    for p in phrases:
+        target = p.replace(" ", "")
+        for n in range(1, len(p.split()) + 2):
+            for i in range(len(words) - n + 1):
+                r = difflib.SequenceMatcher(None, "".join(words[i:i + n]), target).ratio()
+                if r >= fuzzy and r > best:
+                    best, end = r, i + n
+    return " ".join(words[end:]) if end is not None else ""
 
 
 def _rms(pcm: bytes) -> float:
@@ -172,6 +232,8 @@ class WakeDetector:
 
     def __init__(self, wcfg: dict) -> None:
         self.phrases = wcfg["phrases"]
+        self.aliases = wcfg.get("aliases") or []
+        self.fuzzy = float(wcfg.get("fuzzy_threshold") or 0.0)
         self.language = wcfg.get("language") or None
 
     def load(self) -> None:
@@ -181,7 +243,11 @@ class WakeDetector:
         return whistle_transcribe(pcm, self.language, self.phrases)
 
     def heard(self, text: str) -> bool:
-        return matches(text, self.phrases)
+        return matches(text, self.phrases, self.aliases, self.fuzzy)
+
+    def command(self, text: str) -> str:
+        """What was said after the wake phrase in the same breath, if anything."""
+        return command_after(text, self.phrases, self.aliases, self.fuzzy)
 
 
 RETRY_MIN_S, RETRY_MAX_S = 30.0, 600.0

@@ -537,7 +537,7 @@ def say_to_speaker(text: str) -> dict:
     if not pcm:
         raise RuntimeError("TTS produced no audio (provider error — check logs)")
 
-    seconds = _bridge.play_pcm(pcm)
+    seconds = _bridge.play_pcm(pcm, text=text)
     log.info("say_to_speaker: %d chars -> %.1fs", len(text), seconds)
     return {"ok": True, "chars": len(text), "seconds": round(seconds, 2)}
 

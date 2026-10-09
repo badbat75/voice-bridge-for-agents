@@ -291,6 +291,47 @@ def load_config() -> dict:
     # stitching, so this is the only consistency lever there). Trades
     # first-audio latency for it. Default false = split per sentence.
     cfg["tts_whole_reply"] = bool(cfg.get("tts_whole_reply", False))
+    # With `tts_whole_reply`, speak the first sentence as soon as it is
+    # complete and the rest in one call (ElevenLabs only).
+    cfg["tts_first_sentence_early"] = bool(cfg.get("tts_first_sentence_early", False))
+
+    # Idle window after a reply finished playing. Defaults to the plain
+    # idle window; a reply ending in "?" gets the (usually longer)
+    # question window, since the user is expected to answer.
+    cfg["idle_after_reply_ms"] = int(cfg.get("idle_after_reply_ms", cfg["idle_timeout_ms"]))
+    cfg["idle_after_question_ms"] = int(
+        cfg.get("idle_after_question_ms", cfg["idle_after_reply_ms"]))
+    # Idle window right after a wake word / button resume: time to start
+    # talking after "Dimmi". Defaults to the plain idle window.
+    cfg["idle_after_resume_ms"] = int(cfg.get("idle_after_resume_ms", cfg["idle_timeout_ms"]))
+    # An utterance still going after this long is people talking among
+    # themselves, not a request: it is dropped and the bridge goes idle.
+    # 0 = no limit.
+    cfg["max_utterance_ms"] = int(cfg.get("max_utterance_ms", 0))
+
+    # PCM buffered before the first write to aplay, so a TTS stream that
+    # stalls right after its first chunk doesn't underrun (audible click).
+    cfg["playback_prebuffer_ms"] = int(cfg.get("playback_prebuffer_ms", 0))
+
+    # Frame-level voice check (webrtcvad) at commit: utterances with less
+    # than `min_voiced_ms` of voiced frames are dropped before STT.
+    sf = cfg.get("speech_filter") or {}
+    cfg["speech_filter"] = {
+        "enabled": bool(sf.get("enabled", False)),
+        "aggressiveness": int(sf.get("aggressiveness", 2)),
+        "min_voiced_ms": int(sf.get("min_voiced_ms", 200)),
+    }
+    if not 0 <= cfg["speech_filter"]["aggressiveness"] <= 3:
+        raise ValueError("voice-bridge.json: speech_filter.aggressiveness must be 0..3")
+
+    # "Still working" feedback between commit and the first reply audio.
+    tc = cfg.get("thinking_cue") or {}
+    cfg["thinking_cue"] = {
+        "enabled": bool(tc.get("enabled", False)),
+        "delay_ms": int(tc.get("delay_ms", 3000)),
+        "repeat_ms": int(tc.get("repeat_ms", 5000)),
+        "phrases": list(tc.get("phrases") or []),
+    }
 
     return cfg
 
@@ -316,6 +357,7 @@ def _build_voice_provider(role: str, cfg: dict):
             tts_text_normalization=cfg.get("elevenlabs_text_normalization"),
             tts_stream_mode=cfg.get("tts_streaming_mode", "http_sentence"),
             tts_whole_reply=cfg.get("tts_whole_reply", False),
+            tts_first_sentence_early=cfg.get("tts_first_sentence_early", False),
         )
     if name == "deepgram":
         kwargs = {
@@ -533,6 +575,17 @@ def _make_beep_pcm(sample_rate: int, freq: float, duration: float, amplitude: in
     return buf.tobytes()
 
 
+def _make_tick_pcm(sample_rate: int) -> bytes:
+    """Soft, short "still working" tick — quiet enough to sit under music."""
+    return _make_beep_pcm(sample_rate, freq=520, duration=0.06, amplitude=4000)
+
+
+def _make_sleep_tone_pcm(sample_rate: int) -> bytes:
+    """Two soft falling notes: the bridge dozed off without a conversation."""
+    return (_make_beep_pcm(sample_rate, freq=660, duration=0.09, amplitude=6000)
+            + _make_beep_pcm(sample_rate, freq=440, duration=0.12, amplitude=6000))
+
+
 def play_beep(device: str, sample_rate: int) -> None:
     """Play a short ~80 ms 880 Hz beep at the given output sample rate."""
     play_audio(device, _make_beep_pcm(sample_rate, freq=880, duration=0.08), sample_rate)
@@ -584,6 +637,15 @@ NO_REPLY_SENTINELS: frozenset[str] = frozenset({"NO_REPLY", "NOREPLY", "NO-REPLY
 _NO_REPLY_MAX_LEN = max(len(s) for s in NO_REPLY_SENTINELS)
 
 
+# The voice agent opens every spoken reply with "... " (a silent breath for
+# eleven_v3, see the voice-reply-style skill), so "... NO_REPLY" must count.
+_NO_REPLY_LEAD = " \t\n.…"
+
+
+def _is_no_reply(text: str) -> bool:
+    return (text or "").strip().lstrip(_NO_REPLY_LEAD).strip() in NO_REPLY_SENTINELS
+
+
 def _filter_no_reply(stream: Iterable[str]) -> Iterator[str]:
     """Wrap a delta stream and swallow it entirely if it strips to a
     NO_REPLY sentinel. Otherwise yield deltas unchanged.
@@ -600,12 +662,12 @@ def _filter_no_reply(stream: Iterable[str]) -> Iterator[str]:
             yield delta
             continue
         buf += delta
-        if len(buf) > _NO_REPLY_MAX_LEN + 2:
+        if len(buf.lstrip(_NO_REPLY_LEAD)) > _NO_REPLY_MAX_LEN + 2:
             yield buf
             buf = ""
             holding = False
     if holding and buf:
-        if buf.strip() in NO_REPLY_SENTINELS:
+        if _is_no_reply(buf):
             return
         yield buf
 
@@ -626,6 +688,59 @@ def _is_non_speech(text: str) -> bool:
     utterance carried no words at all. A tag mixed with real speech
     ("[click] accendi la luce") is speech and passes through unchanged."""
     return not any(ch.isalnum() for ch in _NON_SPEECH_TAG_RE.sub(" ", text))
+
+
+# Closing invitations that expect an answer without a "?": "Dimmi tu il
+# titolo e la metto!", "Rifammi il pensiero, che ci sono."
+_INVITE_RE = re.compile(
+    r"\b(dimmi|ditemi|dimmelo|ditemelo|raccontami|fammi sapere|fatemi sapere|"
+    r"rifammi|ripetimi|ripeti|riprova\w*|prova a)\b", re.IGNORECASE)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _expects_answer(text: str) -> bool:
+    """True when the spoken reply leaves the user something to answer: a "?"
+    in its last two sentences ("Vuoi la remix? Te la metto se dici sì.") or
+    an invitation in the last one ("Dimmi tu il titolo!"). eleven_v3 tone
+    tags ("[warm]") are ignored."""
+    stripped = _NON_SPEECH_TAG_RE.sub(" ", text or "")
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(stripped.strip())
+                 if any(ch.isalnum() for ch in s)]
+    if not sentences:
+        return False
+    return any("?" in s for s in sentences[-2:]) or bool(_INVITE_RE.search(sentences[-1]))
+
+
+_VAD_RATES = (8000, 16000, 32000, 48000)
+_VAD_FRAME_MS = 30
+
+
+def _voiced_ms(pcm: bytes, sample_rate: int, vad) -> int | None:
+    """Milliseconds of voiced 30 ms frames in S16LE mono `pcm`, per a
+    `webrtcvad.Vad`. None when the rate is one webrtcvad can't take, so the
+    caller can skip the check instead of dropping speech."""
+    if sample_rate not in _VAD_RATES:
+        return None
+    frame_bytes = sample_rate * _VAD_FRAME_MS // 1000 * 2
+    voiced = 0
+    for i in range(0, len(pcm) - frame_bytes + 1, frame_bytes):
+        if vad.is_speech(pcm[i:i + frame_bytes], sample_rate):
+            voiced += _VAD_FRAME_MS
+    return voiced
+
+
+def _make_speech_vad(cfg: dict):
+    """A `webrtcvad.Vad` when `speech_filter.enabled`, else None. A missing
+    module only logs: the filter is an optimization, never a hard dep."""
+    sf = cfg.get("speech_filter") or {}
+    if not sf.get("enabled"):
+        return None
+    try:
+        import webrtcvad
+    except ImportError:
+        log.warning("speech_filter enabled but webrtcvad is not installed — filter off")
+        return None
+    return webrtcvad.Vad(int(sf.get("aggressiveness", 2)))
 
 
 def gateway_chat_stream(
@@ -736,12 +851,23 @@ def gateway_chat_stream_zeroclaw(
         yield GATEWAY_FALLBACK_REPLY
 
 
+# Spoken when the WS dropped AFTER the message reached the agent: it may
+# already have acted (started a song, sent a mail), so don't pretend
+# nothing happened and don't silently retry (that would act twice).
+GATEWAY_LOST_REPLY = ("Ho perso la risposta per strada. Se mi avevi chiesto di fare "
+                      "qualcosa, controlla se è partita.")
+# Spoken when the agent could not be reached at all, even after a retry.
+GATEWAY_UNREACHABLE_REPLY = "Non riesco a raggiungere l'assistente in questo momento. Riprova tra poco."
+
+
 def gateway_chat_stream_zeroclaw_ws(
     base_url: str,
     token: str,
     text: str,
     agent: str = "default",
     session_id: str = "voice-bridge",
+    on_event=None,
+    connect_fn=None,
 ) -> Iterator[str]:
     """zeroclaw `/ws/chat` WebSocket leg — same iterator contract as the others.
 
@@ -756,60 +882,95 @@ def gateway_chat_stream_zeroclaw_ws(
       - ``done``                               → end of turn (its `full_response`
                                                  is the same lossy string; ignored)
 
+    Every non-chunk frame is also reported to `on_event(type, frame)` if
+    given (the bridge plays a "un attimo" cue on the first `tool_call`).
+
+    Failure handling depends on how far the turn got:
+      - before the message was sent (connect/upgrade failed): retried once,
+        then `GATEWAY_UNREACHABLE_REPLY` — nothing reached the agent, so a
+        retry can't make it act twice;
+      - after the message was sent but before any answer text:
+        `GATEWAY_LOST_REPLY`, no retry (the agent may already have acted);
+      - after some answer text was yielded: stop quietly, the user already
+        heard part of the answer and an apology tacked on would be noise.
+
     Connects to ``ws(s)://<host>/ws/chat?agent=<agent>&session_id=<id>`` with
     the paired token as the ``?token=`` query param. Conversational context is
     keyed by ``session_id`` (the gateway namespaces it as ``gw_<id>``), so a
-    stable id keeps every turn in the same session. On any transport error this
-    yields the shared fallback string so the TTS stage always has something to
-    speak.
+    stable id keeps every turn in the same session. `connect_fn` is injectable
+    for tests (defaults to ``websockets.sync.client.connect``).
     """
     from urllib.parse import urlsplit, urlunsplit, urlencode
-    from websockets.sync.client import connect
+    if connect_fn is None:
+        from websockets.sync.client import connect as connect_fn
 
     parts = urlsplit(base_url)
     ws_scheme = "wss" if parts.scheme == "https" else "ws"
     query = urlencode({"agent": agent, "session_id": session_id, "token": token})
     url = urlunsplit((ws_scheme, parts.netloc, "/ws/chat", query, ""))
 
-    try:
-        # open_timeout caps the upgrade; the per-recv timeout below caps each
-        # frame wait so a stalled turn can't hang the worker forever.
-        with connect(url, max_size=None, open_timeout=30) as ws:
-            log.info("WS connect: %s/ws/chat (agent=%s session=%s)",
-                     base_url, agent, session_id)
-            ws.send(json.dumps({"type": "message", "content": text}))
-            while True:
-                raw = ws.recv(timeout=120)
-                try:
-                    frame = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                ftype = frame.get("type")
-                if ftype == "chunk":
-                    delta = frame.get("content")
-                    if delta:
-                        yield delta
-                elif ftype == "done":
-                    return
-                elif ftype == "error":
-                    log.error("WS gateway error frame: %s",
-                              frame.get("message", raw[:200]))
-                    return
-                elif ftype == "approval_request":
-                    # Voice has no interactive approval path; deny so the turn
-                    # finishes instead of blocking on a prompt no one answers.
-                    log.info("WS approval_request for tool %r → auto-deny",
-                             frame.get("tool"))
-                    ws.send(json.dumps({
-                        "type": "approval_response",
-                        "request_id": frame.get("request_id"),
-                        "decision": "deny",
-                    }))
-                # thinking / tool_call / tool_result / session_start /
-                # chunk_reset / agent_end etc. are intentionally dropped.
-    except Exception as exc:
-        log.error("Gateway WS streaming error: %s", exc)
-        yield GATEWAY_FALLBACK_REPLY
+    for attempt in (1, 2):
+        sent = yielded = False
+        try:
+            # open_timeout caps the upgrade; the per-recv timeout below caps
+            # each frame wait so a stalled turn can't hang the worker forever.
+            with connect_fn(url, max_size=None, open_timeout=30) as ws:
+                log.info("WS connect: %s/ws/chat (agent=%s session=%s)",
+                         base_url, agent, session_id)
+                ws.send(json.dumps({"type": "message", "content": text}))
+                sent = True
+                while True:
+                    raw = ws.recv(timeout=120)
+                    try:
+                        frame = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    ftype = frame.get("type")
+                    if ftype == "chunk":
+                        delta = frame.get("content")
+                        if delta:
+                            yielded = True
+                            yield delta
+                        continue
+                    if on_event is not None:
+                        try:
+                            on_event(ftype, frame)
+                        except Exception:
+                            log.exception("WS on_event callback failed")
+                    if ftype == "done":
+                        return
+                    elif ftype == "error":
+                        log.error("WS gateway error frame: %s",
+                                  frame.get("message", str(raw)[:200]))
+                        if not yielded:
+                            yield GATEWAY_LOST_REPLY
+                        return
+                    elif ftype == "approval_request":
+                        # Voice has no interactive approval path; deny so the
+                        # turn finishes instead of blocking on a prompt.
+                        log.info("WS approval_request for tool %r → auto-deny",
+                                 frame.get("tool"))
+                        ws.send(json.dumps({
+                            "type": "approval_response",
+                            "request_id": frame.get("request_id"),
+                            "decision": "deny",
+                        }))
+                    # thinking / tool_call / tool_result / session_start /
+                    # chunk_reset / agent_end etc. are intentionally dropped.
+        except Exception as exc:
+            log.error("Gateway WS streaming error (attempt %d, sent=%s, answered=%s): %s",
+                      attempt, sent, yielded, exc)
+            if yielded:
+                return
+            if sent:
+                yield GATEWAY_LOST_REPLY
+                return
+            if attempt == 1:
+                log.info("WS: message never reached the agent — retrying once")
+                continue
+            yield GATEWAY_UNREACHABLE_REPLY
+            return
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -832,9 +993,87 @@ _END_OF_UTTERANCE = _EndOfUtterance()
 # player plays `pcm` end-to-end as its own utterance and fires `done` when
 # the playback (and no-clip drain) finishes, releasing a blocked caller.
 class _ExternalUtterance:
-    def __init__(self, pcm: bytes, done: "threading.Event") -> None:
+    """`duck`: lower the music while it plays. `cue`: a thinking cue (tick
+    or "un attimo") — it doesn't count as a reply for the idle window.
+    `question`: the speech expects an answer (see `_after_external`)."""
+
+    def __init__(self, pcm: bytes, done: "threading.Event", *,
+                 label: str = "say_to_speaker", duck: bool = True,
+                 cue: bool = False, question: bool = False) -> None:
         self.pcm = pcm
         self.done = done
+        self.label = label
+        self.duck = duck
+        self.cue = cue
+        self.question = question
+
+
+class _ThinkingCue:
+    """Per-turn "still working" feedback between pick-up and the first
+    reply audio, so the user never sits through 10–25 s of dead air.
+
+    - the first `tool_call` frame plays a spoken cue ("Un attimo.") once;
+    - after `delay_ms` with no reply audio, a soft tick, repeated every
+      `repeat_ms`.
+
+    Cues go through the player queue (serialized, never mixed with the
+    reply) and don't duck the music. `stop()` is called before the first
+    reply chunk is queued; the lock makes "check stopped + enqueue"
+    atomic, so no cue can land behind the reply."""
+
+    def __init__(self, bridge: "VoiceBridge", gen: int) -> None:
+        self._bridge = bridge
+        self._gen = gen
+        tc = bridge.cfg.get("thinking_cue") or {}
+        self._enabled = bool(tc.get("enabled"))
+        self._delay = max(0, int(tc.get("delay_ms", 3000))) / 1000.0
+        self._repeat = max(100, int(tc.get("repeat_ms", 5000))) / 1000.0
+        self._stop = threading.Event()
+        self._tool = threading.Event()
+        self._lock = threading.Lock()
+        self.cues_played = 0
+
+    def start(self) -> "_ThinkingCue":
+        if self._enabled:
+            threading.Thread(target=self._run, name="vb-thinking", daemon=True).start()
+        return self
+
+    def on_event(self, ftype: str, _frame: dict) -> None:
+        if ftype == "tool_call":
+            self._tool.set()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop.set()
+
+    def _enqueue(self, pcm: bytes | None, label: str) -> bool:
+        if not pcm:
+            return False
+        with self._lock:
+            if self._stop.is_set():
+                return False
+            self._bridge.playback_q.put((self._gen, _ExternalUtterance(
+                pcm, threading.Event(), label=label, duck=False, cue=True)))
+            self.cues_played += 1
+            return True
+
+    def _run(self) -> None:
+        rate = int(self._bridge.cfg["tts_sample_rate"])
+        next_tick = time.monotonic() + self._delay
+        spoke = False
+        while not self._stop.wait(0.05):
+            now = time.monotonic()
+            if self._tool.is_set() and not spoke:
+                spoke = True
+                bank = self._bridge._thinking_acks
+                clip = bank.pick() if bank else None
+                if self._enqueue(clip[2] if clip else None, "thinking-ack"):
+                    log.info("Thinking cue: %r", clip[1])
+                    next_tick = now + self._repeat
+                    continue
+            if now >= next_tick:
+                self._enqueue(_make_tick_pcm(rate), "thinking-tick")
+                next_tick = now + self._repeat
 
 
 class VoiceBridge:
@@ -971,6 +1210,38 @@ class VoiceBridge:
             if not self.recording.is_set():
                 self._wake_armed.set()
 
+        # Spoken "un attimo" clips for the thinking cue (any activation mode).
+        self._thinking_acks = None
+        tphrases = (cfg.get("thinking_cue") or {}).get("phrases") or []
+        if (cfg.get("thinking_cue") or {}).get("enabled") and tphrases:
+            self._thinking_acks = wake_word.AckBank(
+                cfg, tphrases, [cfg.get("tts_provider", "elevenlabs")],
+                wake_word.wake_config(cfg)["ack_cache_dir"],
+                lambda name: _build_voice_provider("tts", {**cfg, "tts_provider": name}),
+                kind="thinking")
+
+        # Frame-level voice check at commit (None = off).
+        self._speech_vad = _make_speech_vad(cfg)
+
+        # Idle window currently in force (ms). Reset to `idle_timeout_ms` on
+        # resume/commit; widened to `idle_after_reply_ms` /
+        # `idle_after_question_ms` when a reply finishes playing.
+        self._idle_window_ms = int(cfg.get("idle_timeout_ms", 0))
+        # Set by the worker when the reply text is complete: does it end
+        # with a question? Read by the player when the reply finishes.
+        self._reply_is_question = False
+        # Replies played since the last wake/resume — a goodbye is only
+        # spoken after an actual conversation (wake_word mode).
+        self._replies_since_resume = 0
+        # Set after a say_to_speaker announcement that asked nothing: the
+        # next auto-idle goes back to sleep without a goodbye or tone.
+        self._quiet_idle = False
+        # Pick-up time of the turn in flight, for the timing log.
+        self._turn_t0: float | None = None
+        # External utterances that arrived while a streamed reply was
+        # playing; the player plays them right after it.
+        self._player_backlog: "deque[tuple[int, object]]" = deque()
+
         # Shadow STT comparison (`stt_compare.enabled`): the remote STT stays
         # authoritative; Whistle's take on the same PCM is only logged.
         ccfg = cfg.get("stt_compare") or {}
@@ -1075,11 +1346,21 @@ class VoiceBridge:
             self._wake_armed.set()
             # Say goodbye — unless a reply is still on its way, in which
             # case the player un-idles for it and "a dopo" would be a lie.
-            if self._sleep_acks and not self._turn_in_flight():
-                clip = self._sleep_acks.pick()
-                if clip:
-                    threading.Thread(target=self._say_goodbye, args=(clip,),
-                                     name="vb-goodbye", daemon=True).start()
+            # Only after a conversation, though: a wake that got no reply
+            # (nobody spoke, or only noise) dozes off with a soft tone.
+            if self._quiet_idle:
+                # Only an announcement was spoken: no conversation to close.
+                self._quiet_idle = False
+            elif not self._turn_in_flight():
+                clip = None
+                if (self._replies_since_resume > 0
+                        or not self._wake_cfg.get("goodbye_after_turn_only", True)):
+                    clip = self._sleep_acks.pick() if self._sleep_acks else None
+                if clip is None:
+                    rate = int(self.cfg["tts_sample_rate"])
+                    clip = ("tone", "(sleep tone)", _make_sleep_tone_pcm(rate))
+                threading.Thread(target=self._say_goodbye, args=(clip,),
+                                 name="vb-goodbye", daemon=True).start()
         else:
             self.hid.set_led(muted=True)
 
@@ -1103,6 +1384,35 @@ class VoiceBridge:
         except Exception:
             log.exception("Goodbye playback failed")
 
+    def _reply_playing(self) -> bool:
+        """A reply (or other player output) is audible or queued to be."""
+        return self._is_playing() or not self.playback_q.empty() or bool(self._player_backlog)
+
+    def _drain_playback(self) -> None:
+        """Empty the player queues, releasing any blocked `play_pcm` caller."""
+        items = list(self._player_backlog)
+        self._player_backlog.clear()
+        while True:
+            try:
+                items.append(self.playback_q.get_nowait())
+            except queue.Empty:
+                break
+        for _gen, item in items:
+            if isinstance(item, _ExternalUtterance):
+                item.done.set()
+
+    def _stop_reply(self) -> None:
+        """HID press during playback: cut the reply and listen right away.
+
+        Bumping the gen first stops the worker from queueing more of the
+        reply (its tee checks the gen) and makes the player drop whatever
+        is in flight; then the queues are drained and aplay is killed."""
+        log.info("HID press during playback: stop reply, listening")
+        self._resume()
+        self._drain_playback()
+        self._drain_queue(self.utterance_q)
+        self._kill_player()
+
     def _on_hid_press(self) -> None:
         if self._processing.is_set():
             # Mic is only paused for the agent; a press here means "mute".
@@ -1114,6 +1424,9 @@ class VoiceBridge:
             self.hid.set_led(muted=True)
             return
         if self.recording.is_set():
+            if self._reply_playing():
+                self._stop_reply()
+                return
             log.info("HID press: commit-and-mute (in-flight pipeline continues)")
             # Soft mute: tell the endpointer to commit any in-progress
             # speech buffer right now (don't wait for silence_timeout_ms),
@@ -1129,42 +1442,82 @@ class VoiceBridge:
             # silenced, wake word off, only the button resumes.
             self._wake_armed.clear()
             self.hid.set_led(muted=True)
+        elif self._reply_playing():
+            # Muted earlier (press while processing) and the reply is now
+            # playing: a second press means "stop talking, I'm listening".
+            self._stop_reply()
         else:
             log.info("HID press: resume recording")
             self._resume()
 
-    def _resume(self) -> None:
-        """Idle/muted → recording. Shared by HID press and wake word."""
+    def _resume(self, prefill: "Iterable[bytes]" = ()) -> None:
+        """Idle/muted → recording. Shared by HID press and wake word.
+
+        `prefill`: mic chunks captured before the resume (the wake word's
+        trailing command) that the endpointer must see first."""
         # Bump gen so any stragglers from before (e.g. an old
         # in-progress speech buffer the endpointer might have under
         # the previous gen) are shed by downstream stages.
         self._auto_idled.clear()
         self._processing.clear()
-        self._wake_armed.clear()
-        self._bump_gen()
+        self._replies_since_resume = 0
+        self._quiet_idle = False
+        self._idle_window_ms = int(self.cfg.get(
+            "idle_after_resume_ms", self.cfg.get("idle_timeout_ms", 0)))
+        gen = self._bump_gen()
+        # Queued before `recording` is set, so they land ahead of the
+        # recorder's first live chunk.
+        for chunk in prefill:
+            self.audio_q.put((gen, chunk))
+        # `recording` before clearing `_wake_armed`: the recorder checks
+        # `recording` first, so no chunk falls between the two routes.
         self.recording.set()
+        self._wake_armed.clear()
         self.hid.set_led(muted=False)
 
-    def _on_wake(self, text: str) -> None:
-        """Wake phrase heard while idle: speak a random ack, then resume."""
+    def _on_wake(self, text: str, segment: bytes = b"", backlog: "Iterable[bytes]" = (),
+                 command: str = "") -> None:
+        """Wake phrase heard while idle: listen at once, ack in parallel.
+
+        The mic opens before the ack plays, so "Hey Binary… metti la
+        musica" said in one breath isn't cut. `backlog` (audio queued while
+        Whistle transcribed) always goes to the endpointer; `segment` (the
+        wake segment itself) too when Whistle heard words after the phrase
+        (`command`) — STT then gets the whole sentence. With a command under
+        way a soft tick replaces the spoken ack, so it doesn't talk over it."""
         if not self._wake_armed.is_set() or self.recording.is_set():
             return
-        log.info("Wake word: %r", text)
-        clip = self._wake_acks.pick() if self._wake_acks else None
-        try:
-            if self._is_playing():
-                pass  # a reply is already speaking; the resume is the ack
-            elif clip:
-                self._play_clip(clip)
-            else:
-                with self._ducked("beep"):
-                    play_beep(self.cfg["output_device"], int(self.cfg["tts_sample_rate"]))
-        except Exception:
-            # A failed ack must not cost the user the turn they asked for.
-            log.exception("Wake ack playback failed; resuming anyway")
-        self._resume()
+        log.info("Wake word: %r%s", text, f" + command {command!r}" if command else "")
+        prefill = list(self._split_chunks(segment)) if command else []
+        prefill += list(backlog)
+        speaking = self._is_playing()
+        self._resume(prefill=prefill)
+        if speaking:
+            return  # a reply is already speaking; the resume is the ack
+        rate = int(self.cfg["tts_sample_rate"])
+        if command:
+            clip = ("tone", "(wake tick)", _make_tick_pcm(rate))
+        else:
+            clip = self._wake_acks.pick() if self._wake_acks else None
+            if clip is None:
+                clip = ("tone", "(beep)", _make_beep_pcm(rate, freq=880, duration=0.08))
+        threading.Thread(target=self._play_wake_ack, args=(clip,),
+                         name="vb-wake-ack", daemon=True).start()
 
-    def play_pcm(self, pcm: bytes, *, block: bool = True) -> float:
+    def _play_wake_ack(self, clip) -> None:
+        try:
+            self._play_clip(clip)
+        except Exception:
+            # The mic is already open: a failed ack costs nothing else.
+            log.exception("Wake ack playback failed")
+
+    def _split_chunks(self, pcm: bytes) -> "Iterator[bytes]":
+        """`pcm` in recorder-sized chunks (the VAD metric depends on N)."""
+        step = int(self.cfg["chunk_size"]) * 2
+        for i in range(0, len(pcm), step):
+            yield pcm[i:i + step]
+
+    def play_pcm(self, pcm: bytes, *, block: bool = True, text: str | None = None) -> float:
         """Play externally-supplied PCM through the bridge's player so it
         behaves like a normal spoken reply.
 
@@ -1179,6 +1532,10 @@ class VoiceBridge:
         Afterwards the player's end-of-playback reset starts the idle window,
         so the usual `idle_timeout_ms` silence re-mutes — exactly the tail of
         a normal speech. Ducking is a no-op unless `deezer_connect` is enabled.
+
+        `text` (what the PCM says) decides the tail: a question gets the
+        answer window, a plain announcement goes back to sleep without a
+        goodbye — see `_after_external`.
 
         Returns the audio duration in seconds; when `block` (the default),
         waits until the player has finished this utterance (bounded so a
@@ -1204,7 +1561,8 @@ class VoiceBridge:
         # player fires `done` when playback finishes (or immediately if a HID
         # press bumps the gen and the item goes stale).
         done = threading.Event()
-        self.playback_q.put((self._current_gen(), _ExternalUtterance(pcm, done)))
+        self.playback_q.put((self._current_gen(), _ExternalUtterance(
+            pcm, done, question=_expects_answer(text or ""))))
 
         if block:
             # Generous bound: playback is realtime, plus drain + margin.
@@ -1348,10 +1706,16 @@ class VoiceBridge:
                      len(segment) / (2 * self.cfg["sample_rate"]), text,
                      time.monotonic() - t0, " (wake)" if hit else "")
             if hit:
-                self._on_wake(text)
+                # Audio queued while Whistle transcribed is the start of
+                # what the user says next: hand it to the endpointer.
+                backlog = []
+                while True:
+                    try:
+                        backlog.append(self.wake_q.get_nowait())
+                    except queue.Empty:
+                        break
+                self._on_wake(text, segment, backlog, self._wake_detector.command(text))
                 gate.reset()
-                # Audio queued while we transcribed/played the ack is stale.
-                self._drain_queue(self.wake_q)
 
     def _endpointer_loop(self) -> None:
         """RMS VAD. Two timers run off the same per-chunk silence count:
@@ -1373,8 +1737,12 @@ class VoiceBridge:
         prebuf: "deque[bytes] | None" = (
             deque(maxlen=pre_chunks) if pre_chunks > 0 else None
         )
-        idle_ms = int(self.cfg.get("idle_timeout_ms", 0))
-        idle_chunks = int(idle_ms / chunk_ms) if idle_ms > 0 else 0
+        # idle_timeout_ms = 0 disables auto-idle entirely; otherwise the
+        # window in force is `self._idle_window_ms` (widened after a reply).
+        idle_enabled = int(self.cfg.get("idle_timeout_ms", 0)) > 0
+        min_voiced_ms = int((self.cfg.get("speech_filter") or {}).get("min_voiced_ms", 0))
+        max_utt_ms = int(self.cfg.get("max_utterance_ms", 0))
+        max_utt_chunks = int(max_utt_ms / chunk_ms) if max_utt_ms > 0 else 0
 
         seen_gen = self._current_gen()
         in_speech = False
@@ -1488,6 +1856,19 @@ class VoiceBridge:
                 if speech_tick % 32 == 0:
                     log.info("Endpointer: still in_speech tick=%d rms=%.0f",
                              speech_tick, rms)
+                if max_utt_chunks and len(buf) >= max_utt_chunks:
+                    # Nobody talks to an assistant this long in one go: it's
+                    # people talking among themselves (seen: 19–34 s of
+                    # family chat sent as one turn). Drop it and go idle —
+                    # in wake mode only the wake word brings it back.
+                    log.info("Endpointer: utterance over max_utterance_ms=%d — side "
+                             "conversation, dropped; going idle", max_utt_ms)
+                    unduck_speech("utterance too long")
+                    buf = []
+                    in_speech = False
+                    silence_count = 0
+                    self._enter_idle(source=f"utterance>{max_utt_ms}ms")
+                    continue
             else:
                 if in_speech:
                     buf.append(data)
@@ -1512,6 +1893,14 @@ class VoiceBridge:
                     unduck_speech("burst dropped")
                     buf = []
                     in_speech = False
+                elif (in_speech and silence_count >= commit_chunks
+                        and self._speech_vad is not None
+                        and self._too_little_voice(buf, sr, min_voiced_ms, level_stats)):
+                    # Loud, long enough, but not a voice (keyboard, TV hum,
+                    # a door): dropped like a burst, no STT call, no pause.
+                    unduck_speech("no voice")
+                    buf = []
+                    in_speech = False
                 elif in_speech and silence_count >= commit_chunks:
                     # Keep only `keep_chunks` of the trailing silence
                     # in the committed audio: the rest of the detection
@@ -1527,6 +1916,7 @@ class VoiceBridge:
                              len(speech_buf), duration_s,
                              min(keep_chunks, silence_count), trim, level_stats())
                     unduck_speech("speech committed")
+                    self._idle_window_ms = int(self.cfg.get("idle_timeout_ms", 0))
                     if self._enqueue_utterance(gen_at_start, pcm, sr):
                         self._pause_for_processing()
                     buf = []
@@ -1539,6 +1929,8 @@ class VoiceBridge:
                     # later wins.)
                     silence_count = 0
 
+                idle_ms = self._idle_window_ms
+                idle_chunks = int(idle_ms / chunk_ms) if idle_enabled and idle_ms > 0 else 0
                 if (not in_speech
                         and idle_chunks > 0
                         and silence_count >= idle_chunks
@@ -1557,6 +1949,22 @@ class VoiceBridge:
                     self._enter_idle(source=f"silence>{idle_ms}ms")
                     silence_count = 0
                     buf = []
+
+    def _too_little_voice(self, buf: list[bytes], sr: int, min_voiced_ms: int,
+                          level_stats) -> bool:
+        """webrtcvad check at commit. Logs the voiced ms of every commit so
+        `speech_filter.min_voiced_ms` can be tuned from the journal."""
+        voiced = _voiced_ms(b"".join(buf), sr, self._speech_vad)
+        if voiced is None:
+            return False
+        if voiced < min_voiced_ms:
+            log.info("Endpointer: dropped %.2fs utterance, only %d ms voiced "
+                     "(< speech_filter.min_voiced_ms=%d) levels %s",
+                     len(buf) * len(buf[0]) / (2 * sr) if buf else 0.0,
+                     voiced, min_voiced_ms, level_stats())
+            return True
+        log.info("Endpointer: %d ms voiced", voiced)
+        return False
 
     def _enqueue_utterance(self, gen: int, pcm: bytes, sr: int) -> bool:
         """Hand a committed utterance to the worker, holding at most ONE
@@ -1651,109 +2059,173 @@ class VoiceBridge:
                 log.info("Worker: dropped %d extra utterance(s) queued behind the reply",
                          len(extra))
 
-            log.info("Worker: STT (%d bytes ≈ %.2fs)", len(pcm), len(pcm) / (sr * 2))
-            t_stt = time.monotonic()
-            text = self.stt.transcribe(pcm, sr)
-            if self._stt_compare:
-                self._stt_compare.submit(pcm, sr, text, time.monotonic() - t_stt)
-            if not text:
-                log.info("Worker: empty transcription, skipping")
-                continue
-            if _is_non_speech(text):
-                log.info("Worker: non-speech transcription %s, skipping", text)
-                continue
-            if gen != self._current_gen():
-                continue
-            log.info("User: %s", text)
-
-            backend = self.cfg.get("gateway_backend", "openclaw")
-            if backend == "zeroclaw_ws":
-                log.info("Worker: → gateway %s (backend=zeroclaw_ws agent=%s session=%s)",
-                         self.cfg["gateway_base_url"],
-                         self.cfg.get("gateway_agent", "default"),
-                         self.cfg.get("session_key", "voice-bridge"))
-                text_stream = gateway_chat_stream_zeroclaw_ws(
-                    self.cfg["gateway_base_url"],
-                    self.cfg["gateway_token"],
-                    text,
-                    self.cfg.get("gateway_agent", "default"),
-                    self.cfg.get("session_key", "voice-bridge"),
-                )
-            elif backend == "zeroclaw":
-                log.info("Worker: → gateway %s (backend=zeroclaw)",
-                         self.cfg["gateway_base_url"])
-                text_stream = gateway_chat_stream_zeroclaw(
-                    self.cfg["gateway_base_url"],
-                    self.cfg["gateway_token"],
-                    text,
-                )
-            else:
-                log.info("Worker: → gateway %s (backend=openclaw model=%s session=%s)",
-                         self.cfg["gateway_base_url"],
-                         self.cfg["voice_model"],
-                         self.cfg.get("session_key", "voice-bridge"))
-                text_stream = gateway_chat_stream(
-                    self.cfg["gateway_base_url"],
-                    self.cfg["gateway_token"],
-                    text,
-                    self.cfg["voice_model"],
-                    self.cfg.get("session_key", "voice-bridge"),
-                )
-            collected: list[str] = []
-
-            def _tee(s: Iterable[str]) -> Iterator[str]:
-                for delta in s:
-                    if gen != self._current_gen():
-                        return
-                    collected.append(delta)
-                    yield delta
-
+            t0 = time.monotonic()
+            self._turn_t0 = t0
+            timing: dict[str, float] = {}
+            # Dead-air feedback from pick-up until the first reply audio.
+            cue = _ThinkingCue(self, gen).start()
             try:
-                for chunk in self.tts.synthesize_stream(_filter_no_reply(_tee(text_stream))):
-                    if gen != self._current_gen():
-                        break
-                    if not chunk:
-                        continue
-                    self.playback_q.put((gen, chunk))
-            except Exception as exc:
-                log.error("Worker: TTS pipeline error: %s", exc)
+                self._run_turn(gen, pcm, sr, t0, timing, cue)
             finally:
-                full_reply = "".join(collected).strip()
-                if full_reply in NO_REPLY_SENTINELS and gen == self._current_gen():
-                    # Agent said "stay silent" — play a short low beep so
-                    # the user gets feedback that the turn was processed
-                    # but nothing needed saying.
-                    log.info("Binary: %s (sentinel — low beep)", full_reply)
-                    beep = _make_beep_pcm(
-                        self.cfg["tts_sample_rate"],
-                        freq=220,
-                        duration=0.18,
-                    )
-                    self.playback_q.put((gen, beep))
-                # Always emit the end-of-utterance marker (even after
-                # cancel) so the player can release the current aplay
-                # cleanly. Stale gen → player drops it harmlessly.
-                self.playback_q.put((gen, _END_OF_UTTERANCE))
+                cue.stop()
 
-            if collected and full_reply not in NO_REPLY_SENTINELS:
-                log.info("Binary: %s", "".join(collected)[:200])
+    def _run_turn(self, gen: int, pcm: bytes, sr: int, t0: float,
+                  timing: dict, cue: "_ThinkingCue") -> None:
+        """One turn: STT → gateway → TTS → playback_q. Returns early (turn
+        dropped) on empty/non-speech STT or a stale generation."""
+        log.info("Worker: STT (%d bytes ≈ %.2fs)", len(pcm), len(pcm) / (sr * 2))
+        t_stt = time.monotonic()
+        text = self.stt.transcribe(pcm, sr)
+        timing["stt"] = time.monotonic() - t0
+        if self._stt_compare:
+            self._stt_compare.submit(pcm, sr, text, time.monotonic() - t_stt)
+        if not text:
+            log.info("Worker: empty transcription, skipping")
+            return
+        if _is_non_speech(text):
+            log.info("Worker: non-speech transcription %s, skipping", text)
+            return
+        if gen != self._current_gen():
+            return
+        log.info("User: %s", text)
+
+        backend = self.cfg.get("gateway_backend", "openclaw")
+        if backend == "zeroclaw_ws":
+            log.info("Worker: → gateway %s (backend=zeroclaw_ws agent=%s session=%s)",
+                     self.cfg["gateway_base_url"],
+                     self.cfg.get("gateway_agent", "default"),
+                     self.cfg.get("session_key", "voice-bridge"))
+            text_stream = gateway_chat_stream_zeroclaw_ws(
+                self.cfg["gateway_base_url"],
+                self.cfg["gateway_token"],
+                text,
+                self.cfg.get("gateway_agent", "default"),
+                self.cfg.get("session_key", "voice-bridge"),
+                on_event=cue.on_event,
+            )
+        elif backend == "zeroclaw":
+            log.info("Worker: → gateway %s (backend=zeroclaw)",
+                     self.cfg["gateway_base_url"])
+            text_stream = gateway_chat_stream_zeroclaw(
+                self.cfg["gateway_base_url"],
+                self.cfg["gateway_token"],
+                text,
+            )
+        else:
+            log.info("Worker: → gateway %s (backend=openclaw model=%s session=%s)",
+                     self.cfg["gateway_base_url"],
+                     self.cfg["voice_model"],
+                     self.cfg.get("session_key", "voice-bridge"))
+            text_stream = gateway_chat_stream(
+                self.cfg["gateway_base_url"],
+                self.cfg["gateway_token"],
+                text,
+                self.cfg["voice_model"],
+                self.cfg.get("session_key", "voice-bridge"),
+            )
+        collected: list[str] = []
+
+        def _tee(s: Iterable[str]) -> Iterator[str]:
+            for delta in s:
+                if gen != self._current_gen():
+                    return
+                timing.setdefault("first_token", time.monotonic() - t0)
+                collected.append(delta)
+                yield delta
+            timing["gateway_done"] = time.monotonic() - t0
+
+        try:
+            for chunk in self.tts.synthesize_stream(_filter_no_reply(_tee(text_stream))):
+                if gen != self._current_gen():
+                    break
+                if not chunk:
+                    continue
+                if "first_pcm" not in timing:
+                    timing["first_pcm"] = time.monotonic() - t0
+                    cue.stop()  # before the first chunk: no cue lands behind it
+                self.playback_q.put((gen, chunk))
+        except Exception as exc:
+            log.error("Worker: TTS pipeline error: %s", exc)
+        finally:
+            cue.stop()
+            full_reply = "".join(collected).strip()
+            self._reply_is_question = _expects_answer(full_reply)
+            if _is_no_reply(full_reply) and gen == self._current_gen():
+                # Agent said "stay silent" — play a short low beep so
+                # the user gets feedback that the turn was processed
+                # but nothing needed saying.
+                log.info("Binary: %s (sentinel — low beep)", full_reply)
+                beep = _make_beep_pcm(
+                    self.cfg["tts_sample_rate"],
+                    freq=220,
+                    duration=0.18,
+                )
+                self.playback_q.put((gen, beep))
+            # Always emit the end-of-utterance marker (even after
+            # cancel) so the player can release the current aplay
+            # cleanly. Stale gen → player drops it harmlessly.
+            self.playback_q.put((gen, _END_OF_UTTERANCE))
+
+        if collected and not _is_no_reply(full_reply):
+            log.info("Binary: %s", "".join(collected)[:200])
+        log.info("Turn timing (s from pick-up): %s, cues=%d",
+                 " ".join(f"{k}={v:.2f}" for k, v in timing.items()) or "n/a",
+                 cue.cues_played)
+
+    def _next_playback(self, timeout: float):
+        """Next player item: deferred external utterances first, then the queue."""
+        if self._player_backlog:
+            return self._player_backlog.popleft()
+        return self.playback_q.get(timeout=timeout)
+
+    def _after_reply(self, *, cue: bool = False) -> None:
+        """A reply (or say_to_speaker speech) finished playing: widen the
+        idle window so the user has time to answer — more if it asked."""
+        if cue:
+            return
+        self._replies_since_resume += 1
+        self._quiet_idle = False
+        self._idle_window_ms = int(
+            self.cfg.get("idle_after_question_ms" if self._reply_is_question
+                         else "idle_after_reply_ms",
+                         self.cfg.get("idle_timeout_ms", 0)))
+        self._reply_is_question = False
+
+    def _after_external(self, question: bool) -> None:
+        """say_to_speaker finished. A question opens a conversation: the
+        answer window, and a goodbye later if nobody answers. A plain
+        announcement keeps the normal window and, unless a conversation was
+        already going, dozes off silently — no "Ciao ciao!" after "La lavatrice
+        ha finito"."""
+        if question:
+            self._replies_since_resume += 1
+            self._quiet_idle = False
+            self._idle_window_ms = int(self.cfg.get(
+                "idle_after_question_ms", self.cfg.get("idle_timeout_ms", 0)))
+            return
+        self._idle_window_ms = int(self.cfg.get("idle_timeout_ms", 0))
+        if not self._replies_since_resume:
+            self._quiet_idle = True
 
     def _player_loop(self) -> None:
         device = self.cfg["output_device"]
         sample_rate = self.cfg["tts_sample_rate"]
         while not self.shutdown_event.is_set():
             try:
-                gen, item = self.playback_q.get(timeout=0.2)
+                gen, item = self._next_playback(timeout=0.2)
             except queue.Empty:
                 continue
-            # Externally-supplied speech (MCP say_to_speaker) arrives as one
-            # atomic item; play it as its own utterance via the same path,
-            # then release the blocked caller. play_pcm() already did the
-            # unmute transition before enqueuing.
+            # Externally-supplied speech (MCP say_to_speaker) and thinking
+            # cues arrive as one atomic item; play it as its own utterance
+            # via the same path, then release the blocked caller.
+            # play_pcm() already did the unmute transition before enqueuing.
             if isinstance(item, _ExternalUtterance):
                 if gen == self._current_gen():
-                    with self._ducked("say_to_speaker"):
+                    ctx = self._ducked(item.label) if item.duck else contextlib.nullcontext()
+                    with ctx:
                         self._play_blob(item.pcm, device, sample_rate)
+                    if gen == self._current_gen() and not item.cue:  # not cut by a barge-in
+                        self._after_external(item.question)
                 item.done.set()
                 continue
 
@@ -1781,17 +2253,68 @@ class VoiceBridge:
                 self._idle_reset_pending.set()
 
             with self._ducked("reply"):
-                self._play_streamed(item, device, sample_rate)
+                if self._play_streamed(item, device, sample_rate, gen):
+                    self._after_reply()
 
-    def _play_streamed(self, item: bytes, device: str, sample_rate: int) -> None:
+    def _prebuffer(self, first: bytes, gen: int, sample_rate: int) -> "tuple[list[bytes], bool, bool]":
+        """Collect `playback_prebuffer_ms` of PCM before the first aplay
+        write. ElevenLabs v3 often sends one chunk and then stalls ~0.5 s;
+        writing that chunk alone makes aplay start and underrun (click).
+        Waits at most prebuffer + 1 s, so a slow stream still starts.
+
+        Returns (chunks, ended, stale): `ended` when the end-of-utterance
+        marker was reached, `stale` when the gen changed meanwhile."""
+        ms = int(self.cfg.get("playback_prebuffer_ms", 0))
+        chunks = [first]
+        if ms <= 0:
+            return chunks, False, False
+        want = sample_rate * 2 * ms // 1000
+        have = len(first)
+        deadline = time.monotonic() + ms / 1000.0 + 1.0
+        while have < want and not self.shutdown_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                gen2, item2 = self.playback_q.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                continue
+            if gen2 != self._current_gen() or gen2 != gen:
+                if isinstance(item2, _ExternalUtterance):
+                    item2.done.set()
+                return chunks, False, True
+            if isinstance(item2, _EndOfUtterance):
+                return chunks, True, False
+            if isinstance(item2, _ExternalUtterance):
+                self._player_backlog.append((gen2, item2))
+                continue
+            chunks.append(item2)
+            have += len(item2)
+        return chunks, False, False
+
+    def _play_streamed(self, item: bytes, device: str, sample_rate: int,
+                       gen: int | None = None) -> bool:
         """Play one reply: `item` is its first PCM chunk, the rest is pulled
-        off `playback_q` until the end-of-utterance marker."""
+        off `playback_q` until the end-of-utterance marker. Returns True when
+        the reply played to its end (not cut by a stale gen / barge-in)."""
+        if gen is None:
+            gen = self._current_gen()
+        chunks, ended, stale = self._prebuffer(item, gen, sample_rate)
+        if stale:
+            return False
         proc = _aplay_popen(device, sample_rate, bufsize=0)
         with self._player_lock:
             self._player_proc = proc
+        if self._turn_t0 is not None:
+            log.info("Turn: first audio %.2fs after pick-up", time.monotonic() - self._turn_t0)
+            self._turn_t0 = None
+        completed = False
         try:
-            if not self._write_chunk(proc, item):
-                return
+            if not self._write_chunk(proc, b"".join(chunks)):
+                return False
+            if ended:
+                completed = True
+                return True
             while not self.shutdown_event.is_set():
                 try:
                     gen2, item2 = self.playback_q.get(timeout=0.2)
@@ -1801,9 +2324,17 @@ class VoiceBridge:
                     # Hard-cancel happened mid-utterance; the proc
                     # has likely already been killed, but break
                     # explicitly so we close it cleanly.
+                    if isinstance(item2, _ExternalUtterance):
+                        item2.done.set()
                     break
                 if isinstance(item2, _EndOfUtterance):
+                    completed = True
                     break
+                if isinstance(item2, _ExternalUtterance):
+                    # say_to_speaker while a reply streams: play it next,
+                    # never write the object into aplay.
+                    self._player_backlog.append((gen2, item2))
+                    continue
                 if not self._write_chunk(proc, item2):
                     break
         finally:
@@ -1828,6 +2359,7 @@ class VoiceBridge:
             self._idle_reset_pending.set()
             with self._player_lock:
                 self._player_proc = None
+        return completed and gen == self._current_gen()
 
     def _play_blob(self, pcm: bytes, device: str, sample_rate: int) -> None:
         """Play one complete PCM blob as a single utterance (external speech).
@@ -1878,6 +2410,8 @@ class VoiceBridge:
             loops += [("wake", self._wake_loop),
                       ("wake-acks", lambda: self._wake_acks.prepare(self.shutdown_event)),
                       ("sleep-acks", lambda: self._sleep_acks.prepare(self.shutdown_event))]
+        if self._thinking_acks:
+            loops.append(("thinking-acks", lambda: self._thinking_acks.prepare(self.shutdown_event)))
         if self._stt_compare:
             self._stt_compare.start()
         for name, fn in loops:

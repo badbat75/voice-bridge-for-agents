@@ -123,6 +123,16 @@ class ValidateLanguageTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 wake_word.validate_language("wake_word.language", lang)
 
+    def test_command_after_the_phrase(self):
+        ca = wake_word.command_after
+        self.assertEqual(ca("Hey Binary, metti la musica.", ["hey binary"]), "metti la musica")
+        self.assertEqual(ca("Hey Binary.", ["hey binary"]), "")
+        self.assertEqual(ca("hey bye harry stop", ["hey binary"], ["hey bye harry"]), "stop")
+        self.assertEqual(ca("Hey, binally. What do you cosa parla", ["hey binary"], fuzzy=0.8),
+                         "what do you cosa parla")
+        self.assertEqual(ca("hey binally", ["hey binary"], fuzzy=0.8), "")
+        self.assertEqual(ca("hey bud ciao", ["hey binary"], fuzzy=0.8), "")
+
     def test_matches_whistle_package(self):
         try:
             from needle.agent.whistle import LANGUAGES
@@ -269,6 +279,13 @@ class SpokenTagsTest(unittest.TestCase):
         self.assertEqual(bank._spoken("deepgram", "Ok, [soft] a dopo."), "Ok, a dopo.")
 
 
+def _drain(q):
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
 class WakeTransitionsTest(unittest.TestCase):
     def test_wake_mode_boots_armed_and_idle(self):
         bridge, _, _ = _bridge("wake_word")
@@ -291,24 +308,57 @@ class WakeTransitionsTest(unittest.TestCase):
         self.assertFalse(bridge.recording.is_set())
         self.assertEqual(hid.leds[-1], True)
 
-    def test_wake_hit_plays_ack_then_resumes(self):
+    def _join_ack(self):
+        for t in [t for t in __import__("threading").enumerate() if t.name == "vb-wake-ack"]:
+            t.join(2)
+
+    def test_wake_hit_listens_first_and_acks_in_parallel(self):
         bridge, hid, vb = _bridge("wake_word")
         bridge._wake_acks._clips.append(("elevenlabs", "Dimmi.", b"\0\0" * 10))
         gen = bridge._current_gen()
-        with mock.patch.object(vb, "play_audio") as play:
+        recording_during_ack = []
+        with mock.patch.object(vb, "play_audio",
+                               side_effect=lambda *a: recording_during_ack.append(
+                                   bridge.recording.is_set())) as play:
             bridge._on_wake("Hey, binary.")
+            self._join_ack()
         play.assert_called_once_with("null", b"\0\0" * 10, 24000)
-        self.assertTrue(bridge.recording.is_set())
+        self.assertEqual(recording_during_ack, [True], "mic must be open while the ack plays")
         self.assertFalse(bridge._wake_armed.is_set())
         self.assertEqual(bridge._current_gen(), gen + 1)
         self.assertEqual(hid.leds[-1], False)
 
     def test_wake_without_acks_beeps(self):
         bridge, _, vb = _bridge("wake_word")
-        with mock.patch.object(vb, "play_beep") as beep, mock.patch.object(vb, "play_audio") as play:
+        with mock.patch.object(vb, "play_audio") as play:
             bridge._on_wake("hey binary")
-        beep.assert_called_once()
-        play.assert_not_called()
+            self._join_ack()
+        play.assert_called_once()
+        self.assertEqual(play.call_args.args[1], vb._make_beep_pcm(24000, freq=880, duration=0.08))
+
+    def test_backlog_reaches_endpointer_in_chunks(self):
+        bridge, _, vb = _bridge("wake_word")
+        backlog = [b"\1\1" * 1024, b"\2\2" * 1024]
+        with mock.patch.object(vb, "play_audio"):
+            bridge._on_wake("hey binary", b"\9\9" * 3000, backlog, "")
+            self._join_ack()
+        gen = bridge._current_gen()
+        # No command: the wake segment itself is not sent, the backlog is.
+        self.assertEqual(_drain(bridge.audio_q), [(gen, c) for c in backlog])
+
+    def test_command_in_same_breath_sends_segment_and_ticks(self):
+        bridge, _, vb = _bridge("wake_word")
+        bridge._wake_acks._clips.append(("elevenlabs", "Dimmi.", b"\0\0" * 10))
+        segment = b"\3\3" * 2500  # 2500 samples → chunks of 1024, 1024, 452
+        with mock.patch.object(vb, "play_audio") as play:
+            bridge._on_wake("hey binary metti la musica", segment, [b"\4\4" * 1024],
+                            "metti la musica")
+            self._join_ack()
+        chunks = [c for _g, c in _drain(bridge.audio_q)]
+        self.assertEqual([len(c) for c in chunks], [2048, 2048, 904, 2048])
+        self.assertEqual(b"".join(chunks[:3]), segment)
+        # A tick, not "Dimmi." spoken over the user.
+        self.assertEqual(play.call_args.args[1], vb._make_tick_pcm(24000))
 
     def test_wake_ignored_when_disarmed(self):
         bridge, _, vb = _bridge("wake_word")
@@ -322,6 +372,7 @@ class WakeTransitionsTest(unittest.TestCase):
         bridge, hid, vb = _bridge("wake_word")
         bridge._sleep_acks._clips.append(("deepgram", "A dopo.", b"\1\1"))
         bridge._resume()
+        bridge._replies_since_resume = 1  # a conversation happened
         return bridge, hid, vb
 
     def test_auto_idle_goodbye_is_ducked(self):
@@ -335,6 +386,37 @@ class WakeTransitionsTest(unittest.TestCase):
                 t.join(2)
         self.assertEqual(order, ["duck", "goodbye", "unduck"])
 
+    def _goodbye_played(self, bridge, vb):
+        with mock.patch.object(vb, "play_audio") as play:
+            bridge._enter_idle("test")
+            for t in [t for t in __import__("threading").enumerate() if t.name == "vb-goodbye"]:
+                t.join(2)
+        return play
+
+    def test_goodbye_spoken_after_a_reply(self):
+        bridge, _, vb = self._with_goodbye()
+        play = self._goodbye_played(bridge, vb)
+        play.assert_called_once_with("null", b"\1\1", 24000)
+
+    def test_unanswered_wake_dozes_off_with_a_tone(self):
+        bridge, _, vb = self._with_goodbye()
+        bridge._replies_since_resume = 0
+        play = self._goodbye_played(bridge, vb)
+        play.assert_called_once()
+        self.assertEqual(play.call_args.args[1], vb._make_sleep_tone_pcm(24000))
+
+    def test_goodbye_always_spoken_when_turn_only_is_off(self):
+        bridge, _, vb = self._with_goodbye()
+        bridge._replies_since_resume = 0
+        bridge._wake_cfg["goodbye_after_turn_only"] = False
+        play = self._goodbye_played(bridge, vb)
+        self.assertEqual(play.call_args.args[1], b"\1\1")
+
+    def test_resume_resets_reply_count(self):
+        bridge, _, _ = self._with_goodbye()
+        bridge._resume()
+        self.assertEqual(bridge._replies_since_resume, 0)
+
     def test_no_goodbye_while_reply_in_flight(self):
         bridge, _, vb = self._with_goodbye()
         bridge._worker_busy.set()
@@ -343,6 +425,29 @@ class WakeTransitionsTest(unittest.TestCase):
         play.assert_not_called()
         bridge.deezer.duck.assert_not_called()
         bridge.deezer.unduck.assert_not_called()
+
+    def test_announcement_dozes_off_silently(self):
+        bridge, _, vb = self._with_goodbye()
+        bridge._replies_since_resume = 0
+        bridge._after_external(question=False)
+        play = self._goodbye_played(bridge, vb)
+        play.assert_not_called()
+        self.assertTrue(bridge._wake_armed.is_set())
+
+    def test_announcement_mid_conversation_keeps_the_goodbye(self):
+        bridge, _, vb = self._with_goodbye()  # one reply already played
+        bridge._after_external(question=False)
+        play = self._goodbye_played(bridge, vb)
+        self.assertEqual(play.call_args.args[1], b"\1\1")
+
+    def test_announcement_with_question_waits_for_an_answer(self):
+        bridge, _, vb = self._with_goodbye()
+        bridge._replies_since_resume = 0
+        bridge.cfg["idle_after_question_ms"] = 12000
+        bridge._after_external(question=True)
+        self.assertEqual(bridge._idle_window_ms, 12000)
+        play = self._goodbye_played(bridge, vb)
+        self.assertEqual(play.call_args.args[1], b"\1\1")
 
     def test_button_mode_unchanged(self):
         bridge, hid, _ = _bridge("button")
