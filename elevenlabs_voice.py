@@ -56,6 +56,7 @@ class ElevenLabsVoice:
         tts_voice_settings: dict | None = None,
         tts_text_normalization: str | None = None,
         tts_stream_mode: str = "http_sentence",
+        tts_whole_reply: bool = False,
         stt_model: str = "scribe_v1",
         stt_language: str = "ita",
     ) -> None:
@@ -74,6 +75,12 @@ class ElevenLabsVoice:
         self._tts_voice_settings = tts_voice_settings
         self._tts_text_normalization = tts_text_normalization
         self._tts_stream_mode = tts_stream_mode
+        # When True, the http path buffers the WHOLE reply and makes one
+        # TTS call instead of one per sentence. Costs first-audio latency
+        # (full gateway stream + full TTS round-trip) but keeps tone and
+        # prosody consistent across the reply — on models like eleven_v3
+        # that reject request stitching, this is the only way to get it.
+        self._tts_whole_reply = bool(tts_whole_reply)
         self._stt_model = stt_model
         self._stt_language = stt_language
 
@@ -148,19 +155,42 @@ class ElevenLabsVoice:
           straight in for token-level latency. Requires an ElevenLabs
           paid tier — free accounts get HTTP 403 on the upgrade.
 
+        `tts_whole_reply=True` overrides the http path: deltas are
+        buffered until the upstream iterator ends and synthesized in one
+        `text_to_speech.stream` call, so the model sees the full reply and
+        keeps a consistent tone. The websocket path ignores the flag — it
+        already keeps one generation context per reply.
+
         Both paths emit the same `pcm_<rate>` output the rest of the
         bridge expects, and both swallow SDK / transport errors (logged,
         then stop yielding) so the main loop keeps running.
         """
         if self._tts_stream_mode == "websocket":
             yield from self._synthesize_stream_websocket(text_iter)
+        elif self._tts_whole_reply:
+            yield from self._synthesize_stream_http_whole(text_iter)
         else:
             yield from self._synthesize_stream_http_sentence(text_iter)
+
+    def _synthesize_stream_http_whole(self, text_iter: Iterable[str]) -> Iterator[bytes]:
+        """Whole-reply HTTP path: drain the text iterator, then one
+        `_stream_sentence` call with the full text. Audio chunks are still
+        forwarded as they arrive from the HTTP stream, so playback starts
+        as soon as ElevenLabs emits its first bytes — the latency cost is
+        waiting for the gateway to finish, not for TTS to finish."""
+        text = "".join(d for d in text_iter if d).strip()
+        if not text:
+            return
+        try:
+            client = elevenlabs.ElevenLabs(api_key=self._api_key)
+            yield from self._stream_sentence(client, text)
+        except Exception as exc:
+            log.error("TTS streaming error: %s", exc)
 
     def _synthesize_stream_websocket(self, text_iter: Iterable[str]) -> Iterator[bytes]:
         """Realtime websocket path. See `synthesize_stream` for context.
 
-        Caveats inherited from `convert_realtime` (SDK 2.45.0):
+        Caveats inherited from `convert_realtime` (SDK 2.67.0):
         - `language_code` and `apply_text_normalization` are NOT forwarded
           (the websocket endpoint doesn't accept them). For Italian via
           `eleven_multilingual_v2` this is fine — the model auto-detects.

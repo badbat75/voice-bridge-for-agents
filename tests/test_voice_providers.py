@@ -32,6 +32,41 @@ class InterfaceContractTest(unittest.TestCase):
             self.assertTrue(callable(getattr(cls, "synthesize")))
 
 
+class ElevenLabsWholeReplyTest(unittest.TestCase):
+    """`tts_whole_reply` must collapse the per-sentence HTTP splitting into
+    a single TTS call carrying the full reply; off by default."""
+
+    def _run(self, whole: bool) -> list[str]:
+        el = ElevenLabsVoice(api_key="dummy", voice_id="v", tts_whole_reply=whole)
+        calls: list[str] = []
+
+        def fake_stream_sentence(client, sentence, *a, **k):
+            calls.append(sentence)
+            yield b"\x00\x00"
+
+        el._stream_sentence = fake_stream_sentence  # type: ignore[method-assign]
+        deltas = ["Prima frase. ", "Seconda ", "frase! ", "Coda senza punto"]
+        audio = b"".join(el.synthesize_stream(iter(deltas)))
+        self.assertTrue(audio)
+        return calls
+
+    def test_default_splits_per_sentence(self) -> None:
+        self.assertEqual(
+            self._run(False),
+            ["Prima frase.", "Seconda frase!", "Coda senza punto"],
+        )
+
+    def test_whole_reply_makes_one_call_with_full_text(self) -> None:
+        self.assertEqual(
+            self._run(True),
+            ["Prima frase. Seconda frase! Coda senza punto"],
+        )
+
+    def test_whole_reply_empty_text_yields_nothing(self) -> None:
+        el = ElevenLabsVoice(api_key="dummy", voice_id="v", tts_whole_reply=True)
+        self.assertEqual(list(el.synthesize_stream(iter(["", "  "]))), [])
+
+
 class DeepgramVoiceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.dg = DeepgramVoice(api_key="dummy", stt_language="it")

@@ -267,6 +267,12 @@ def load_config() -> dict:
             f"voice-bridge.json: unknown tts_streaming_mode "
             f"{cfg['tts_streaming_mode']!r}; valid: {VALID_TTS_STREAM_MODES}"
         )
+    # `tts_whole_reply: true` disables per-sentence splitting on the HTTP
+    # path: the whole gateway reply is buffered and sent to TTS in ONE
+    # call, so tone/prosody stay consistent (eleven_v3 rejects request
+    # stitching, so this is the only consistency lever there). Trades
+    # first-audio latency for it. Default false = split per sentence.
+    cfg["tts_whole_reply"] = bool(cfg.get("tts_whole_reply", False))
 
     return cfg
 
@@ -291,6 +297,7 @@ def _build_voice_provider(role: str, cfg: dict):
             tts_voice_settings=cfg.get("elevenlabs_voice_settings"),
             tts_text_normalization=cfg.get("elevenlabs_text_normalization"),
             tts_stream_mode=cfg.get("tts_streaming_mode", "http_sentence"),
+            tts_whole_reply=cfg.get("tts_whole_reply", False),
         )
     if name == "deepgram":
         kwargs = {
@@ -1635,9 +1642,9 @@ def main() -> None:
 
     log.info("Config loaded")
     log.info("STT provider: %s", cfg["stt_provider"])
-    log.info("TTS provider: %s (voice=%s model=%s rate=%dHz stream=%s)",
+    log.info("TTS provider: %s (voice=%s model=%s rate=%dHz stream=%s whole_reply=%s)",
              cfg["tts_provider"], cfg["elevenlabs_voice"], cfg["elevenlabs_model"],
-             cfg["tts_sample_rate"], cfg["tts_streaming_mode"])
+             cfg["tts_sample_rate"], cfg["tts_streaming_mode"], cfg["tts_whole_reply"])
     log.info("Output: %s @ %d Hz", cfg["output_device"], cfg["tts_sample_rate"])
     _apply_output_volume(cfg)
     log.info("VAD: rms_threshold=%g pause_commit=%dms idle=%dms",

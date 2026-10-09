@@ -1,7 +1,7 @@
 {
   "gateway_base_url": "http://127.0.0.1:42617",
   "gateway_backend": "zeroclaw_ws",
-  "gateway_agent": "default",
+  "gateway_agent": "voice",
   "sample_rate": 16000,
   "tts_sample_rate": 24000,
   "chunk_size": 1024,
@@ -18,6 +18,7 @@
   "stt_provider": "elevenlabs",
   "tts_provider": "elevenlabs",
   "tts_streaming_mode": "http_sentence",
+  "tts_whole_reply": true,
   "session_key": "agent:main:voice-bridge",
   "voice_model": "openclaw",
   "elevenlabs": {
