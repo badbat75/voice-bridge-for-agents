@@ -2,8 +2,9 @@
 """
 Binary Voice Bridge v3 — always-on mic, async pipeline.
 
-Trigger: voice activity (no wake word, no PTT).
-         Jabra HID button = hard-cancel toggle (stops/resumes everything).
+Trigger: `activation` = "button" (Jabra HID press unmutes) or "wake_word"
+         (RMS-gated Whistle keyword spotting while idle; see wake_word.py).
+         Either way the HID button mutes, and voice activity drives turns.
 STT:     Deepgram or ElevenLabs Scribe (configurable).
 TTS:     Deepgram Aura or ElevenLabs (configurable, streaming).
 Output:  ALSA aplay.
@@ -46,6 +47,8 @@ from deepgram_voice import DeepgramVoice
 from deezer_connect_plugin import DeezerConnectPlugin
 from elevenlabs_voice import ElevenLabsVoice
 from jabra_hid import HidMuteMonitor
+import wake_word
+from stt_compare import SttComparer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -69,6 +72,7 @@ SECRETS_PATH = os.path.join(_HERE, "voice-bridge.secrets.json")
 VALID_PROVIDERS = ("elevenlabs", "deepgram")
 VALID_TTS_STREAM_MODES = ("http_sentence", "websocket")
 VALID_GATEWAY_BACKENDS = ("openclaw", "zeroclaw", "zeroclaw_ws")
+VALID_ACTIVATIONS = ("button", "wake_word")
 
 
 def _camel_to_snake_keys(d: dict | None) -> dict | None:
@@ -206,6 +210,24 @@ def load_config() -> dict:
                 f"voice-bridge.json: unknown {role}_provider "
                 f"{cfg[f'{role}_provider']!r}; valid: {VALID_PROVIDERS}"
             )
+
+    # How an idle bridge comes back: "button" (HID press) or "wake_word"
+    # (mic stays open while idle; the `wake_word` block configures it).
+    cfg["activation"] = str(cfg.get("activation", "button")).strip().lower()
+    if cfg["activation"] not in VALID_ACTIVATIONS:
+        raise ValueError(
+            f"voice-bridge.json: unknown activation {cfg['activation']!r}; "
+            f"valid: {VALID_ACTIVATIONS}"
+        )
+
+    # Whistle settings fail at load, not on the first wake/utterance.
+    if cfg["activation"] == "wake_word":
+        wcfg = wake_word.wake_config(cfg)
+        if not wcfg["phrases"]:
+            raise ValueError("voice-bridge.json: wake_word.phrases is empty")
+        wake_word.validate_language("wake_word.language", wcfg["language"])
+    if (cfg.get("stt_compare") or {}).get("enabled"):
+        wake_word.validate_language("stt_compare.language", cfg["stt_compare"].get("language", "it"))
 
     # Output sample rate must be agreed upon by TTS request, the
     # synth library, and the aplay invocation. One number, one place.
@@ -460,7 +482,11 @@ def play_audio(device: str, audio_data: bytes, sample_rate: int) -> None:
     for `pcm_<rate>` / `linear16` at the same number) — otherwise aplay
     plays back at the wrong speed/pitch."""
     proc = _aplay_popen(device, sample_rate)
-    proc.communicate(input=audio_data)
+    # Not `communicate()`: with VOICE_BRIDGE_DEBUG_AUDIO=1 a drain thread
+    # already owns aplay's stderr, and two readers race to EBADF.
+    with contextlib.suppress(BrokenPipeError):
+        proc.stdin.write(audio_data)
+    _drain_aplay(proc, sample_rate)
 
 
 def play_audio_stream(device: str, audio_iter: Iterable[bytes], sample_rate: int) -> bool:
@@ -907,6 +933,44 @@ class VoiceBridge:
         self._player_proc: subprocess.Popen | None = None
         self._player_lock = threading.Lock()
 
+        # Wake-word activation. `_wake_armed` set = idle but listening for
+        # the wake phrase: the firmware mic stays unmuted and the recorder
+        # routes chunks to `wake_q` instead of `audio_q`. Cleared by an HID
+        # mute (privacy: firmware-muted, only the button resumes) and while
+        # recording. Always clear in "button" mode.
+        self.wake_mode = cfg.get("activation") == "wake_word"
+        self.wake_q: "queue.Queue[bytes]" = queue.Queue()
+        self._wake_armed = threading.Event()
+        # Set while a wake/sleep clip plays so the wake loop ignores our own
+        # voice coming back through the mic.
+        self._speaking_ack = threading.Event()
+        # Set by the worker from picking an utterance up until it loops back
+        # for the next one — i.e. a turn is in flight. A goodbye on auto-idle
+        # is skipped while a reply is still on its way.
+        self._worker_busy = threading.Event()
+        self._wake_cfg = self._wake_detector = self._wake_acks = self._sleep_acks = None
+        if self.wake_mode:
+            self._wake_cfg = wake_word.wake_config(cfg)
+            self._wake_detector = wake_word.WakeDetector(self._wake_cfg)
+
+            def build_tts(name):
+                return _build_voice_provider("tts", {**cfg, "tts_provider": name})
+
+            w = self._wake_cfg
+            self._wake_acks = wake_word.AckBank(
+                cfg, w["acks"], w["ack_providers"], w["ack_cache_dir"], build_tts, kind="wake")
+            self._sleep_acks = wake_word.AckBank(
+                cfg, w["sleep_acks"], w["ack_providers"], w["ack_cache_dir"], build_tts, kind="sleep")
+            if not self.recording.is_set():
+                self._wake_armed.set()
+
+        # Shadow STT comparison (`stt_compare.enabled`): the remote STT stays
+        # authoritative; Whistle's take on the same PCM is only logged.
+        ccfg = cfg.get("stt_compare") or {}
+        self._stt_compare = (
+            SttComparer(ccfg, _HERE, cfg.get("stt_provider", "?")) if ccfg.get("enabled") else None
+        )
+
         self._threads: list[threading.Thread] = []
 
     # -- generation helpers --------------------------------------------
@@ -969,10 +1033,46 @@ class VoiceBridge:
         # Mark this idle as auto so the player un-idles itself when the
         # in-flight reply starts playing — see `_player_loop`.
         self._auto_idled.set()
-        self.hid.set_led(muted=True)
+        if self.wake_mode:
+            # Idle-but-listening: the firmware mic must stay open or the
+            # wake loop would hear only zeros, so the LED stays off too.
+            self._wake_armed.set()
+            # Say goodbye — unless a reply is still on its way, in which
+            # case the player un-idles for it and "a dopo" would be a lie.
+            if self._sleep_acks and not self._turn_in_flight():
+                clip = self._sleep_acks.pick()
+                if clip:
+                    # Unducks after the clip so it isn't buried under music.
+                    threading.Thread(target=self._say_goodbye, args=(clip,),
+                                     name="vb-goodbye", daemon=True).start()
+                    return
+        else:
+            self.hid.set_led(muted=True)
         # Mute → stop ducking deezer-connect (ducking tracks mute state,
         # not playback; no-op if disabled / not currently ducked).
         self.deezer.unduck()
+
+    def _turn_in_flight(self) -> bool:
+        return (self._worker_busy.is_set() or not self.utterance_q.empty()
+                or not self.playback_q.empty() or self._is_playing())
+
+    def _play_clip(self, clip) -> None:
+        provider, text, pcm = clip
+        log.info("Ack (%s): %r", provider, text)
+        self._speaking_ack.set()
+        try:
+            play_audio(self.cfg["output_device"], pcm, int(self.cfg["tts_sample_rate"]))
+        finally:
+            self._speaking_ack.clear()
+
+    def _say_goodbye(self, clip) -> None:
+        try:
+            self._play_clip(clip)
+        except Exception:
+            log.exception("Goodbye playback failed")
+        # A wake word during the goodbye resumed (and re-ducked) — leave it.
+        if not self.recording.is_set():
+            self.deezer.unduck()
 
     def _on_hid_press(self) -> None:
         if self.recording.is_set():
@@ -987,21 +1087,49 @@ class VoiceBridge:
             # discard the very thing the user pressed mute to send.
             self._force_commit.set()
             self.recording.clear()
+            # An explicit mute is a privacy mute in wake mode too: firmware
+            # silenced, wake word off, only the button resumes.
+            self._wake_armed.clear()
             self.hid.set_led(muted=True)
             # Mute → unduck, even if a reply is still playing (ducking
             # tracks mute state now, not the aplay lifecycle).
             self.deezer.unduck()
         else:
             log.info("HID press: resume recording")
-            # Bump gen so any stragglers from before (e.g. an old
-            # in-progress speech buffer the endpointer might have under
-            # the previous gen) are shed by downstream stages.
-            self._auto_idled.clear()
-            self._bump_gen()
-            self.recording.set()
-            self.hid.set_led(muted=False)
-            # Unmute → duck deezer-connect for the whole listening window.
-            self.deezer.duck()
+            self._resume()
+
+    def _resume(self) -> None:
+        """Idle/muted → recording. Shared by HID press and wake word."""
+        # Bump gen so any stragglers from before (e.g. an old
+        # in-progress speech buffer the endpointer might have under
+        # the previous gen) are shed by downstream stages.
+        self._auto_idled.clear()
+        self._wake_armed.clear()
+        self._bump_gen()
+        self.recording.set()
+        self.hid.set_led(muted=False)
+        # Unmute → duck deezer-connect for the whole listening window.
+        self.deezer.duck()
+
+    def _on_wake(self, text: str) -> None:
+        """Wake phrase heard while idle: speak a random ack, then resume."""
+        if not self._wake_armed.is_set() or self.recording.is_set():
+            return
+        log.info("Wake word: %r", text)
+        # Duck first so the ack isn't buried under music.
+        self.deezer.duck()
+        clip = self._wake_acks.pick() if self._wake_acks else None
+        try:
+            if self._is_playing():
+                pass  # a reply is already speaking; the resume is the ack
+            elif clip:
+                self._play_clip(clip)
+            else:
+                play_beep(self.cfg["output_device"], int(self.cfg["tts_sample_rate"]))
+        except Exception:
+            # A failed ack must not cost the user the turn they asked for.
+            log.exception("Wake ack playback failed; resuming anyway")
+        self._resume()
 
     def play_pcm(self, pcm: bytes, *, block: bool = True) -> float:
         """Play externally-supplied PCM through the bridge's player so it
@@ -1033,6 +1161,7 @@ class VoiceBridge:
         # and the player's auto-resume; idempotent if already unmuted/ducked.
         if not self.recording.is_set():
             log.info("play_pcm: unmuting for external speech (mic open, LED off)")
+            self._wake_armed.clear()
             self.recording.set()
             self.hid.set_led(muted=False)
         self._auto_idled.clear()
@@ -1088,7 +1217,8 @@ class VoiceBridge:
 
         try:
             while not self.shutdown_event.is_set():
-                if not self.recording.is_set():
+                listening = self.recording.is_set() or self._wake_armed.is_set()
+                if not listening:
                     if stream is not None:
                         try:
                             stream.close()
@@ -1140,7 +1270,10 @@ class VoiceBridge:
                         pass
                     stream = None
                     continue
-                self.audio_q.put((self._current_gen(), data))
+                if self.recording.is_set():
+                    self.audio_q.put((self._current_gen(), data))
+                elif self._wake_armed.is_set():
+                    self.wake_q.put(data)
         finally:
             if stream is not None:
                 try:
@@ -1148,6 +1281,45 @@ class VoiceBridge:
                 except Exception:
                     pass
             _safe_terminate(pa)
+
+    def _wake_loop(self) -> None:
+        """Idle wake-word spotting: gate chunks on energy, Whistle the rest."""
+        try:
+            self._wake_detector.load()
+        except Exception:
+            log.exception("Wake word: Whistle failed to load — only the HID button can resume")
+            return
+        log.info("Wake word: listening for %s (lang=%s, rms>%g)",
+                 self._wake_cfg["phrases"], self._wake_cfg["language"],
+                 self._wake_cfg["rms_threshold"])
+        gate = wake_word.SpeechGate(self.cfg["sample_rate"], self.cfg["chunk_size"], self._wake_cfg)
+        while not self.shutdown_event.is_set():
+            try:
+                chunk = self.wake_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if not self._wake_armed.is_set() or self._speaking_ack.is_set():
+                gate.reset()
+                self._drain_queue(self.wake_q)
+                continue
+            segment = gate.feed(chunk)
+            if segment is None:
+                continue
+            t0 = time.monotonic()
+            try:
+                text = self._wake_detector.transcribe(segment)
+            except Exception as exc:
+                log.warning("Wake word: transcribe failed: %s", exc)
+                continue
+            hit = self._wake_detector.heard(text)
+            log.info("Wake segment %.1fs → %r in %.2fs%s",
+                     len(segment) / (2 * self.cfg["sample_rate"]), text,
+                     time.monotonic() - t0, " (wake)" if hit else "")
+            if hit:
+                self._on_wake(text)
+                gate.reset()
+                # Audio queued while we transcribed/played the ack is stale.
+                self._drain_queue(self.wake_q)
 
     def _endpointer_loop(self) -> None:
         """RMS VAD. Two timers run off the same per-chunk silence count:
@@ -1346,10 +1518,14 @@ class VoiceBridge:
 
     def _worker_loop(self) -> None:
         while not self.shutdown_event.is_set():
+            # Every `continue` below lands back here, so busy spans exactly
+            # pick-up → reply handed to the player (or turn dropped).
+            self._worker_busy.clear()
             try:
                 gen, pcm, sr = self.utterance_q.get(timeout=0.2)
             except queue.Empty:
                 continue
+            self._worker_busy.set()
             if gen != self._current_gen():
                 continue
 
@@ -1378,7 +1554,10 @@ class VoiceBridge:
                          len(segments), len(pcm), len(pcm) / (sr * 2))
 
             log.info("Worker: STT (%d bytes ≈ %.2fs)", len(pcm), len(pcm) / (sr * 2))
+            t_stt = time.monotonic()
             text = self.stt.transcribe(pcm, sr)
+            if self._stt_compare:
+                self._stt_compare.submit(pcm, sr, text, time.monotonic() - t_stt)
             if not text:
                 log.info("Worker: empty transcription, skipping")
                 continue
@@ -1587,13 +1766,24 @@ class VoiceBridge:
         # mic boots open = unmuted, so duck immediately to match.
         if self.recording.is_set():
             self.deezer.duck()
-        for name, fn in (
+        loops = [
             ("hid", self._hid_loop),
             ("recorder", self._recorder_loop),
             ("endpointer", self._endpointer_loop),
             ("worker", self._worker_loop),
             ("player", self._player_loop),
-        ):
+        ]
+        if self.wake_mode:
+            # Boot idle-but-listening: firmware mic open (the HID monitor
+            # boots muted), acks synthesized/loaded off the hot path.
+            if self._wake_armed.is_set():
+                self.hid.set_led(muted=False)
+            loops += [("wake", self._wake_loop),
+                      ("wake-acks", lambda: self._wake_acks.prepare(self.shutdown_event)),
+                      ("sleep-acks", lambda: self._sleep_acks.prepare(self.shutdown_event))]
+        if self._stt_compare:
+            self._stt_compare.start()
+        for name, fn in loops:
             t = threading.Thread(target=fn, name=f"vb-{name}", daemon=True)
             t.start()
             self._threads.append(t)
@@ -1670,7 +1860,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigterm)
 
     bridge.start()
-    if cfg.get("hid_mute_enabled"):
+    if cfg["activation"] == "wake_word":
+        log.info("Ready — say the wake word to begin (Jabra button mutes/resumes)")
+    elif cfg.get("hid_mute_enabled"):
         log.info("Ready — device starts muted, press the Jabra button to begin")
     else:
         log.info("Ready — listening (always-on mic, HID button disabled)")

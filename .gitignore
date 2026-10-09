@@ -28,3 +28,6 @@ voice-bridge.secrets.json
 # copy of voice-bridge.json to swap in. Personal working files that drift from
 # the tracked config — keep them out of the repo.
 voice-bridge.json.*
+
+# Runtime data (e.g. stt_compare log)
+data/

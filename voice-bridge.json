@@ -14,9 +14,54 @@
     "card": "USB",
     "percent": 100
   },
+  "activation": "wake_word",
   "hid_mute_enabled": true,
+  "wake_word": {
+    "phrases": [
+      "hey binary"
+    ],
+    "language": "en",
+    "rms_threshold": 5000,
+    "min_loud_ms": 300,
+    "hang_ms": 300,
+    "pre_roll_ms": 300,
+    "max_segment_ms": 3000,
+    "acks": [
+      "Dimmi.",
+      "Sì?",
+      "Eccomi.",
+      "Ti ascolto.",
+      "Dimmi pure.",
+      "Sono qui.",
+      "Cosa posso fare?",
+      "Ci sono, dimmi.",
+      "Sì, ti ascolto.",
+      "Pronta, dimmi tutto."
+    ],
+    "sleep_acks": [
+      "A dopo.",
+      "A più tardi.",
+      "Ci sentiamo.",
+      "Alla prossima.",
+      "Ciao ciao.",
+      "A presto.",
+      "Chiamami se serve.",
+      "Sono qui se serve.",
+      "Ok, a dopo.",
+      "Va bene, ciao."
+    ],
+    "ack_providers": [
+      "elevenlabs",
+      "deepgram"
+    ]
+  },
   "stt_provider": "elevenlabs",
   "tts_provider": "elevenlabs",
+  "stt_compare": {
+    "enabled": true,
+    "language": "it",
+    "log_path": "data/stt-compare.tsv"
+  },
   "tts_streaming_mode": "http_sentence",
   "tts_whole_reply": true,
   "session_key": "agent:main:voice-bridge",
