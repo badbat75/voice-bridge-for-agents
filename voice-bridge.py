@@ -24,11 +24,9 @@ single RMS per ~64 ms chunk, worker/player are idle off-turn.
 
 from __future__ import annotations
 
-import array
 import contextlib
 import functools
 import logging
-import math
 import queue
 import signal
 import subprocess
@@ -40,8 +38,10 @@ from typing import Iterable, Iterator
 
 import pyaudio
 
+import endpointer
 import wake_word
 from deezer_connect_plugin import DeezerConnectPlugin
+from endpointer import Endpointer
 from jabra_hid import HidMuteMonitor
 from stt_compare import SttComparer
 
@@ -911,116 +911,56 @@ class VoiceBridge:
                 gate.reset()
 
     def _endpointer_loop(self) -> None:
-        """RMS VAD. Two timers run off the same per-chunk silence count:
+        """Drive the `Endpointer` (see endpointer.py) from `audio_q`.
 
-          - speech-then-silence ≥ `silence_timeout_ms` → commit utterance
-          - cumulative silence ≥ `idle_timeout_ms` (no speech) → enter idle
-
-        The silence count is NOT reset by a commit, so the idle timer
-        accounts for the trailing silence of the last utterance too.
+        The endpointer commits utterances on `silence_timeout_ms` pauses;
+        this loop adds what needs bridge state: generation changes, the
+        HID force-commit, ducking while the user talks, and auto-idle after
+        `self._idle_window_ms` of silence (`idle_timeout_ms` = 0 disables it).
         """
-        sr = self.cfg["sample_rate"]
-        chunk = self.cfg["chunk_size"]
-        chunk_ms = (chunk / sr) * 1000.0
-        rms_threshold = float(self.cfg["vad_rms_threshold"])
-        commit_chunks = max(1, int(self.cfg["silence_timeout_ms"] / chunk_ms))
-        min_speech_chunks = round(self.cfg.get("min_speech_ms", 0) / chunk_ms)
-        keep_chunks = max(0, int(self.cfg.get("silence_keep_ms", 500) / chunk_ms))
-        pre_chunks = max(0, int(self.cfg.get("pre_speech_keep_ms", 100) / chunk_ms))
-        prebuf: "deque[bytes] | None" = (
-            deque(maxlen=pre_chunks) if pre_chunks > 0 else None
-        )
-        # idle_timeout_ms = 0 disables auto-idle entirely; otherwise the
-        # window in force is `self._idle_window_ms` (widened after a reply).
+        ep = Endpointer(self.cfg, self._speech_vad)
+        sr = ep.sample_rate
         idle_enabled = int(self.cfg.get("idle_timeout_ms", 0)) > 0
-        min_voiced_ms = int((self.cfg.get("speech_filter") or {}).get("min_voiced_ms", 0))
-        max_utt_ms = int(self.cfg.get("max_utterance_ms", 0))
-        max_utt_chunks = int(max_utt_ms / chunk_ms) if max_utt_ms > 0 else 0
-
         seen_gen = self._current_gen()
-        in_speech = False
-        silence_count = 0
-        buf: list[bytes] = []
-        gen_at_start = seen_gen
-        speech_tick = 0
-        levels: list[float] = []  # per-chunk energy of the current utterance
-        # Music is ducked from the first above-threshold chunk until the
-        # utterance goes to STT (commit), is dropped, or is discarded.
+        # Music is ducked while the endpointer is inside an utterance: from
+        # the first above-threshold chunk until it is committed or dropped.
         ducked = False
 
-        def unduck_speech(reason: str) -> None:
+        def follow_ducking(reason: str) -> None:
             nonlocal ducked
-            if ducked:
-                ducked = False
-                self._duck_release(reason)
+            if ep.in_speech != ducked:
+                ducked = ep.in_speech
+                (self._duck_acquire if ducked else self._duck_release)(reason)
 
-        def discard(reason: str) -> None:
-            """End the utterance in progress without sending it (also the
-            tail of a commit, once its PCM has been taken)."""
-            nonlocal buf, in_speech
-            unduck_speech(reason)
-            buf = []
-            in_speech = False
-
-        def speech_pcm() -> "tuple[bytes, int, int]":
-            """The utterance as PCM, keeping only `keep_chunks` of the
-            trailing silence: the rest of the detection window is trimmed so
-            STT doesn't see a full silence_timeout_ms tail (keep_chunks=0
-            cuts exactly at the last above-threshold chunk). Returns
-            (pcm, chunks kept, chunks trimmed)."""
-            trim = max(0, min(silence_count - keep_chunks, len(buf)))
-            kept = buf[:-trim] if trim > 0 else buf
-            return b"".join(kept), len(kept), trim
-
-        def level_stats() -> str:
-            if not levels:
-                return "n/a"
-            lv = sorted(levels)
-            pick = lambda q: lv[min(len(lv) - 1, int(q * len(lv)))]
-            return f"p50={pick(0.5):.3g} p90={pick(0.9):.3g} max={lv[-1]:.3g}"
+        def committed(pcm: bytes, gen: int) -> None:
+            if self._enqueue_utterance(gen, pcm, sr):
+                self._pause_for_processing()
 
         while not self.shutdown_event.is_set():
-            # Reset on resume: a gen bump means the user pressed HID
-            # to resume from idle, so any half-built speech buffer
-            # captured under the old gen must be discarded.
+            # A gen bump (resume) sheds any half-built utterance.
             cur_gen = self._current_gen()
             if cur_gen != seen_gen:
-                discard("speech discarded")
-                silence_count = 0
-                if prebuf is not None:
-                    prebuf.clear()
+                ep.reset()
+                follow_ducking(endpointer.DISCARDED)
                 seen_gen = cur_gen
 
-            # Reset silence_count when the player finishes a reply, so
-            # the time spent listening to TTS doesn't count toward
-            # idle_timeout_ms. Also drain audio_q: the recorder was
-            # filling it while aplay was running, and those chunks
-            # (silence — the user was listening to the reply) would
-            # otherwise be processed back-to-back right after the reset
-            # and burn the idle counter down to nearly the threshold
-            # before the first wall-clock-fresh chunk even arrives. The
-            # whole point of this reset is "start counting from end-of-
-            # aplay", which means dropping the queued past too.
+            # Playback just ended: the idle window starts now. Drop the
+            # chunks queued while aplay ran too — the user was listening, and
+            # processing them back-to-back would burn the fresh window down
+            # before the first wall-clock-fresh chunk arrives.
             if self._idle_reset_pending.is_set():
                 self._idle_reset_pending.clear()
-                silence_count = 0
+                ep.silence = 0
                 self._drain_queue(self.audio_q)
 
             # HID press while recording = "send what I said and stop
-            # listening". If we're in the middle of a speech buffer,
-            # commit it now (don't wait for silence_timeout_ms); the
-            # worker will pick it up off utterance_q normally. If
-            # there's nothing in flight, the press is just a soft mute.
-            # No voice check here: the user asked for this to be sent.
+            # listening": commit now instead of waiting for the pause.
             if self._force_commit.is_set():
                 self._force_commit.clear()
-                if in_speech and buf:
-                    pcm, kept, _trim = speech_pcm()
-                    log.info("Endpointer: force-commit on HID press "
-                             "(%d chunks ≈ %.2fs)", kept, kept * chunk_ms / 1000.0)
-                    discard("speech committed")
-                    self._enqueue_utterance(gen_at_start, pcm, sr)
-                    silence_count = 0
+                result = ep.force_commit()
+                follow_ducking(endpointer.COMMITTED)
+                if result:
+                    self._enqueue_utterance(cur_gen, result[1], sr)
 
             try:
                 gen, data = self.audio_q.get(timeout=0.2)
@@ -1029,129 +969,30 @@ class VoiceBridge:
             if gen != cur_gen:
                 continue
 
-            samples = array.array("h", data)
-            if not samples:
-                continue
-            # Same not-quite-RMS metric the legacy `record_until_silence`
-            # used: `sum(s²) / sqrt(N)`. Keeping the formula as-is so the
-            # threshold default (`vad_rms_threshold`) carries over from
-            # prior calibrations.
-            rms = math.sumprod(samples, samples) / len(samples) ** 0.5
-
-            if rms >= rms_threshold:
-                if not in_speech:
-                    in_speech = True
-                    gen_at_start = gen
-                    speech_tick = 0
-                    levels = []
-                    if prebuf:
-                        buf.extend(prebuf)
-                        prebuf.clear()
-                    log.info("Endpointer: sound detected (rms=%.0f ≥ %g)",
-                             rms, rms_threshold)
-                    if not ducked:
-                        ducked = True
-                        self._duck_acquire("speech")
-                buf.append(data)
-                levels.append(rms)
-                silence_count = 0
-                speech_tick += 1
-                if speech_tick % 32 == 0:
-                    log.info("Endpointer: still in_speech tick=%d rms=%.0f",
-                             speech_tick, rms)
-                if max_utt_chunks and len(buf) >= max_utt_chunks:
-                    # Nobody talks to an assistant this long in one go: it's
-                    # people talking among themselves (seen: 19–34 s of
-                    # family chat sent as one turn). Drop it and go idle —
-                    # in wake mode only the wake word brings it back.
-                    log.info("Endpointer: utterance over max_utterance_ms=%d — side "
-                             "conversation, dropped; going idle", max_utt_ms)
-                    discard("utterance too long")
-                    silence_count = 0
-                    self._enter_idle(source=f"utterance>{max_utt_ms}ms")
-                continue
-
-            if in_speech:
-                buf.append(data)
-                if silence_count < commit_chunks:
-                    levels.append(rms)
-                if silence_count == 0:
-                    log.info("Endpointer: silence onset (rms=%.0f < %g, "
-                             "need %d chunks ≈ %dms to commit)",
-                             rms, rms_threshold, commit_chunks,
-                             self.cfg["silence_timeout_ms"])
-            elif prebuf is not None:
-                # Rolling pre-roll window for the next utterance.
-                prebuf.append(data)
-            silence_count += 1
-
-            if in_speech and silence_count >= commit_chunks:
-                if speech_tick < min_speech_chunks:
-                    # Too short to be speech (click, bump, echo blip):
-                    # drop it before STT. silence_count keeps running, so
-                    # noise never postpones auto-idle.
-                    log.info("Endpointer: dropped %d-chunk burst (< min_speech_ms=%d) levels %s",
-                             speech_tick, self.cfg["min_speech_ms"], level_stats())
-                    discard("burst dropped")
-                else:
-                    pcm, kept, trim = speech_pcm()
-                    if (self._speech_vad is not None
-                            and self._too_little_voice(pcm, sr, min_voiced_ms, level_stats)):
-                        # Loud, long enough, but not a voice (keyboard, TV
-                        # hum, a door): dropped like a burst, no STT call.
-                        discard("no voice")
-                    else:
-                        log.info("Endpointer: commit (%d chunks ≈ %.2fs, "
-                                 "kept %d trailing silence, trimmed %d) levels %s",
-                                 kept, kept * chunk_ms / 1000.0,
-                                 min(keep_chunks, silence_count), trim, level_stats())
-                        discard("speech committed")
-                        self._set_idle_window("idle_timeout_ms")
-                        if self._enqueue_utterance(gen_at_start, pcm, sr):
-                            self._pause_for_processing()
-                        # Treat commit as a "transaction" boundary: the idle
-                        # window starts counting from here, not from the
-                        # trailing-silence chunks already absorbed to detect
-                        # end-of-speech. (Playback end resets it again via
-                        # _idle_reset_pending — whichever lands later wins.)
-                        silence_count = 0
+            result = ep.feed(data)
+            follow_ducking(result[0] if result else "speech")
+            if result:
+                kind, pcm = result
+                if kind == endpointer.COMMITTED:
+                    self._set_idle_window("idle_timeout_ms")
+                    committed(pcm, cur_gen)
+                elif kind == endpointer.TOO_LONG:
+                    # In wake mode only the wake word brings it back.
+                    self._enter_idle(source=f"utterance>{self.cfg.get('max_utterance_ms')}ms")
 
             idle_ms = self._idle_window_ms
-            idle_chunks = int(idle_ms / chunk_ms) if idle_enabled and idle_ms > 0 else 0
-            if (not in_speech
+            idle_chunks = int(idle_ms / ep.chunk_ms) if idle_enabled and idle_ms > 0 else 0
+            if (not ep.in_speech
                     and idle_chunks > 0
-                    and silence_count >= idle_chunks
+                    and ep.silence >= idle_chunks
                     and not self._is_playing()
                     and not self._idle_reset_pending.is_set()):
-                # The `_idle_reset_pending` guard closes a race at the
-                # tail of a reply: the player clears `_player_proc`
-                # (so `_is_playing()` flips False) and sets the reset
-                # flag as a pair, but the endpointer could observe the
-                # cleared proc one tick before consuming the reset —
-                # with `silence_count` already past the threshold from
-                # the whole playback — and fire idle the instant the
-                # reply finished. Holding off while a reset is pending
-                # lets the next loop tick zero the counter first, so
-                # the idle window truly starts at end-of-playback.
+                # The `_idle_reset_pending` guard closes a race at the tail
+                # of a reply: the player sets it just before clearing
+                # `_player_proc`, so "not playing" with a pending reset means
+                # the next tick zeroes the stale playback-long silence first.
                 self._enter_idle(source=f"silence>{idle_ms}ms")
-                silence_count = 0
-                buf = []
-
-    def _too_little_voice(self, pcm: bytes, sr: int, min_voiced_ms: int,
-                          level_stats) -> bool:
-        """webrtcvad check at commit. Logs the voiced ms of every commit so
-        `speech_filter.min_voiced_ms` can be tuned from the journal."""
-        voiced = _voiced_ms(pcm, sr, self._speech_vad)
-        if voiced is None:
-            return False
-        if voiced < min_voiced_ms:
-            log.info("Endpointer: dropped %.2fs utterance, only %d ms voiced "
-                     "(< speech_filter.min_voiced_ms=%d) levels %s",
-                     len(pcm) / (2 * sr),
-                     voiced, min_voiced_ms, level_stats())
-            return True
-        log.info("Endpointer: %d ms voiced", voiced)
-        return False
+                ep.silence = 0
 
     def _enqueue_utterance(self, gen: int, pcm: bytes, sr: int) -> bool:
         """Hand a committed utterance to the worker, holding at most ONE
