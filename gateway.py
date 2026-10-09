@@ -16,45 +16,46 @@ from __future__ import annotations
 import json
 import logging
 import re
+import urllib.request
 from typing import Iterable, Iterator
 
 log = logging.getLogger("voice-bridge")
 
-def gateway_chat(base_url: str, token: str, text: str, voice_model: str, session_key: str = "voice-bridge") -> str:
-    """Send user transcript to OpenClaw gateway and get response text."""
-    import urllib.request
+GATEWAY_FALLBACK_REPLY = "Mi dispiace, ho avuto un problema di connessione."
 
-    url = f"{base_url}/v1/chat/completions"
+
+def _openclaw_request(base_url: str, token: str, text: str, voice_model: str,
+                      session_key: str, stream: bool) -> "urllib.request.Request":
+    """`POST /v1/chat/completions` for one user turn (OpenClaw leg)."""
     payload = json.dumps({
         "model": voice_model,
         "messages": [{"role": "user", "content": text}],
         "max_tokens": 500,
-        "stream": False,
+        "stream": stream,
     }).encode()
-
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
     }
+    if stream:
+        headers["Accept"] = "text/event-stream"
     if session_key:
         headers["X-OpenClaw-Session-Key"] = session_key
+    return urllib.request.Request(f"{base_url}/v1/chat/completions",
+                                  data=payload, headers=headers)
 
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers=headers,
-    )
+
+def gateway_chat(base_url: str, token: str, text: str, voice_model: str, session_key: str = "voice-bridge") -> str:
+    """Send user transcript to OpenClaw gateway and get response text."""
+    req = _openclaw_request(base_url, token, text, voice_model, session_key, stream=False)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', url, resp.status, resp.reason)
+            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', req.full_url, resp.status, resp.reason)
             result = json.loads(resp.read())
             return result["choices"][0]["message"]["content"]
     except Exception as exc:
         log.error("Gateway error: %s", exc)
-        return "Mi dispiace, ho avuto un problema di connessione."
-
-
-GATEWAY_FALLBACK_REPLY = "Mi dispiace, ho avuto un problema di connessione."
+        return GATEWAY_FALLBACK_REPLY
 
 # Tokens the agent emits to signal "stay silent on this turn" (e.g. when the
 # user utterance was just background noise). The bridge intercepts these
@@ -156,28 +157,10 @@ def gateway_chat_stream(
     means an empty stream really does mean "no content" (the model said
     nothing), distinct from "the request blew up."
     """
-    import urllib.request
-
-    url = f"{base_url}/v1/chat/completions"
-    payload = json.dumps({
-        "model": voice_model,
-        "messages": [{"role": "user", "content": text}],
-        "max_tokens": 500,
-        "stream": True,
-    }).encode()
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-        "Accept": "text/event-stream",
-    }
-    if session_key:
-        headers["X-OpenClaw-Session-Key"] = session_key
-
-    req = urllib.request.Request(url, data=payload, headers=headers)
+    req = _openclaw_request(base_url, token, text, voice_model, session_key, stream=True)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', url, resp.status, resp.reason)
+            log.info('HTTP Request: POST %s "HTTP/1.1 %d %s"', req.full_url, resp.status, resp.reason)
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line.startswith("data:"):
@@ -219,8 +202,6 @@ def gateway_chat_stream_zeroclaw(
     error this yields the same fallback string the OpenClaw leg uses, so the
     TTS stage always has something to speak.
     """
-    import urllib.request
-
     url = f"{base_url}/webhook"
     payload = json.dumps({"message": text}).encode()
     headers = {

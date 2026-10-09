@@ -5,10 +5,11 @@ match elevenlabs_voice.ElevenLabsVoice — both classes expose
 `transcribe(pcm, sample_rate) -> str` and `synthesize(text) -> bytes`,
 so callers can swap providers by changing one constructor call.
 
-NOTE on TTS: Deepgram Aura currently ships only English (`*-en`) and
-Spanish (`*-es`) voices — there is NO Italian voice. Don't use this for
-TTS in an Italian flow; prefer ElevenLabs `eleven_multilingual_v2`.
-STT works for Italian via `nova-3`, which is the default here.
+NOTE on TTS: Aura has no `language` parameter — the language is baked
+into the voice-model name (`aura-2-thalia-en` English, `aura-2-livia-it`
+Italian, ...). Pick an `aura-2-*-it` voice for Italian speech; the default
+`aura-2-thalia-en` speaks English whatever the text. STT works for
+Italian via `nova-3`, which is the default here.
 
 Output of synthesize() is raw S16LE mono PCM at `tts_sample_rate` Hz —
 ready to feed to `aplay -f S16_LE -r <rate> -c 1` directly, no

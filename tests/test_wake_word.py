@@ -153,8 +153,8 @@ class AckBankTest(unittest.TestCase):
         self.cfg = {"tts_sample_rate": 24000, "deepgram_key": "k", "deepgram_tts_model": "aura-2-livia-it"}
 
     def _bank(self, tts, cfg=None, kind="wake", phrases=("Dimmi.", "Eccomi.")):
-        return wake_word.AckBank(cfg or self.cfg, phrases, ["deepgram"], self.cache,
-                                 lambda name: tts, kind=kind)
+        return wake_word.AckBank(cfg or self.cfg, phrases, "deepgram", self.cache,
+                                 tts, kind=kind)
 
     @staticmethod
     def _echo_tts():
@@ -192,7 +192,7 @@ class AckBankTest(unittest.TestCase):
     def test_voice_settings_change_redownloads(self):
         cfg = {**self.cfg, "elevenlabs_key": "k", "elevenlabs_voice": "v", "elevenlabs_model": "m",
                "elevenlabs_voice_settings": {"stability": 0.7}}
-        mk = lambda c, t: wake_word.AckBank(c, ["Dimmi."], ["elevenlabs"], self.cache, lambda n: t)
+        mk = lambda c, t: wake_word.AckBank(c, ["Dimmi."], "elevenlabs", self.cache, t)
         mk(cfg, self._echo_tts()).prepare()
         tts = self._echo_tts()
         mk({**cfg, "elevenlabs_voice_settings": {"stability": 0.3}}, tts).prepare()
@@ -267,7 +267,7 @@ def _bridge(activation: str):
 
 class SpokenTagsTest(unittest.TestCase):
     def _bank(self, **cfg):
-        return wake_word.AckBank(cfg, [], [], "/nonexistent", lambda p: None)
+        return wake_word.AckBank(cfg, [], "elevenlabs", "/nonexistent", None)
 
     def test_v3_keeps_tone_tags(self):
         bank = self._bank(elevenlabs_model="eleven_v3")
@@ -448,6 +448,29 @@ class WakeTransitionsTest(unittest.TestCase):
         self.assertEqual(bridge._idle_window_ms, 12000)
         play = self._goodbye_played(bridge, vb)
         self.assertEqual(play.call_args.args[1], b"\1\1")
+
+    def test_wake_queue_is_bounded_and_drops_oldest(self):
+        bridge, _, _ = _bridge("wake_word")
+        cap = bridge.wake_q.maxsize
+        self.assertGreater(cap, 0)
+        for i in range(cap + 5):
+            bridge._put_wake_chunk(bytes([i % 256]))
+        self.assertEqual(bridge.wake_q.qsize(), cap)
+        self.assertEqual(bridge.wake_q.get_nowait(), bytes([5]))
+
+    def test_whistle_load_failure_falls_back_to_button(self):
+        bridge, hid, _ = _bridge("wake_word")
+        bridge._wake_detector.load = mock.Mock(side_effect=OSError("no model"))
+        bridge._put_wake_chunk(b"x")
+        bridge._wake_loop()
+        self.assertFalse(bridge.wake_mode)
+        self.assertFalse(bridge._wake_armed.is_set())
+        self.assertTrue(bridge.wake_q.empty())
+        self.assertEqual(hid.leds[-1], True)
+        bridge._resume()
+        bridge._enter_idle("test")  # now behaves like button mode
+        self.assertFalse(bridge._wake_armed.is_set())
+        self.assertEqual(hid.leds[-1], True)
 
     def test_button_mode_unchanged(self):
         bridge, hid, _ = _bridge("button")

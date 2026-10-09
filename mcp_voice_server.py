@@ -57,10 +57,7 @@ import uuid
 
 from mcp.server.fastmcp import FastMCP
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# Logging is configured by the host process (the bridge's main()).
 log = logging.getLogger("mcp_voice_server")
 
 # STT decode target. 16 kHz mono is plenty for both Scribe and nova-3 and
@@ -190,20 +187,44 @@ def _decode_to_pcm(path: str, rate: int = _STT_RATE) -> bytes:
     return proc.stdout
 
 
-def _encode_from_pcm(pcm: bytes, src_rate: int, fmt: str, out_path: str) -> None:
-    """Encode raw S16LE mono PCM into `fmt`'s container at `out_path`."""
+def _encode_from_pcm(pcm: bytes, src_rate: int, fmt: str, out_path: str | None = None) -> bytes:
+    """Encode raw S16LE mono PCM into `fmt`'s container.
+
+    Written to `out_path` when given; otherwise ffmpeg writes to its stdout
+    and the encoded bytes are returned (no temp file). Raises RuntimeError
+    with ffmpeg's stderr on failure."""
     enc_args, _mime, _ext = _OUTPUT_FORMATS[fmt]
-    subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "s16le", "-ar", str(src_rate), "-ac", "1", "-i", "pipe:0",
-            *enc_args,
-            out_path,
-        ],
-        input=pcm,
-        capture_output=True,
-        check=True,
-    )
+    out = ["-f", fmt, "pipe:1"] if out_path is None else [out_path]
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "s16le", "-ar", str(src_rate), "-ac", "1", "-i", "pipe:0",
+                *enc_args,
+                *out,
+            ],
+            input=pcm,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(f"ffmpeg encode failed: {stderr}") from exc
+    return proc.stdout
+
+
+def _synthesize(text: str) -> "tuple[str, bytes]":
+    """Validate + sanitize `text` and synthesize it: (spoken text, PCM).
+    Shared by every tool that speaks; raises on empty text or TTS failure."""
+    if not text or not text.strip():
+        raise ValueError("text is empty")
+    text = _sanitize_for_tts(text)
+    if not text:
+        raise ValueError("text is empty after sanitization")
+    pcm = _tts.synthesize(text)
+    if not pcm:
+        raise RuntimeError("TTS produced no audio (provider error — check logs)")
+    return text, pcm
 
 
 @mcp.tool()
@@ -294,16 +315,7 @@ def text_to_speech(
         raise ValueError(
             f"unknown format {format!r}; valid: {sorted(_OUTPUT_FORMATS)}"
         )
-    if not text or not text.strip():
-        raise ValueError("text is empty")
-
-    text = _sanitize_for_tts(text)
-    if not text:
-        raise ValueError("text is empty after sanitization")
-
-    pcm = _tts.synthesize(text)
-    if not pcm:
-        raise RuntimeError("TTS produced no audio (provider error — check logs)")
+    text, pcm = _synthesize(text)
 
     _enc_args, mime, ext = _OUTPUT_FORMATS[fmt]
     if out_path is None:
@@ -311,11 +323,7 @@ def text_to_speech(
         out_path = os.path.join(_OUT_DIR, f"tts-{uuid.uuid4().hex}{ext}")
     out_path = os.path.abspath(out_path)
 
-    try:
-        _encode_from_pcm(pcm, _TTS_RATE, fmt, out_path)
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
-        raise RuntimeError(f"ffmpeg encode failed: {stderr}") from exc
+    _encode_from_pcm(pcm, _TTS_RATE, fmt, out_path)
 
     size = os.path.getsize(out_path)
     log.info("text_to_speech: %d chars -> %s (%d bytes, %s)",
@@ -464,8 +472,7 @@ def say_to_telegram(
 
     Equivalent to `text_to_speech(text, format="ogg")` followed by
     `send_voice_telegram(path, chat_id, caption)`, but a single MCP call
-    and the temp file is deleted after upload (success OR failure), so no
-    path ever leaks back to the client. This is the tool to use when
+    and the OGG is encoded in memory, so no file is ever written. This is the tool to use when
     relaying a spoken reply on Telegram — the two-step variants exist for
     when you need to inspect or re-use the audio.
 
@@ -477,41 +484,16 @@ def say_to_telegram(
         raise RuntimeError(
             "telegram_bot_token not set in voice-bridge.secrets.json"
         )
-    if not text or not text.strip():
-        raise ValueError("text is empty")
     cid = _resolve_chat_id(chat_id)
-
-    text = _sanitize_for_tts(text)
-    if not text:
-        raise ValueError("text is empty after sanitization")
-
-    pcm = _tts.synthesize(text)
-    if not pcm:
-        raise RuntimeError("TTS produced no audio (provider error — check logs)")
-
-    os.makedirs(_OUT_DIR, exist_ok=True)
-    out_path = os.path.join(_OUT_DIR, f"tts-{uuid.uuid4().hex}.ogg")
-    try:
-        _encode_from_pcm(pcm, _TTS_RATE, "ogg", out_path)
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
-        raise RuntimeError(f"ffmpeg encode failed: {stderr}") from exc
-
-    try:
-        with open(out_path, "rb") as f:
-            data = f.read()
-        return _upload_voice_to_telegram(
-            data,
-            os.path.basename(out_path),
-            cid,
-            caption,
-            log_tag=f"say_to_telegram[text={len(text)}c]",
-        )
-    finally:
-        try:
-            os.remove(out_path)
-        except OSError:
-            pass
+    text, pcm = _synthesize(text)
+    data = _encode_from_pcm(pcm, _TTS_RATE, "ogg")
+    return _upload_voice_to_telegram(
+        data,
+        f"tts-{uuid.uuid4().hex}.ogg",
+        cid,
+        caption,
+        log_tag=f"say_to_telegram[text={len(text)}c]",
+    )
 
 
 @mcp.tool()
@@ -526,17 +508,7 @@ def say_to_speaker(text: str) -> dict:
     behind any reply already playing rather than overlapping it. Blocks until
     playback finishes. Returns `{ok, chars, seconds}`.
     """
-    if not text or not text.strip():
-        raise ValueError("text is empty")
-
-    text = _sanitize_for_tts(text)
-    if not text:
-        raise ValueError("text is empty after sanitization")
-
-    pcm = _tts.synthesize(text)
-    if not pcm:
-        raise RuntimeError("TTS produced no audio (provider error — check logs)")
-
+    text, pcm = _synthesize(text)
     seconds = _bridge.play_pcm(pcm, text=text)
     log.info("say_to_speaker: %d chars -> %.1fs", len(text), seconds)
     return {"ok": True, "chars": len(text), "seconds": round(seconds, 2)}

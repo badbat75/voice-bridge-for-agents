@@ -15,11 +15,12 @@ which runs them through:
   - `WakeDetector` — one-shot Whistle transcription of the gated segment with
     `language` forced and the wake phrases passed as keyword bias (auto-detect
     once heard "Hey, Binary" as Spanish; forced language + bias caught every
-    take in testing). A hit is a normalized substring match.
+    take in testing). A hit is an exact word-boundary match on a phrase or
+    alias, else a fuzzy match (`fuzzy_threshold`) on a phrase.
 
 `AckBank` holds short spoken clips picked at random — `acks` played on a hit,
 `sleep_acks` played when the bridge dozes off — each phrase synthesized in the
-reply voice (the configured `tts_provider`) and cached on disk as raw PCM so
+reply voice (the bridge's own TTS instance) and cached on disk as raw PCM so
 later boots make no API calls. Phrases may carry eleven_v3 tone tags like
 `[warm]`; they're stripped for any other voice, which would read them aloud. The cache is keyed to the voice: one folder per
 `<kind>/<provider>-<voice>-<model>`, and a clip's file name hashes the text
@@ -85,55 +86,42 @@ def normalize(text: str) -> str:
     return " ".join(re.sub(r"[^\w\s]|_", " ", text.lower()).split())
 
 
-def fuzzy_score(text: str, phrase: str) -> float:
-    """Best similarity between `phrase` and any window of 1..n+1 heard words.
+def _phrase_end(words: list[str], phrases, aliases=(), fuzzy: float = 0.0) -> int | None:
+    """Index just past the wake phrase in `words` (normalized), or None.
 
-    Spaces are dropped on both sides, so a split mishearing ("hey bin ally")
-    scores like a joined one ("hey binally")."""
-    words = normalize(text).split()
-    target = normalize(phrase).replace(" ", "")
-    if not words or not target:
-        return 0.0
-    n_max = len(normalize(phrase).split()) + 1
-    best = 0.0
-    for n in range(1, n_max + 1):
-        for i in range(len(words) - n + 1):
-            cand = "".join(words[i:i + n])
-            best = max(best, difflib.SequenceMatcher(None, cand, target).ratio())
-    return best
+    An exact phrase/alias on word boundaries wins; else, when `fuzzy` > 0,
+    the window of 1..n+1 heard words whose letters (spaces dropped, so "hey
+    bin ally" scores like "hey binally") are most similar to a phrase, if
+    that difflib ratio reaches `fuzzy`. Aliases never match fuzzily."""
+    for p in (*phrases, *aliases):
+        pw = normalize(p).split()
+        for i in range(len(words) - len(pw) + 1):
+            if pw and words[i:i + len(pw)] == pw:
+                return i + len(pw)
+    if fuzzy <= 0:
+        return None
+    best, end = 0.0, None
+    for p in phrases:
+        target = normalize(p).replace(" ", "")
+        for n in range(1, len(normalize(p).split()) + 2):
+            for i in range(len(words) - n + 1):
+                r = difflib.SequenceMatcher(None, "".join(words[i:i + n]), target).ratio()
+                if r >= fuzzy and r > best:
+                    best, end = r, i + n
+    return end
 
 
 def matches(text: str, phrases: list[str], aliases=(), fuzzy: float = 0.0) -> bool:
     """Exact word-boundary match on phrases + aliases, else a fuzzy match
     on the phrases when `fuzzy` > 0."""
-    heard = f" {normalize(text)} "
-    if any(f" {p} " in heard for p in (*phrases, *aliases)):
-        return True
-    return fuzzy > 0 and any(fuzzy_score(text, p) >= fuzzy for p in phrases)
+    return _phrase_end(normalize(text).split(), phrases, aliases, fuzzy) is not None
 
 
 def command_after(text: str, phrases: list[str], aliases=(), fuzzy: float = 0.0) -> str:
     """Words heard after the wake phrase — "hey binary metti la musica" →
-    "metti la musica" — or "" when there are none (or no match at all).
-
-    Same matching as `matches`: an exact phrase/alias first, else the
-    window of heard words that scores best (≥ `fuzzy`) against a phrase."""
+    "metti la musica" — or "" when there are none (or no match at all)."""
     words = normalize(text).split()
-    for p in (*phrases, *aliases):
-        pw = p.split()
-        for i in range(len(words) - len(pw) + 1):
-            if words[i:i + len(pw)] == pw:
-                return " ".join(words[i + len(pw):])
-    if fuzzy <= 0:
-        return ""
-    best, end = 0.0, None
-    for p in phrases:
-        target = p.replace(" ", "")
-        for n in range(1, len(p.split()) + 2):
-            for i in range(len(words) - n + 1):
-                r = difflib.SequenceMatcher(None, "".join(words[i:i + n]), target).ratio()
-                if r >= fuzzy and r > best:
-                    best, end = r, i + n
+    end = _phrase_end(words, phrases, aliases, fuzzy)
     return " ".join(words[end:]) if end is not None else ""
 
 
@@ -262,24 +250,30 @@ class WakeDetector:
     def heard(self, text: str) -> bool:
         return matches(text, self.phrases, self.aliases, self.fuzzy)
 
-    def command(self, text: str) -> str:
-        """What was said after the wake phrase in the same breath, if anything."""
-        return command_after(text, self.phrases, self.aliases, self.fuzzy)
+    def detect(self, text: str) -> str | None:
+        """None when the wake phrase wasn't heard; else what was said after
+        it in the same breath ("" if nothing). One search for both."""
+        words = normalize(text).split()
+        end = _phrase_end(words, self.phrases, self.aliases, self.fuzzy)
+        return None if end is None else " ".join(words[end:])
 
 
 RETRY_MIN_S, RETRY_MAX_S = 30.0, 600.0
 
 
 class AckBank:
-    """Short spoken clips: every phrase × every ack provider, disk-cached per voice."""
+    """Short spoken clips in the reply voice, disk-cached per voice.
 
-    def __init__(self, cfg: dict, phrases, providers, cache_dir: str, build_tts, kind: str = "wake") -> None:
+    `tts` is the bridge's own reply provider (named by `provider`), so acks
+    never sound like a different speaker and no extra SDK client is built."""
+
+    def __init__(self, cfg: dict, phrases, provider: str, cache_dir: str, tts, kind: str = "wake") -> None:
         self.cfg = cfg
         self.kind = kind
         self.phrases = list(phrases)
-        self.providers = list(providers)
+        self.provider = provider
         self.cache_dir = os.path.expanduser(cache_dir)
-        self._build_tts = build_tts
+        self._tts = tts
         self._clips: list[tuple[str, str, bytes]] = []
         self._lock = threading.Lock()
 
@@ -303,14 +297,6 @@ class AckBank:
     def _path(self, provider: str, text: str) -> str:
         digest = hashlib.sha1(f"{self._render_key(provider)}|{text}".encode()).hexdigest()
         return os.path.join(self.cache_dir, self.kind, self._voice_dir(provider), digest + ".pcm")
-
-    def _available(self, provider: str) -> bool:
-        if provider == "elevenlabs":
-            return bool(self.cfg.get("elevenlabs_key") and self.cfg.get("elevenlabs_voice")
-                        and self.cfg.get("elevenlabs_model"))
-        if provider == "deepgram":
-            return bool(self.cfg.get("deepgram_key"))
-        return False
 
     def _prune(self, keep: set[str]) -> None:
         """Delete clips of voices/phrases no longer configured (ours only)."""
@@ -343,16 +329,14 @@ class AckBank:
             return text
         return " ".join(re.sub(r"\[[^\]]*\]", " ", text).split())
 
-    def _load_or_synthesize(self, provider: str, text: str, path: str, tts_box: list) -> bytes | None:
+    def _load_or_synthesize(self, text: str, path: str) -> bytes | None:
         if os.path.exists(path) and os.path.getsize(path) > 0:
             with open(path, "rb") as f:
                 return f.read()
         try:
-            if not tts_box:
-                tts_box.append(self._build_tts(provider))
-            pcm = tts_box[0].synthesize(self._spoken(provider, text))
+            pcm = self._tts.synthesize(self._spoken(self.provider, text))
         except Exception as exc:
-            log.warning("Wake acks (%s): %s failed on %r: %s", self.kind, provider, text, exc)
+            log.warning("Wake acks (%s): %s failed on %r: %s", self.kind, self.provider, text, exc)
             return None
         if pcm:
             # Write-then-rename: a crash mid-write never leaves a truncated
@@ -372,24 +356,18 @@ class AckBank:
         set; wakes meanwhile use whatever is ready, or a beep if nothing is.
         """
         stop = stop or threading.Event()
-        wanted = []
-        for provider in self.providers:
-            if not self._available(provider):
-                log.warning("Wake acks (%s): %s not configured, skipping", self.kind, provider)
-                continue
-            wanted += [(provider, text, self._path(provider, text)) for text in self.phrases]
-        self._prune({path for _p, _t, path in wanted})
+        wanted = [(text, self._path(self.provider, text)) for text in self.phrases]
+        self._prune({path for _t, path in wanted})
         delay = RETRY_MIN_S
         while True:
-            tts_boxes: dict[str, list] = {}
             missing = []
-            for provider, text, path in wanted:
-                pcm = self._load_or_synthesize(provider, text, path, tts_boxes.setdefault(provider, []))
+            for text, path in wanted:
+                pcm = self._load_or_synthesize(text, path)
                 if pcm:
                     with self._lock:
-                        self._clips.append((provider, text, pcm))
+                        self._clips.append((self.provider, text, pcm))
                 else:
-                    missing.append((provider, text, path))
+                    missing.append((text, path))
             wanted = missing
             log.info("Wake acks (%s): %d clips ready%s", self.kind, len(self._clips),
                      f", {len(wanted)} missing — retry in {delay:.0f}s" if wanted else "")

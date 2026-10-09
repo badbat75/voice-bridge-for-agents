@@ -685,6 +685,22 @@ class DuckingTest(unittest.TestCase):
         bridge._enter_idle("test")
         self.assertEqual(events, [])
 
+    def test_started_bridge_never_waits_on_the_bff(self):
+        bridge, events = self._bridge()
+        gate = threading.Event()
+        bridge.deezer.duck.side_effect = lambda: (gate.wait(5), events.append("duck"))
+        bridge._duck_q = queue.Queue()
+        bridge._duck_thread = threading.Thread(target=bridge._duck_loop, daemon=True)
+        bridge._duck_thread.start()
+        t0 = time.monotonic()
+        bridge._duck_acquire("speech")
+        bridge._duck_release("speech")
+        self.assertLess(time.monotonic() - t0, 0.5, "a hung BFF must not stall the caller")
+        gate.set()
+        bridge._duck_q.put(None)
+        bridge._duck_thread.join(2)
+        self.assertEqual(events, ["duck", "unduck"])
+
     def test_overlapping_holds_unduck_once_both_end(self):
         bridge, events = self._bridge()
         with bridge._ducked("reply"):

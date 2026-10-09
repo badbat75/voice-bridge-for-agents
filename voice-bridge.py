@@ -121,6 +121,11 @@ class _EndOfUtterance:
 
 
 _END_OF_UTTERANCE = _EndOfUtterance()
+# Returned by `_next_reply_item` when the reply was cut by a gen change.
+_STALE = object()
+
+# Most idle audio `wake_q` holds; Whistle normally drains it in well under 1 s.
+_WAKE_Q_SECONDS = 10.0
 
 
 # A whole externally-supplied utterance (the MCP `say_to_speaker` tool),
@@ -166,6 +171,8 @@ class _ThinkingCue:
         self._repeat = max(100, int(tc.get("repeat_ms", 5000))) / 1000.0
         self._stop = threading.Event()
         self._tool = threading.Event()
+        # Wakes `_run` early (tool_call or stop) instead of polling.
+        self._wake = threading.Event()
         self._lock = threading.Lock()
         self.cues_played = 0
 
@@ -177,10 +184,12 @@ class _ThinkingCue:
     def on_event(self, ftype: str, _frame: dict) -> None:
         if ftype == "tool_call":
             self._tool.set()
+            self._wake.set()
 
     def stop(self) -> None:
         with self._lock:
             self._stop.set()
+        self._wake.set()
 
     def _enqueue(self, pcm: bytes | None, label: str) -> bool:
         if not pcm:
@@ -197,7 +206,11 @@ class _ThinkingCue:
         rate = int(self._bridge.cfg["tts_sample_rate"])
         next_tick = time.monotonic() + self._delay
         spoke = False
-        while not self._stop.wait(0.05):
+        while True:
+            self._wake.wait(max(0.0, next_tick - time.monotonic()))
+            self._wake.clear()
+            if self._stop.is_set():
+                return
             now = time.monotonic()
             if self._tool.is_set() and not spoke:
                 spoke = True
@@ -247,6 +260,9 @@ class VoiceBridge:
         # Ducking holds — see `_duck_acquire`.
         self._duck_lock = threading.Lock()
         self._duck_holds = 0
+        # Set by `start()`: volume calls go to the `vb-duck` thread.
+        self._duck_q: "queue.Queue | None" = None
+        self._duck_thread: threading.Thread | None = None
 
         # `audio_q` is unbounded: the endpointer is O(N) over a 1024-
         # sample chunk per ~64 ms — easily faster than the recorder, so
@@ -316,7 +332,11 @@ class VoiceBridge:
         # mute (privacy: firmware-muted, only the button resumes) and while
         # recording. Always clear in "button" mode.
         self.wake_mode = cfg.get("activation") == "wake_word"
-        self.wake_q: "queue.Queue[bytes]" = queue.Queue()
+        # Bounded: if the wake loop stalls or dies, the recorder drops the
+        # oldest audio instead of growing the queue until the OOM killer.
+        chunk_s = int(cfg.get("chunk_size", 1024)) / int(cfg.get("sample_rate", 16000))
+        self.wake_q: "queue.Queue[bytes]" = queue.Queue(
+            maxsize=max(1, int(_WAKE_Q_SECONDS / chunk_s)))
         self._wake_armed = threading.Event()
         # Set while a wake/sleep clip plays so the wake loop ignores our own
         # voice coming back through the mic.
@@ -326,20 +346,16 @@ class VoiceBridge:
         # is skipped while a reply is still on its way.
         self._worker_busy = threading.Event()
         self._wake_cfg = self._wake_detector = self._wake_acks = self._sleep_acks = None
+        # Acks speak in the reply voice: they reuse the reply's TTS instance.
+        voice = cfg.get("tts_provider", "elevenlabs")
+        ack_dir = wake_word.wake_config(cfg)["ack_cache_dir"]
         if self.wake_mode:
             self._wake_cfg = wake_word.wake_config(cfg)
             self._wake_detector = wake_word.WakeDetector(self._wake_cfg)
-
-            def build_tts(name):
-                return _build_voice_provider("tts", {**cfg, "tts_provider": name})
-
-            # Acks speak in the reply voice: the configured tts_provider only.
             w = self._wake_cfg
-            voice = [cfg.get("tts_provider", "elevenlabs")]
-            self._wake_acks = wake_word.AckBank(
-                cfg, w["acks"], voice, w["ack_cache_dir"], build_tts, kind="wake")
+            self._wake_acks = wake_word.AckBank(cfg, w["acks"], voice, ack_dir, tts, kind="wake")
             self._sleep_acks = wake_word.AckBank(
-                cfg, w["sleep_acks"], voice, w["ack_cache_dir"], build_tts, kind="sleep")
+                cfg, w["sleep_acks"], voice, ack_dir, tts, kind="sleep")
             if not self.recording.is_set():
                 self._wake_armed.set()
 
@@ -348,10 +364,7 @@ class VoiceBridge:
         tphrases = (cfg.get("thinking_cue") or {}).get("phrases") or []
         if (cfg.get("thinking_cue") or {}).get("enabled") and tphrases:
             self._thinking_acks = wake_word.AckBank(
-                cfg, tphrases, [cfg.get("tts_provider", "elevenlabs")],
-                wake_word.wake_config(cfg)["ack_cache_dir"],
-                lambda name: _build_voice_provider("tts", {**cfg, "tts_provider": name}),
-                kind="thinking")
+                cfg, tphrases, voice, ack_dir, tts, kind="thinking")
 
         # Frame-level voice check at commit (None = off).
         self._speech_vad = _make_speech_vad(cfg)
@@ -426,19 +439,42 @@ class VoiceBridge:
     # goodbye, beep, say_to_speaker). Holds overlap (talking over a reply,
     # an ack racing the player), so they're counted: duck on 0→1, unduck
     # on 1→0. Mute/idle state no longer affects ducking.
+    #
+    # The volume I/O (HTTP to the deezer-connect BFF, up to 2 × timeout)
+    # runs on the `vb-duck` thread once `start()` has launched it, so the
+    # endpointer and the player never wait on the network. Commands keep
+    # their order through one FIFO; before `start()` (tests) they run inline.
     def _duck_acquire(self, reason: str) -> None:
         with self._duck_lock:
             self._duck_holds += 1
             if self._duck_holds == 1:
                 log.info("Ducking on (%s)", reason)
-                self.deezer.duck()
+                self._duck_send(self.deezer.duck)
 
     def _duck_release(self, reason: str) -> None:
         with self._duck_lock:
             self._duck_holds = max(0, self._duck_holds - 1)
             if self._duck_holds == 0:
                 log.info("Ducking off (%s)", reason)
-                self.deezer.unduck()
+                self._duck_send(self.deezer.unduck)
+
+    def _duck_send(self, fn) -> None:
+        """Run a volume call on the duck thread (inline when not started).
+        Called under `_duck_lock`, so commands are queued in hold order."""
+        if self._duck_q is None:
+            fn()
+        else:
+            self._duck_q.put(fn)
+
+    def _duck_loop(self) -> None:
+        while True:
+            fn = self._duck_q.get()
+            if fn is None:
+                return
+            try:
+                fn()
+            except Exception:
+                log.exception("deezer-connect volume call failed")
 
     @contextlib.contextmanager
     def _ducked(self, reason: str):
@@ -499,8 +535,9 @@ class VoiceBridge:
             self.hid.set_led(muted=True)
 
     def _turn_in_flight(self) -> bool:
+        """A turn is being processed, waiting, or its reply is playing."""
         return (self._worker_busy.is_set() or not self.utterance_q.empty()
-                or not self.playback_q.empty() or self._is_playing())
+                or self._reply_playing())
 
     def _play_clip(self, clip) -> None:
         provider, text, pcm = clip
@@ -793,7 +830,7 @@ class VoiceBridge:
                 if self.recording.is_set():
                     self.audio_q.put((self._current_gen(), data))
                 elif self._wake_armed.is_set():
-                    self.wake_q.put(data)
+                    self._put_wake_chunk(data)
         finally:
             if stream is not None:
                 try:
@@ -802,12 +839,37 @@ class VoiceBridge:
                     pass
             _safe_terminate(pa)
 
+    def _put_wake_chunk(self, data: bytes) -> None:
+        """Queue an idle chunk for the wake loop, dropping the oldest when full."""
+        while True:
+            try:
+                self.wake_q.put_nowait(data)
+                return
+            except queue.Full:
+                try:
+                    self.wake_q.get_nowait()
+                except queue.Empty:
+                    pass
+
+    @_transition
+    def _disable_wake(self) -> None:
+        """Whistle is unusable: fall back to button activation for good.
+
+        Idle-but-listening becomes a firmware mute, so the mic is not kept
+        open (and recorded into `wake_q`) for a wake word nobody can hear."""
+        self.wake_mode = False
+        self._drain_queue(self.wake_q)
+        if self._wake_armed.is_set():
+            self._wake_armed.clear()
+            self.hid.set_led(muted=True)
+
     def _wake_loop(self) -> None:
         """Idle wake-word spotting: gate chunks on energy, Whistle the rest."""
         try:
             self._wake_detector.load()
         except Exception:
-            log.exception("Wake word: Whistle failed to load — only the HID button can resume")
+            log.exception("Wake word: Whistle failed to load — falling back to the HID button")
+            self._disable_wake()
             return
         log.info("Wake word: listening for %s (lang=%s, rms>%g)",
                  self._wake_cfg["phrases"], self._wake_cfg["language"],
@@ -831,7 +893,8 @@ class VoiceBridge:
             except Exception as exc:
                 log.warning("Wake word: transcribe failed: %s", exc)
                 continue
-            hit = self._wake_detector.heard(text)
+            command = self._wake_detector.detect(text)
+            hit = command is not None
             log.info("Wake segment %.1fs → %r in %.2fs%s",
                      len(segment) / (2 * self.cfg["sample_rate"]), text,
                      time.monotonic() - t0, " (wake)" if hit else "")
@@ -844,7 +907,7 @@ class VoiceBridge:
                         backlog.append(self.wake_q.get_nowait())
                     except queue.Empty:
                         break
-                self._on_wake(text, segment, backlog, self._wake_detector.command(text))
+                self._on_wake(text, segment, backlog, command)
                 gate.reset()
 
     def _endpointer_loop(self) -> None:
@@ -1158,23 +1221,16 @@ class VoiceBridge:
         self._idle_reset_pending.set()
         self.recording.set()
 
-    def _drain_utterances(self, gen: int, into: list[bytes]) -> int:
-        """Pull every currently-queued same-gen utterance onto `into`.
-
-        Non-blocking. Stale-gen items (a hard-cancel resume bumped `_gen`)
-        are dropped. Returns how many segments were appended.
-        """
-        added = 0
+    def _discard_utterances(self, gen: int) -> int:
+        """Drop every queued utterance; returns how many were under `gen`
+        (stale-gen ones, left by a resume, are dropped without counting)."""
+        dropped = 0
         while True:
             try:
-                g, pcm, _sr = self.utterance_q.get_nowait()
+                g, _pcm, _sr = self.utterance_q.get_nowait()
             except queue.Empty:
-                break
-            if g != gen:
-                continue  # stale generation — drop
-            into.append(pcm)
-            added += 1
-        return added
+                return dropped
+            dropped += g == gen
 
     def _worker_loop(self) -> None:
         while not self.shutdown_event.is_set():
@@ -1182,7 +1238,7 @@ class VoiceBridge:
             # pick-up → reply handed to the player (or turn dropped).
             self._worker_busy.clear()
             if (self._processing.is_set() and self.utterance_q.empty()
-                    and self.playback_q.empty() and not self._is_playing()):
+                    and not self._reply_playing()):
                 self._resume_after_processing()
             try:
                 gen, pcm, sr = self.utterance_q.get(timeout=0.2)
@@ -1199,18 +1255,17 @@ class VoiceBridge:
             # Well-behaved turn-taking pays no latency: when no reply is in
             # flight the wait loop doesn't run and the utterance is sent
             # immediately.
-            extra: list[bytes] = []
-            self._drain_utterances(gen, extra)
-            while not self.playback_q.empty() or self._is_playing():
+            extra = self._discard_utterances(gen)
+            while self._reply_playing():
                 if self.shutdown_event.is_set() or gen != self._current_gen():
                     break
                 self.shutdown_event.wait(0.1)
-                self._drain_utterances(gen, extra)
+                extra += self._discard_utterances(gen)
             if gen != self._current_gen():
                 continue
             if extra:
                 log.info("Worker: dropped %d extra utterance(s) queued behind the reply",
-                         len(extra))
+                         extra)
 
             t0 = time.monotonic()
             self._turn_t0 = t0
@@ -1406,6 +1461,24 @@ class VoiceBridge:
                 if self._play_streamed(item, device, sample_rate, gen):
                     self._after_reply()
 
+    def _next_reply_item(self, gen: int, timeout: float):
+        """Next item of the reply streaming under `gen`: PCM bytes,
+        `_END_OF_UTTERANCE`, `_STALE` (cut by a gen change) or None (nothing
+        yet). External utterances met meanwhile are deferred to the backlog
+        (played right after the reply); stale ones release their caller."""
+        try:
+            gen2, item = self.playback_q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if gen2 != gen or gen2 != self._current_gen():
+            if isinstance(item, _ExternalUtterance):
+                item.done.set()
+            return _STALE
+        if isinstance(item, _ExternalUtterance):
+            self._player_backlog.append((gen2, item))
+            return None
+        return item
+
     def _prebuffer(self, first: bytes, gen: int, sample_rate: int) -> "tuple[list[bytes], bool, bool]":
         """Collect `playback_prebuffer_ms` of PCM before the first aplay
         write. ElevenLabs v3 often sends one chunk and then stalls ~0.5 s;
@@ -1425,21 +1498,15 @@ class VoiceBridge:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            try:
-                gen2, item2 = self.playback_q.get(timeout=min(0.05, remaining))
-            except queue.Empty:
+            item = self._next_reply_item(gen, min(0.05, remaining))
+            if item is None:
                 continue
-            if gen2 != self._current_gen() or gen2 != gen:
-                if isinstance(item2, _ExternalUtterance):
-                    item2.done.set()
+            if item is _STALE:
                 return chunks, False, True
-            if isinstance(item2, _EndOfUtterance):
+            if item is _END_OF_UTTERANCE:
                 return chunks, True, False
-            if isinstance(item2, _ExternalUtterance):
-                self._player_backlog.append((gen2, item2))
-                continue
-            chunks.append(item2)
-            have += len(item2)
+            chunks.append(item)
+            have += len(item)
         return chunks, False, False
 
     def _play_streamed(self, item: bytes, device: str, sample_rate: int,
@@ -1462,26 +1529,17 @@ class VoiceBridge:
             if ended:
                 return True
             while not self.shutdown_event.is_set():
-                try:
-                    gen2, item2 = self.playback_q.get(timeout=0.2)
-                except queue.Empty:
+                item = self._next_reply_item(gen, 0.2)
+                if item is None:
                     continue
-                if gen2 != self._current_gen():
-                    # Hard-cancel happened mid-utterance; the proc
-                    # has likely already been killed, but break
-                    # explicitly so we close it cleanly.
-                    if isinstance(item2, _ExternalUtterance):
-                        item2.done.set()
+                if item is _STALE:
+                    # Barge-in mid-utterance: aplay has likely been killed
+                    # already; break so it is closed cleanly.
                     break
-                if isinstance(item2, _EndOfUtterance):
+                if item is _END_OF_UTTERANCE:
                     completed = True
                     break
-                if isinstance(item2, _ExternalUtterance):
-                    # say_to_speaker while a reply streams: play it next,
-                    # never write the object into aplay.
-                    self._player_backlog.append((gen2, item2))
-                    continue
-                if not self._write_chunk(proc, item2):
+                if not self._write_chunk(proc, item):
                     break
         return completed and gen == self._current_gen()
 
@@ -1535,6 +1593,9 @@ class VoiceBridge:
         # Pin deezer-connect to its configured baseline volume on boot
         # (no-op unless the plugin is enabled).
         self.deezer.apply_default_volume()
+        self._duck_q = queue.Queue()
+        self._duck_thread = threading.Thread(target=self._duck_loop, name="vb-duck", daemon=True)
+        self._duck_thread.start()
         loops = [
             ("hid", self._hid_loop),
             ("recorder", self._recorder_loop),
@@ -1569,11 +1630,16 @@ class VoiceBridge:
         self._kill_player()
         for t in self._threads:
             t.join(timeout=3.0)
+        # Let queued volume calls finish, then go back to inline calls.
+        with self._duck_lock:
+            q, self._duck_q = self._duck_q, None
+            self._duck_holds = 0
+        if q is not None:
+            q.put(None)
+            self._duck_thread.join(timeout=3.0)
         # Restore deezer-connect's volume if we were ducked when stop
         # arrived (SIGTERM mid-playback or mid-speech). No-op when the
         # plugin is disabled or wasn't currently ducking.
-        with self._duck_lock:
-            self._duck_holds = 0
         self.deezer.unduck()
 
 
