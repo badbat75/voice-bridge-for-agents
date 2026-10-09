@@ -521,8 +521,8 @@ def say_to_speaker(text: str) -> dict:
     The speaker-side analogue of `say_to_telegram`: synthesize -> hand the
     PCM to the bridge's player via `play_pcm()`, so it behaves exactly like a
     normal spoken reply. The bridge unmutes (mic open, LED off) and ducks
-    deezer-connect for the playback window (ducking tracks mute state); after
-    the speech the usual idle timer re-mutes and unducks. The audio serializes
+    deezer-connect for exactly the playback window; after the speech the
+    usual idle timer re-mutes. The audio serializes
     behind any reply already playing rather than overlapping it. Blocks until
     playback finishes. Returns `{ok, chars, seconds}`.
     """

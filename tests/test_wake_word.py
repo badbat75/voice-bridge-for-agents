@@ -16,8 +16,9 @@ Three groups, all hardware-free and network-free (Whistle is never loaded):
                       unmuted); auto-idle re-arms WITHOUT firmware-muting; an
                       HID mute disarms and firmware-mutes; a wake hit plays an
                       ack and resumes (gen bump, LED off); a hit while disarmed
-                      is ignored; auto-idle says a goodbye clip and only then
-                      unducks, but stays silent while a reply is in flight.
+                      is ignored; auto-idle says a goodbye clip ducked for exactly
+                      its playback, but stays silent (and never touches the
+                      music) while a reply is in flight.
                       Button mode is unchanged: never armed, and auto-idle
                       firmware-mutes.
 
@@ -323,15 +324,16 @@ class WakeTransitionsTest(unittest.TestCase):
         bridge._resume()
         return bridge, hid, vb
 
-    def test_auto_idle_says_goodbye_then_unducks(self):
+    def test_auto_idle_goodbye_is_ducked(self):
         bridge, _, vb = self._with_goodbye()
         order = []
+        bridge.deezer.duck.side_effect = lambda: order.append("duck")
         bridge.deezer.unduck.side_effect = lambda: order.append("unduck")
         with mock.patch.object(vb, "play_audio", side_effect=lambda *a: order.append("goodbye")):
             bridge._enter_idle("test")
             for t in [t for t in __import__("threading").enumerate() if t.name == "vb-goodbye"]:
                 t.join(2)
-        self.assertEqual(order, ["goodbye", "unduck"])
+        self.assertEqual(order, ["duck", "goodbye", "unduck"])
 
     def test_no_goodbye_while_reply_in_flight(self):
         bridge, _, vb = self._with_goodbye()
@@ -339,7 +341,8 @@ class WakeTransitionsTest(unittest.TestCase):
         with mock.patch.object(vb, "play_audio") as play:
             bridge._enter_idle("test")
         play.assert_not_called()
-        bridge.deezer.unduck.assert_called_once()
+        bridge.deezer.duck.assert_not_called()
+        bridge.deezer.unduck.assert_not_called()
 
     def test_button_mode_unchanged(self):
         bridge, hid, _ = _bridge("button")

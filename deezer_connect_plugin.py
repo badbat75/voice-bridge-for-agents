@@ -1,8 +1,10 @@
 """Optional deezer-connect ducking plugin.
 
 When enabled in `voice-bridge.json` under the `deezer_connect` block,
-the bridge lowers the deezer-connect player's volume while a TTS reply
-is playing and restores it when playback ends. Disabled (no-op) unless
+the bridge lowers the deezer-connect player's volume while someone is
+talking — the user (speech onset → commit) or the bridge (playback) —
+and restores it afterwards. `VoiceBridge` decides when; this class only
+does the volume I/O. Disabled (no-op) unless
 `enabled: true` is set explicitly — same shape as other optional knobs
 in this codebase.
 
@@ -27,7 +29,7 @@ log = logging.getLogger("voice-bridge.deezer")
 
 
 class DeezerConnectPlugin:
-    """Ducks deezer-connect's volume during TTS playback.
+    """Ducks deezer-connect's volume while the user or the bridge talks.
 
     State machine is trivial: `_original_volume` is the volume we read
     before ducking, or `None` when not currently ducked. `duck()` is a

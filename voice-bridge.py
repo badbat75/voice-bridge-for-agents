@@ -874,6 +874,9 @@ class VoiceBridge:
         # in voice-bridge.json under `deezer_connect`. Constructed by
         # main() so tests can inject a fake.
         self.deezer = deezer or DeezerConnectPlugin(cfg.get("deezer_connect"))
+        # Ducking holds — see `_duck_acquire`.
+        self._duck_lock = threading.Lock()
+        self._duck_holds = 0
 
         # `audio_q` is unbounded: the endpointer is O(N) over a 1024-
         # sample chunk per ~64 ms — easily faster than the recorder, so
@@ -1012,6 +1015,35 @@ class VoiceBridge:
             return self._player_proc is not None
 
     # -- state transitions ---------------------------------------------
+    # -- deezer ducking --------------------------------------------------
+    # Music is ducked while someone is talking: the user (the endpointer
+    # holds from the first above-threshold chunk until the utterance is
+    # committed to STT) or the bridge (one hold per aplay — reply, ack,
+    # goodbye, beep, say_to_speaker). Holds overlap (talking over a reply,
+    # an ack racing the player), so they're counted: duck on 0→1, unduck
+    # on 1→0. Mute/idle state no longer affects ducking.
+    def _duck_acquire(self, reason: str) -> None:
+        with self._duck_lock:
+            self._duck_holds += 1
+            if self._duck_holds == 1:
+                log.info("Ducking on (%s)", reason)
+                self.deezer.duck()
+
+    def _duck_release(self, reason: str) -> None:
+        with self._duck_lock:
+            self._duck_holds = max(0, self._duck_holds - 1)
+            if self._duck_holds == 0:
+                log.info("Ducking off (%s)", reason)
+                self.deezer.unduck()
+
+    @contextlib.contextmanager
+    def _ducked(self, reason: str):
+        self._duck_acquire(reason)
+        try:
+            yield
+        finally:
+            self._duck_release(reason)
+
     def _enter_idle(self, source: str) -> None:
         """Hard idle: close mic, firmware-mute, LED red.
 
@@ -1046,15 +1078,10 @@ class VoiceBridge:
             if self._sleep_acks and not self._turn_in_flight():
                 clip = self._sleep_acks.pick()
                 if clip:
-                    # Unducks after the clip so it isn't buried under music.
                     threading.Thread(target=self._say_goodbye, args=(clip,),
                                      name="vb-goodbye", daemon=True).start()
-                    return
         else:
             self.hid.set_led(muted=True)
-        # Mute → stop ducking deezer-connect (ducking tracks mute state,
-        # not playback; no-op if disabled / not currently ducked).
-        self.deezer.unduck()
 
     def _turn_in_flight(self) -> bool:
         return (self._worker_busy.is_set() or not self.utterance_q.empty()
@@ -1065,7 +1092,8 @@ class VoiceBridge:
         log.info("Ack (%s): %r", provider, text)
         self._speaking_ack.set()
         try:
-            play_audio(self.cfg["output_device"], pcm, int(self.cfg["tts_sample_rate"]))
+            with self._ducked("ack"):
+                play_audio(self.cfg["output_device"], pcm, int(self.cfg["tts_sample_rate"]))
         finally:
             self._speaking_ack.clear()
 
@@ -1074,9 +1102,6 @@ class VoiceBridge:
             self._play_clip(clip)
         except Exception:
             log.exception("Goodbye playback failed")
-        # A wake word during the goodbye resumed (and re-ducked) — leave it.
-        if not self.recording.is_set():
-            self.deezer.unduck()
 
     def _on_hid_press(self) -> None:
         if self._processing.is_set():
@@ -1087,7 +1112,6 @@ class VoiceBridge:
             self._auto_idled.clear()
             self._wake_armed.clear()
             self.hid.set_led(muted=True)
-            self.deezer.unduck()
             return
         if self.recording.is_set():
             log.info("HID press: commit-and-mute (in-flight pipeline continues)")
@@ -1105,9 +1129,6 @@ class VoiceBridge:
             # silenced, wake word off, only the button resumes.
             self._wake_armed.clear()
             self.hid.set_led(muted=True)
-            # Mute → unduck, even if a reply is still playing (ducking
-            # tracks mute state now, not the aplay lifecycle).
-            self.deezer.unduck()
         else:
             log.info("HID press: resume recording")
             self._resume()
@@ -1123,16 +1144,12 @@ class VoiceBridge:
         self._bump_gen()
         self.recording.set()
         self.hid.set_led(muted=False)
-        # Unmute → duck deezer-connect for the whole listening window.
-        self.deezer.duck()
 
     def _on_wake(self, text: str) -> None:
         """Wake phrase heard while idle: speak a random ack, then resume."""
         if not self._wake_armed.is_set() or self.recording.is_set():
             return
         log.info("Wake word: %r", text)
-        # Duck first so the ack isn't buried under music.
-        self.deezer.duck()
         clip = self._wake_acks.pick() if self._wake_acks else None
         try:
             if self._is_playing():
@@ -1140,7 +1157,8 @@ class VoiceBridge:
             elif clip:
                 self._play_clip(clip)
             else:
-                play_beep(self.cfg["output_device"], int(self.cfg["tts_sample_rate"]))
+                with self._ducked("beep"):
+                    play_beep(self.cfg["output_device"], int(self.cfg["tts_sample_rate"]))
         except Exception:
             # A failed ack must not cost the user the turn they asked for.
             log.exception("Wake ack playback failed; resuming anyway")
@@ -1156,12 +1174,11 @@ class VoiceBridge:
         reuses the player's no-clip drain and the `_is_playing()` guard (the
         endpointer won't auto-idle mid-speech).
 
-        Like a real reply it runs through the unmute → duck transition: the
-        device unmutes (mic open, LED off) and deezer-connect ducks for the
-        playback window. Afterwards the player's end-of-playback reset starts
-        the idle window, so the usual `idle_timeout_ms` silence re-mutes and
-        unducks — exactly the tail of a normal speech. Ducking is a no-op
-        unless `deezer_connect` is enabled.
+        Like a real reply the device unmutes (mic open, LED off) and the
+        player ducks deezer-connect for exactly the playback window.
+        Afterwards the player's end-of-playback reset starts the idle window,
+        so the usual `idle_timeout_ms` silence re-mutes — exactly the tail of
+        a normal speech. Ducking is a no-op unless `deezer_connect` is enabled.
 
         Returns the audio duration in seconds; when `block` (the default),
         waits until the player has finished this utterance (bounded so a
@@ -1172,8 +1189,8 @@ class VoiceBridge:
         if not pcm:
             return 0.0
 
-        # Unmute like a normal speech → duck. Mirrors `_on_hid_press` resume
-        # and the player's auto-resume; idempotent if already unmuted/ducked.
+        # Unmute like a normal speech. Mirrors `_on_hid_press` resume and
+        # the player's auto-resume; idempotent if already unmuted.
         if not self.recording.is_set():
             log.info("play_pcm: unmuting for external speech (mic open, LED off)")
             self._wake_armed.clear()
@@ -1181,7 +1198,6 @@ class VoiceBridge:
             self.hid.set_led(muted=False)
         self._auto_idled.clear()
         self._processing.clear()
-        self.deezer.duck()
 
         # One atomic item under the current gen → serializes behind any reply
         # already playing, never interleaves with the worker's chunks. The
@@ -1367,6 +1383,15 @@ class VoiceBridge:
         gen_at_start = seen_gen
         speech_tick = 0
         levels: list[float] = []  # per-chunk energy of the current utterance
+        # Music is ducked from the first above-threshold chunk until the
+        # utterance goes to STT (commit), is dropped, or is discarded.
+        ducked = False
+
+        def unduck_speech(reason: str) -> None:
+            nonlocal ducked
+            if ducked:
+                ducked = False
+                self._duck_release(reason)
 
         def level_stats() -> str:
             if not levels:
@@ -1381,6 +1406,7 @@ class VoiceBridge:
             # captured under the old gen must be discarded.
             cur_gen = self._current_gen()
             if cur_gen != seen_gen:
+                unduck_speech("speech discarded")
                 in_speech = False
                 silence_count = 0
                 buf.clear()
@@ -1418,6 +1444,7 @@ class VoiceBridge:
                     log.info("Endpointer: force-commit on HID press "
                              "(%d chunks ≈ %.2fs)",
                              len(speech_buf), duration_s)
+                    unduck_speech("speech committed")
                     self._enqueue_utterance(gen_at_start, pcm, sr)
                     buf = []
                     in_speech = False
@@ -1451,6 +1478,9 @@ class VoiceBridge:
                         prebuf.clear()
                     log.info("Endpointer: sound detected (rms=%.0f ≥ %g)",
                              rms, rms_threshold)
+                    if not ducked:
+                        ducked = True
+                        self._duck_acquire("speech")
                 buf.append(data)
                 levels.append(rms)
                 silence_count = 0
@@ -1479,6 +1509,7 @@ class VoiceBridge:
                     # noise never postpones auto-idle.
                     log.info("Endpointer: dropped %d-chunk burst (< min_speech_ms=%d) levels %s",
                              speech_tick, self.cfg["min_speech_ms"], level_stats())
+                    unduck_speech("burst dropped")
                     buf = []
                     in_speech = False
                 elif in_speech and silence_count >= commit_chunks:
@@ -1495,6 +1526,7 @@ class VoiceBridge:
                              "kept %d trailing silence, trimmed %d) levels %s",
                              len(speech_buf), duration_s,
                              min(keep_chunks, silence_count), trim, level_stats())
+                    unduck_speech("speech committed")
                     if self._enqueue_utterance(gen_at_start, pcm, sr):
                         self._pause_for_processing()
                     buf = []
@@ -1717,10 +1749,11 @@ class VoiceBridge:
             # Externally-supplied speech (MCP say_to_speaker) arrives as one
             # atomic item; play it as its own utterance via the same path,
             # then release the blocked caller. play_pcm() already did the
-            # unmute → duck transition before enqueuing.
+            # unmute transition before enqueuing.
             if isinstance(item, _ExternalUtterance):
                 if gen == self._current_gen():
-                    self._play_blob(item.pcm, device, sample_rate)
+                    with self._ducked("say_to_speaker"):
+                        self._play_blob(item.pcm, device, sample_rate)
                 item.done.set()
                 continue
 
@@ -1746,52 +1779,55 @@ class VoiceBridge:
                 self.recording.set()
                 self.hid.set_led(muted=False)
                 self._idle_reset_pending.set()
-                # Auto-resume is an unmute → duck (ducking tracks mute
-                # state; the player no longer ducks per-aplay).
-                self.deezer.duck()
 
-            proc = _aplay_popen(device, sample_rate, bufsize=0)
-            with self._player_lock:
-                self._player_proc = proc
-            try:
-                if not self._write_chunk(proc, item):
+            with self._ducked("reply"):
+                self._play_streamed(item, device, sample_rate)
+
+    def _play_streamed(self, item: bytes, device: str, sample_rate: int) -> None:
+        """Play one reply: `item` is its first PCM chunk, the rest is pulled
+        off `playback_q` until the end-of-utterance marker."""
+        proc = _aplay_popen(device, sample_rate, bufsize=0)
+        with self._player_lock:
+            self._player_proc = proc
+        try:
+            if not self._write_chunk(proc, item):
+                return
+            while not self.shutdown_event.is_set():
+                try:
+                    gen2, item2 = self.playback_q.get(timeout=0.2)
+                except queue.Empty:
                     continue
-                while not self.shutdown_event.is_set():
-                    try:
-                        gen2, item2 = self.playback_q.get(timeout=0.2)
-                    except queue.Empty:
-                        continue
-                    if gen2 != self._current_gen():
-                        # Hard-cancel happened mid-utterance; the proc
-                        # has likely already been killed, but break
-                        # explicitly so we close it cleanly.
-                        break
-                    if isinstance(item2, _EndOfUtterance):
-                        break
-                    if not self._write_chunk(proc, item2):
-                        break
-            finally:
-                # Close stdin and play out aplay's buffered tail without
-                # chopping it (bounded so a hung aplay can't pin the
-                # thread). See `_drain_aplay`: a fixed timeout + kill would
-                # clip the reply's tail and, via `sw_dmix`'s mixing, overlap
-                # the next utterance. Crucially, `_player_proc` stays set
-                # throughout the drain — it's only cleared below, after the
-                # wait returns — so `_is_playing()` keeps the endpointer
-                # from firing auto-idle during the audible tail of the reply.
-                _drain_aplay(proc, sample_rate, abort=self.shutdown_event)
-                # Order matters: signal the end-of-playback idle reset
-                # BEFORE clearing the player handle. The endpointer's idle
-                # check also gates on `_idle_reset_pending`, so as long as
-                # the flag is already set whenever `_player_proc` becomes
-                # None, the endpointer can never see "not playing + stale
-                # silence_count" and auto-idle the instant the reply ends.
-                # The flag is consumed on the endpointer's next tick, which
-                # zeroes `silence_count` — restarting the idle window from
-                # here (end of playback), as intended.
-                self._idle_reset_pending.set()
-                with self._player_lock:
-                    self._player_proc = None
+                if gen2 != self._current_gen():
+                    # Hard-cancel happened mid-utterance; the proc
+                    # has likely already been killed, but break
+                    # explicitly so we close it cleanly.
+                    break
+                if isinstance(item2, _EndOfUtterance):
+                    break
+                if not self._write_chunk(proc, item2):
+                    break
+        finally:
+            # Close stdin and play out aplay's buffered tail without
+            # chopping it (bounded so a hung aplay can't pin the
+            # thread). See `_drain_aplay`: a fixed timeout + kill would
+            # clip the reply's tail and, via `sw_dmix`'s mixing, overlap
+            # the next utterance. Crucially, `_player_proc` stays set
+            # throughout the drain — it's only cleared below, after the
+            # wait returns — so `_is_playing()` keeps the endpointer
+            # from firing auto-idle during the audible tail of the reply.
+            _drain_aplay(proc, sample_rate, abort=self.shutdown_event)
+            # Order matters: signal the end-of-playback idle reset
+            # BEFORE clearing the player handle. The endpointer's idle
+            # check also gates on `_idle_reset_pending`, so as long as
+            # the flag is already set whenever `_player_proc` becomes
+            # None, the endpointer can never see "not playing + stale
+            # silence_count" and auto-idle the instant the reply ends.
+            # The flag is consumed on the endpointer's next tick, which
+            # zeroes `silence_count` — restarting the idle window from
+            # here (end of playback), as intended.
+            self._idle_reset_pending.set()
+            with self._player_lock:
+                self._player_proc = None
 
     def _play_blob(self, pcm: bytes, device: str, sample_rate: int) -> None:
         """Play one complete PCM blob as a single utterance (external speech).
@@ -1827,12 +1863,6 @@ class VoiceBridge:
         # Pin deezer-connect to its configured baseline volume on boot
         # (no-op unless the plugin is enabled).
         self.deezer.apply_default_volume()
-        # Ducking now tracks mute state (duck on unmute, unduck on mute).
-        # With HID enabled the bridge boots muted, so the first duck waits
-        # for the first unmute press. In always-on mode (HID disabled) the
-        # mic boots open = unmuted, so duck immediately to match.
-        if self.recording.is_set():
-            self.deezer.duck()
         loops = [
             ("hid", self._hid_loop),
             ("recorder", self._recorder_loop),
@@ -1866,8 +1896,10 @@ class VoiceBridge:
         for t in self._threads:
             t.join(timeout=3.0)
         # Restore deezer-connect's volume if we were ducked when stop
-        # arrived (SIGTERM mid-playback). No-op when the plugin is
-        # disabled or wasn't currently ducking.
+        # arrived (SIGTERM mid-playback or mid-speech). No-op when the
+        # plugin is disabled or wasn't currently ducking.
+        with self._duck_lock:
+            self._duck_holds = 0
         self.deezer.unduck()
 
 

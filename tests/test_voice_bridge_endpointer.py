@@ -2,7 +2,7 @@
 """Tests for VoiceBridge's endpointer (sound gate), commit/idle timings,
 and the HID-press mute trigger.
 
-Three groups, exercising the three pieces of state-machine logic that
+Four groups, exercising the pieces of state-machine logic that
 matter most for end-user feel — all on synthetic audio + a stub HID,
 no PyAudio, no Jabra, no network.
 
@@ -29,6 +29,10 @@ no PyAudio, no Jabra, no network.
                                     resume — bumps gen (sheds
                                     stragglers), sets recording, LED
                                     off, clears `_auto_idled`.
+
+  4. deezer-connect ducking      — ducked from speech onset to commit
+                                    (or drop), and per playback; mute
+                                    state doesn't touch it.
 
 Run: .venv/bin/python tests/test_voice_bridge_endpointer.py
 """
@@ -614,6 +618,81 @@ class MuteTriggerTest(unittest.TestCase):
             self.assertEqual(gen_out, fresh)
         finally:
             _stop_endpointer(bridge, t)
+
+
+# ---------------------------------------------------------------------------
+# 4. deezer-connect ducking
+# ---------------------------------------------------------------------------
+class DuckingTest(unittest.TestCase):
+    """Music is ducked while someone talks: the user from the first
+    above-threshold chunk to the commit, the bridge for each playback.
+    Overlapping holds are counted, so the music only comes back when
+    both are done."""
+
+    def _bridge(self, **overrides):
+        bridge, _hid, vb = _make_bridge(_cfg(idle_timeout_ms=0, **overrides))
+        events: list[str] = []
+        bridge.deezer = mock.Mock()
+        bridge.deezer.duck.side_effect = lambda: events.append("duck")
+        bridge.deezer.unduck.side_effect = lambda: events.append("unduck")
+        return bridge, events
+
+    def test_speech_ducks_on_onset_and_unducks_at_commit(self):
+        bridge, events = self._bridge()
+        bridge.recording.set()
+        t = _start_endpointer(bridge)
+        try:
+            gen = bridge._current_gen()
+            _push(bridge, gen, [_silence_chunk()] * 3 + [_speech_chunk()])
+            self.assertTrue(_wait_until(lambda: events == ["duck"]))
+            _push(bridge, gen, [_speech_chunk()] * 3 + [_silence_chunk()])
+            time.sleep(0.2)
+            self.assertEqual(events, ["duck"], "a short pause is not a commit")
+            _push(bridge, gen, [_silence_chunk()] * 4)
+            bridge.utterance_q.get(timeout=2.0)
+            self.assertEqual(events, ["duck", "unduck"])
+        finally:
+            _stop_endpointer(bridge, t)
+
+    def test_dropped_burst_unducks(self):
+        bridge, events = self._bridge(min_speech_ms=192)
+        bridge.recording.set()
+        t = _start_endpointer(bridge)
+        try:
+            _push(bridge, bridge._current_gen(),
+                  [_speech_chunk()] * 2 + [_silence_chunk()] * 5)
+            self.assertTrue(_wait_until(lambda: events == ["duck", "unduck"]))
+            self.assertTrue(bridge.utterance_q.empty())
+        finally:
+            _stop_endpointer(bridge, t)
+
+    def test_force_commit_unducks(self):
+        bridge, events = self._bridge()
+        bridge.recording.set()
+        t = _start_endpointer(bridge)
+        try:
+            _push(bridge, bridge._current_gen(), [_speech_chunk()] * 3)
+            self.assertTrue(_wait_until(lambda: events == ["duck"]))
+            bridge._on_hid_press()
+            bridge.utterance_q.get(timeout=2.0)
+            self.assertEqual(events, ["duck", "unduck"])
+        finally:
+            _stop_endpointer(bridge, t)
+
+    def test_mute_and_resume_do_not_touch_ducking(self):
+        bridge, events = self._bridge()
+        bridge._on_hid_press()  # resume
+        bridge._on_hid_press()  # mute
+        bridge._enter_idle("test")
+        self.assertEqual(events, [])
+
+    def test_overlapping_holds_unduck_once_both_end(self):
+        bridge, events = self._bridge()
+        with bridge._ducked("reply"):
+            bridge._duck_acquire("speech")
+            bridge._duck_release("speech")
+            self.assertEqual(events, ["duck"], "reply still playing")
+        self.assertEqual(events, ["duck", "unduck"])
 
 
 if __name__ == "__main__":

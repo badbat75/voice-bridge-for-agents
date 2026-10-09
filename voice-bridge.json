@@ -5,7 +5,7 @@
   "sample_rate": 16000,
   "tts_sample_rate": 24000,
   "chunk_size": 1024,
-  "vad_rms_threshold": 10000000,
+  "vad_rms_threshold": 6000000,
   "min_speech_ms": 200,
   "pre_speech_keep_ms": 250,
   "silence_timeout_ms": 1000,
