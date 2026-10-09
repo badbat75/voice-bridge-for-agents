@@ -247,11 +247,25 @@ def _bridge(activation: str):
         "sample_rate": _SR, "chunk_size": 1024, "tts_sample_rate": 24000,
         "output_device": "null", "hid_mute_enabled": True,
         "activation": activation,
-        "wake_word": {"acks": ["Dimmi."], "sleep_acks": ["A dopo."], "ack_providers": []},
+        "wake_word": {"acks": ["Dimmi."], "sleep_acks": ["A dopo."]},
     }
     hid = _RecordingHid()
     bridge = vb.VoiceBridge(cfg, stt=mock.Mock(), tts=mock.Mock(), hid=hid, deezer=mock.Mock())
     return bridge, hid, vb
+
+
+class SpokenTagsTest(unittest.TestCase):
+    def _bank(self, **cfg):
+        return wake_word.AckBank(cfg, [], [], "/nonexistent", lambda p: None)
+
+    def test_v3_keeps_tone_tags(self):
+        bank = self._bank(elevenlabs_model="eleven_v3")
+        self.assertEqual(bank._spoken("elevenlabs", "[warm] Dimmi."), "[warm] Dimmi.")
+
+    def test_other_voices_drop_tone_tags(self):
+        bank = self._bank(elevenlabs_model="eleven_multilingual_v2")
+        self.assertEqual(bank._spoken("elevenlabs", "[warm] Dimmi."), "Dimmi.")
+        self.assertEqual(bank._spoken("deepgram", "Ok, [soft] a dopo."), "Ok, a dopo.")
 
 
 class WakeTransitionsTest(unittest.TestCase):

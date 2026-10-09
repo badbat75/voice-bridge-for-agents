@@ -18,9 +18,10 @@ which runs them through:
     take in testing). A hit is a normalized substring match.
 
 `AckBank` holds short spoken clips picked at random — `acks` played on a hit,
-`sleep_acks` played when the bridge dozes off — each phrase synthesized with
-every TTS provider in `ack_providers` and cached on disk as raw PCM so later
-boots make no API calls. The cache is keyed to the voice: one folder per
+`sleep_acks` played when the bridge dozes off — each phrase synthesized in the
+reply voice (the configured `tts_provider`) and cached on disk as raw PCM so
+later boots make no API calls. Phrases may carry eleven_v3 tone tags like
+`[warm]`; they're stripped for any other voice, which would read them aloud. The cache is keyed to the voice: one folder per
 `<kind>/<provider>-<voice>-<model>`, and a clip's file name hashes the text
 with the rate, language and voice settings. Changing any of them re-downloads
 the affected clips and prunes the ones no voice uses any more.
@@ -55,7 +56,6 @@ DEFAULTS = {
     "max_segment_ms": 3000,
     "acks": [],
     "sleep_acks": [],
-    "ack_providers": ["elevenlabs", "deepgram"],
     "ack_cache_dir": "~/.cache/voice-bridge/acks",
 }
 
@@ -253,6 +253,13 @@ class AckBank:
         if removed:
             log.info("Wake acks (%s): pruned %d stale clips", self.kind, removed)
 
+    def _spoken(self, provider: str, text: str) -> str:
+        """Drop `[tone]` tags unless the voice is eleven_v3, which acts them."""
+        model = str(self.cfg.get("elevenlabs_model") or "")
+        if provider == "elevenlabs" and "v3" in model:
+            return text
+        return " ".join(re.sub(r"\[[^\]]*\]", " ", text).split())
+
     def _load_or_synthesize(self, provider: str, text: str, path: str, tts_box: list) -> bytes | None:
         if os.path.exists(path) and os.path.getsize(path) > 0:
             with open(path, "rb") as f:
@@ -260,7 +267,7 @@ class AckBank:
         try:
             if not tts_box:
                 tts_box.append(self._build_tts(provider))
-            pcm = tts_box[0].synthesize(text)
+            pcm = tts_box[0].synthesize(self._spoken(provider, text))
         except Exception as exc:
             log.warning("Wake acks (%s): %s failed on %r: %s", self.kind, provider, text, exc)
             return None

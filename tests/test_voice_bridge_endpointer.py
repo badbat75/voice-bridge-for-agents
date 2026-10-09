@@ -215,6 +215,59 @@ class SoundGateTest(unittest.TestCase):
         finally:
             _stop_endpointer(bridge, t)
 
+    def test_commit_pauses_mic_until_turn_ends(self):
+        """A commit stops recording while the agent processes it; a turn
+        that ends with nothing to play resumes the mic."""
+        cfg = _cfg(idle_timeout_ms=0)
+        bridge, hid, _vb = _make_bridge(cfg)
+        bridge.recording.set()
+        t = _start_endpointer(bridge)
+        try:
+            _push(bridge, bridge._current_gen(), [_speech_chunk()] * 4 + [_silence_chunk()] * 5)
+            self.assertTrue(_wait_until(lambda: not bridge.utterance_q.empty()))
+            self.assertTrue(_wait_until(lambda: bridge._processing.is_set()))
+            self.assertFalse(bridge.recording.is_set(), "mic must pause while processing")
+            self.assertTrue(bridge._auto_idled.is_set(), "player must resume on playback")
+            self.assertEqual(hid.set_led_calls, [], "pausing is not a mute")
+            bridge.utterance_q.get_nowait()
+            bridge._resume_after_processing()
+            self.assertTrue(bridge.recording.is_set())
+            self.assertFalse(bridge._processing.is_set())
+        finally:
+            _stop_endpointer(bridge, t)
+
+    def test_press_while_processing_mutes_without_gen_bump(self):
+        cfg = _cfg(idle_timeout_ms=0)
+        bridge, hid, _vb = _make_bridge(cfg)
+        bridge.recording.set()
+        bridge._pause_for_processing()
+        gen = bridge._current_gen()
+        bridge._on_hid_press()
+        self.assertEqual(bridge._current_gen(), gen, "the reply must still play")
+        self.assertFalse(bridge.recording.is_set())
+        self.assertFalse(bridge._auto_idled.is_set(), "player must not un-mute")
+        self.assertEqual(hid.set_led_calls, [True])
+
+    def test_burst_shorter_than_min_speech_is_dropped(self):
+        """`min_speech_ms`: a 2-chunk click (128 ms) under a 192 ms floor
+        never reaches the utterance queue; a 4-chunk burst still does."""
+        cfg = _cfg(idle_timeout_ms=0, min_speech_ms=192)
+        bridge, _hid, _vb = _make_bridge(cfg)
+        bridge.recording.set()
+        t = _start_endpointer(bridge)
+        try:
+            gen = bridge._current_gen()
+            _push(bridge, gen, [_speech_chunk()] * 2 + [_silence_chunk()] * 5)
+            time.sleep(0.4)
+            self.assertTrue(bridge.utterance_q.empty(), "short burst must be dropped")
+            _push(bridge, gen, [_speech_chunk()] * 4 + [_silence_chunk()] * 5)
+            try:
+                bridge.utterance_q.get(timeout=2.0)
+            except queue.Empty:
+                self.fail("a burst at/above min_speech_ms must still commit")
+        finally:
+            _stop_endpointer(bridge, t)
+
     def test_below_threshold_chunk_does_not_count_as_speech(self):
         """A small-amplitude sine (amp=100) sits well below the default
         1e6 threshold. The endpointer must treat it as silence — i.e.
@@ -319,7 +372,7 @@ class ActivationTimingsTest(unittest.TestCase):
         trailing silence already exceeded `idle_timeout_ms` if
         silence_timeout_ms ≤ idle_timeout_ms)."""
         cfg = _cfg(silence_timeout_ms=128, idle_timeout_ms=320)
-        bridge, _hid, _vb = _make_bridge(cfg)
+        bridge, hid, _vb = _make_bridge(cfg)
         bridge.recording.set()
         t = _start_endpointer(bridge)
         try:
@@ -329,10 +382,12 @@ class ActivationTimingsTest(unittest.TestCase):
                 bridge.utterance_q.get(timeout=2.0)
             except queue.Empty:
                 self.fail("expected commit before idle could fire")
-            # Right after commit: still recording (idle starts NOW, not
-            # at the speech onset 200 ms ago).
-            self.assertTrue(bridge.recording.is_set(),
-                            "must still be recording immediately after commit")
+            # Right after commit the mic is paused for processing — not
+            # idled: no firmware mute (idle starts after the turn, not at
+            # the speech onset 200 ms ago).
+            self.assertTrue(_wait_until(bridge._processing.is_set))
+            self.assertFalse(bridge._wake_armed.is_set())
+            self.assertEqual(hid.set_led_calls, [], "commit must not idle/mute")
         finally:
             _stop_endpointer(bridge, t)
 

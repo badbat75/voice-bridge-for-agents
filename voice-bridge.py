@@ -258,6 +258,11 @@ def load_config() -> dict:
     # word-boundary cue without bloating each utterance with the full
     # detection window.
     cfg["silence_keep_ms"] = int(cfg.get("silence_keep_ms", 500))
+    # Minimum above-threshold audio for an utterance to reach STT. A key
+    # click, a bump or a speaker echo crosses the threshold for one or two
+    # chunks; real speech stays above it far longer. Shorter bursts are
+    # dropped at commit time (no STT call, no idle-timer reset). 0 = off.
+    cfg["min_speech_ms"] = int(cfg.get("min_speech_ms", 0))
     # Pre-roll: how much audio captured *before* the threshold-crossing
     # to prepend to the committed PCM. Helps STT catch the very first
     # phoneme, which often dips below the VAD threshold (the leading
@@ -265,15 +270,6 @@ def load_config() -> dict:
     # keeps a rolling window of the last `pre_speech_keep_ms` of
     # below-threshold audio and pastes it in at speech onset.
     cfg["pre_speech_keep_ms"] = int(cfg.get("pre_speech_keep_ms", 100))
-
-    # When utterances pile up in `utterance_q` while a previous turn is
-    # still being processed (STT → gateway → TTS in flight — often seconds
-    # while waiting on the gateway), the worker coalesces the whole backlog
-    # into a SINGLE turn instead of firing one gateway interaction per
-    # pause-separated phrase. `utterance_merge_gap_ms` is the silence padded
-    # between merged segments so STT keeps them as distinct phrases; set to
-    # 0 for a hard concatenation.
-    cfg["utterance_merge_gap_ms"] = int(cfg.get("utterance_merge_gap_ms", 300))
 
     # TTS streaming strategy. `http_sentence` (default) buffers gateway
     # deltas to sentence boundaries and calls the HTTP streaming endpoint
@@ -360,6 +356,8 @@ def _drain_aplay_stderr(stream) -> None:
             line = raw.decode("utf-8", errors="replace").rstrip()
             if line:
                 log.warning("aplay: %s", line)
+    except ValueError:
+        pass  # the stream was closed under us when aplay was reaped
     finally:
         with contextlib.suppress(Exception):
             stream.close()
@@ -926,6 +924,10 @@ class VoiceBridge:
         # flag stays clear and the player respects the press — playback
         # happens but the mic stays muted afterwards.
         self._auto_idled = threading.Event()
+        # Set from an utterance commit until the reply starts playing (or the
+        # turn ends without one): the mic is not recorded while the agent
+        # is processing, so nothing piles up behind the turn.
+        self._processing = threading.Event()
 
         # The active aplay process, if any. Held under `_player_lock`
         # so a hard-cancel from the HID thread can `kill()` it without
@@ -956,11 +958,13 @@ class VoiceBridge:
             def build_tts(name):
                 return _build_voice_provider("tts", {**cfg, "tts_provider": name})
 
+            # Acks speak in the reply voice: the configured tts_provider only.
             w = self._wake_cfg
+            voice = [cfg.get("tts_provider", "elevenlabs")]
             self._wake_acks = wake_word.AckBank(
-                cfg, w["acks"], w["ack_providers"], w["ack_cache_dir"], build_tts, kind="wake")
+                cfg, w["acks"], voice, w["ack_cache_dir"], build_tts, kind="wake")
             self._sleep_acks = wake_word.AckBank(
-                cfg, w["sleep_acks"], w["ack_providers"], w["ack_cache_dir"], build_tts, kind="sleep")
+                cfg, w["sleep_acks"], voice, w["ack_cache_dir"], build_tts, kind="sleep")
             if not self.recording.is_set():
                 self._wake_armed.set()
 
@@ -1075,6 +1079,16 @@ class VoiceBridge:
             self.deezer.unduck()
 
     def _on_hid_press(self) -> None:
+        if self._processing.is_set():
+            # Mic is only paused for the agent; a press here means "mute".
+            # No gen bump, so the reply still plays — the mic stays muted.
+            log.info("HID press while processing: mute (reply still plays)")
+            self._processing.clear()
+            self._auto_idled.clear()
+            self._wake_armed.clear()
+            self.hid.set_led(muted=True)
+            self.deezer.unduck()
+            return
         if self.recording.is_set():
             log.info("HID press: commit-and-mute (in-flight pipeline continues)")
             # Soft mute: tell the endpointer to commit any in-progress
@@ -1104,6 +1118,7 @@ class VoiceBridge:
         # in-progress speech buffer the endpointer might have under
         # the previous gen) are shed by downstream stages.
         self._auto_idled.clear()
+        self._processing.clear()
         self._wake_armed.clear()
         self._bump_gen()
         self.recording.set()
@@ -1165,6 +1180,7 @@ class VoiceBridge:
             self.recording.set()
             self.hid.set_led(muted=False)
         self._auto_idled.clear()
+        self._processing.clear()
         self.deezer.duck()
 
         # One atomic item under the current gen → serializes behind any reply
@@ -1335,6 +1351,7 @@ class VoiceBridge:
         chunk_ms = (chunk / sr) * 1000.0
         rms_threshold = float(self.cfg["vad_rms_threshold"])
         commit_chunks = max(1, int(self.cfg["silence_timeout_ms"] / chunk_ms))
+        min_speech_chunks = round(self.cfg.get("min_speech_ms", 0) / chunk_ms)
         keep_chunks = max(0, int(self.cfg.get("silence_keep_ms", 500) / chunk_ms))
         pre_chunks = max(0, int(self.cfg.get("pre_speech_keep_ms", 100) / chunk_ms))
         prebuf: "deque[bytes] | None" = (
@@ -1349,6 +1366,14 @@ class VoiceBridge:
         buf: list[bytes] = []
         gen_at_start = seen_gen
         speech_tick = 0
+        levels: list[float] = []  # per-chunk energy of the current utterance
+
+        def level_stats() -> str:
+            if not levels:
+                return "n/a"
+            lv = sorted(levels)
+            pick = lambda q: lv[min(len(lv) - 1, int(q * len(lv)))]
+            return f"p50={pick(0.5):.3g} p90={pick(0.9):.3g} max={lv[-1]:.3g}"
 
         while not self.shutdown_event.is_set():
             # Reset on resume: a gen bump means the user pressed HID
@@ -1393,7 +1418,7 @@ class VoiceBridge:
                     log.info("Endpointer: force-commit on HID press "
                              "(%d chunks ≈ %.2fs)",
                              len(speech_buf), duration_s)
-                    self.utterance_q.put((gen_at_start, pcm, sr))
+                    self._enqueue_utterance(gen_at_start, pcm, sr)
                     buf = []
                     in_speech = False
                     silence_count = 0
@@ -1420,12 +1445,14 @@ class VoiceBridge:
                     in_speech = True
                     gen_at_start = gen
                     speech_tick = 0
+                    levels = []
                     if prebuf:
                         buf.extend(prebuf)
                         prebuf.clear()
                     log.info("Endpointer: sound detected (rms=%.0f ≥ %g)",
                              rms, rms_threshold)
                 buf.append(data)
+                levels.append(rms)
                 silence_count = 0
                 speech_tick += 1
                 if speech_tick % 32 == 0:
@@ -1434,6 +1461,8 @@ class VoiceBridge:
             else:
                 if in_speech:
                     buf.append(data)
+                    if silence_count < commit_chunks:
+                        levels.append(rms)
                     if silence_count == 0:
                         log.info("Endpointer: silence onset (rms=%.0f < %g, "
                                  "need %d chunks ≈ %dms to commit)",
@@ -1444,7 +1473,15 @@ class VoiceBridge:
                     prebuf.append(data)
                 silence_count += 1
 
-                if in_speech and silence_count >= commit_chunks:
+                if in_speech and silence_count >= commit_chunks and speech_tick < min_speech_chunks:
+                    # Too short to be speech (click, bump, echo blip):
+                    # drop it before STT. silence_count keeps running, so
+                    # noise never postpones auto-idle.
+                    log.info("Endpointer: dropped %d-chunk burst (< min_speech_ms=%d) levels %s",
+                             speech_tick, self.cfg["min_speech_ms"], level_stats())
+                    buf = []
+                    in_speech = False
+                elif in_speech and silence_count >= commit_chunks:
                     # Keep only `keep_chunks` of the trailing silence
                     # in the committed audio: the rest of the detection
                     # window is trimmed so STT doesn't see a full
@@ -1455,10 +1492,11 @@ class VoiceBridge:
                     pcm = b"".join(speech_buf)
                     duration_s = len(speech_buf) * chunk_ms / 1000.0
                     log.info("Endpointer: commit (%d chunks ≈ %.2fs, "
-                             "kept %d trailing silence, trimmed %d)",
+                             "kept %d trailing silence, trimmed %d) levels %s",
                              len(speech_buf), duration_s,
-                             min(keep_chunks, silence_count), trim)
-                    self.utterance_q.put((gen_at_start, pcm, sr))
+                             min(keep_chunks, silence_count), trim, level_stats())
+                    if self._enqueue_utterance(gen_at_start, pcm, sr):
+                        self._pause_for_processing()
                     buf = []
                     in_speech = False
                     # Treat commit as a "transaction" boundary: the
@@ -1488,6 +1526,45 @@ class VoiceBridge:
                     silence_count = 0
                     buf = []
 
+    def _enqueue_utterance(self, gen: int, pcm: bytes, sr: int) -> bool:
+        """Hand a committed utterance to the worker, holding at most ONE
+        message in line behind the turn in flight. While the worker is busy
+        (gateway or playback), the first utterance waits; anything said after
+        it is dropped — otherwise interjections, side talk and speaker echo
+        pile into a muddled turn."""
+        if self._worker_busy.is_set() and not self.utterance_q.empty():
+            log.info("Endpointer: one message already queued, dropping %.2fs utterance",
+                     len(pcm) / (sr * 2))
+            return False
+        self.utterance_q.put((gen, pcm, sr))
+        return True
+
+    def _pause_for_processing(self) -> None:
+        """Stop recording while the committed utterance is processed.
+
+        The player resumes the mic when the reply starts (via `_auto_idled`,
+        same as an auto-idle), and the worker resumes it if the turn ends
+        without a reply (noise, empty STT, gateway error). The LED and
+        firmware mute are left alone: this is not a mute, just not listening.
+        """
+        if not self.recording.is_set():
+            return
+        log.info("Processing: mic paused until the reply starts")
+        self.recording.clear()
+        self._drain_queue(self.audio_q)
+        self._processing.set()
+        self._auto_idled.set()
+
+    def _resume_after_processing(self) -> None:
+        """Turn ended with nothing to play: listen again."""
+        if not self._processing.is_set():
+            return
+        self._processing.clear()
+        self._auto_idled.clear()
+        log.info("Processing: no reply, resuming mic")
+        self._idle_reset_pending.set()
+        self.recording.set()
+
     def _drain_utterances(self, gen: int, into: list[bytes]) -> int:
         """Pull every currently-queued same-gen utterance onto `into`.
 
@@ -1506,21 +1583,14 @@ class VoiceBridge:
             added += 1
         return added
 
-    def _join_utterances(self, segments: list[bytes], sr: int) -> bytes:
-        """Concatenate PCM segments into one blob, padded between them with
-        `utterance_merge_gap_ms` of silence so STT keeps them as distinct
-        phrases rather than running words together."""
-        if len(segments) == 1:
-            return segments[0]
-        gap_ms = int(self.cfg.get("utterance_merge_gap_ms", 300))
-        gap = b"\x00\x00" * int(sr * gap_ms / 1000) if gap_ms > 0 else b""
-        return gap.join(segments)
-
     def _worker_loop(self) -> None:
         while not self.shutdown_event.is_set():
             # Every `continue` below lands back here, so busy spans exactly
             # pick-up → reply handed to the player (or turn dropped).
             self._worker_busy.clear()
+            if (self._processing.is_set() and self.utterance_q.empty()
+                    and self.playback_q.empty() and not self._is_playing()):
+                self._resume_after_processing()
             try:
                 gen, pcm, sr = self.utterance_q.get(timeout=0.2)
             except queue.Empty:
@@ -1529,29 +1599,25 @@ class VoiceBridge:
             if gen != self._current_gen():
                 continue
 
-            # Batch everything the user says while the PREVIOUS reply is
-            # still being delivered (queued for the player or actively
-            # playing) into a single turn. The worker processes one turn at
-            # a time and the gateway can take many seconds; without this,
-            # each phrase spoken over the reply becomes its own gateway
-            # round-trip and the replies cascade (one answer per
-            # interjection). Well-behaved turn-taking pays no latency: when
-            # no reply is in flight the wait loop doesn't run and the
-            # utterance is sent immediately.
-            segments = [pcm]
-            self._drain_utterances(gen, segments)
+            # Only ONE message waits behind the reply being delivered: hold
+            # this utterance until the previous reply has finished playing,
+            # and drop anything else said meanwhile (the endpointer already
+            # refuses a second one while we're busy; this catches the rest).
+            # Well-behaved turn-taking pays no latency: when no reply is in
+            # flight the wait loop doesn't run and the utterance is sent
+            # immediately.
+            extra: list[bytes] = []
+            self._drain_utterances(gen, extra)
             while not self.playback_q.empty() or self._is_playing():
                 if self.shutdown_event.is_set() or gen != self._current_gen():
                     break
                 self.shutdown_event.wait(0.1)
-                self._drain_utterances(gen, segments)
+                self._drain_utterances(gen, extra)
             if gen != self._current_gen():
                 continue
-            pcm = self._join_utterances(segments, sr)
-            if len(segments) > 1:
-                log.info("Worker: batched %d utterances into one turn "
-                         "(%d bytes ≈ %.2fs)",
-                         len(segments), len(pcm), len(pcm) / (sr * 2))
+            if extra:
+                log.info("Worker: dropped %d extra utterance(s) queued behind the reply",
+                         len(extra))
 
             log.info("Worker: STT (%d bytes ≈ %.2fs)", len(pcm), len(pcm) / (sr * 2))
             t_stt = time.monotonic()
@@ -1676,6 +1742,7 @@ class VoiceBridge:
                 log.info("Player: un-idling for playback (auto-idle, "
                          "resume mic + LED off)")
                 self._auto_idled.clear()
+                self._processing.clear()
                 self.recording.set()
                 self.hid.set_led(muted=False)
                 self._idle_reset_pending.set()
