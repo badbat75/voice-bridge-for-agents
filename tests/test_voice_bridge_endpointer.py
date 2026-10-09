@@ -157,6 +157,7 @@ def _start_endpointer(bridge) -> threading.Thread:
 
 def _stop_endpointer(bridge, t: threading.Thread) -> None:
     bridge.shutdown_event.set()
+    bridge._wake_endpointer()  # it blocks on audio_q now
     t.join(timeout=1.5)
 
 
@@ -362,11 +363,11 @@ class ActivationTimingsTest(unittest.TestCase):
         """If the player still has aplay running, idle must NOT fire —
         the endpointer would otherwise close the mic mid-reply on a
         long TTS playback. We simulate an active player by parking a
-        Mock in `_player_proc`."""
+        Mock in `player.proc`."""
         cfg = _cfg(idle_timeout_ms=128)  # 2 chunks
         bridge, _hid, _vb = _make_bridge(cfg)
         _recording(bridge)
-        bridge._player_proc = mock.Mock()  # _is_playing() → True
+        bridge.player.proc = mock.Mock()  # _is_playing() → True
         t = _start_endpointer(bridge)
         try:
             _push(bridge, bridge._current_gen(), [_silence_chunk()] * 12)

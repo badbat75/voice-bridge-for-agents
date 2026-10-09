@@ -340,10 +340,12 @@ class HidMuteMonitorEngageTest(unittest.TestCase):
     def test_engage_returns_false_on_write_failure(self) -> None:
         # A closed fd makes os.write raise — _engage must catch it and
         # report False rather than crashing the start() path.
+        # The monitor is built first: it opens a wake pipe of its own, which
+        # would otherwise reuse the closed fd numbers.
+        mon = HidMuteMonitor()
         r, w = os.pipe()
         os.close(w)
         os.close(r)
-        mon = HidMuteMonitor()
         self.assertFalse(mon._engage(w))
 
 

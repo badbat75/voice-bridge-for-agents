@@ -1,0 +1,17 @@
+[Unit]
+Description=Voice Bridge MCP voice tools (STT/TTS, Telegram voice notes, speaker)
+# Socket-activated by voice-bridge-mcp.socket — not enabled on its own.
+# `say_to_speaker` plays through the running voice-bridge.service via its
+# speaker socket; the other tools work without it.
+Requires=voice-bridge-mcp.socket
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Services/voice-bridge
+ExecStart=%h/Services/voice-bridge/.venv/bin/python %h/Services/voice-bridge/mcp_voice_server.py
+# Exits 0 on its own when idle; systemd restarts it on the next connection.
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10

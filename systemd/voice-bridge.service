@@ -18,8 +18,9 @@ Type=simple
 # %h is systemd's specifier for the running user's home dir (user unit).
 # Edit the Services/voice-bridge suffix if your checkout lives elsewhere.
 WorkingDirectory=%h/Services/voice-bridge
-# Diagnostic: surface aplay's stderr (underrun!!! lines) to the journal.
-Environment=VOICE_BRIDGE_DEBUG_AUDIO=1
+# Diagnostic, off by default (a drain thread per aplay + journal noise):
+# uncomment to surface aplay's stderr (underrun!!! lines) to the journal.
+#Environment=VOICE_BRIDGE_DEBUG_AUDIO=1
 ExecStart=%h/Services/voice-bridge/.venv/bin/python %h/Services/voice-bridge/voice-bridge.py
 Restart=on-failure
 RestartSec=5

@@ -244,7 +244,7 @@ class ThinkingCueTest(unittest.TestCase):
         bridge.playback_q.put((bridge._current_gen(), VB._ExternalUtterance(
             b"\x01\x01", threading.Event(), label="thinking-tick", duck=False, cue=True)))
         with mock.patch.object(VB, "_aplay_popen", side_effect=_FakeAplay):
-            t = threading.Thread(target=bridge._player_loop, daemon=True)
+            t = threading.Thread(target=bridge.player.run, daemon=True)
             t.start()
             self.assertTrue(_wait_until(lambda: bridge.playback_q.empty() and not bridge._is_playing()))
             time.sleep(0.05)
@@ -328,7 +328,7 @@ class PrebufferTest(unittest.TestCase):
         for _ in range(4):
             bridge.playback_q.put((gen, b"\x01" * 2000))
         bridge.playback_q.put((gen, VB._END_OF_UTTERANCE))
-        self.assertTrue(bridge._play_streamed(b"\x01" * 1000, "null", _TTS_RATE, gen))
+        self.assertTrue(bridge.player.play_streamed(b"\x01" * 1000, "null", _TTS_RATE, gen))
         writes = _FakeAplay.instances[0].writes
         self.assertGreaterEqual(len(writes[0]), 4800)
         self.assertEqual(sum(map(len, writes)), 9000, "no PCM lost")
@@ -338,7 +338,7 @@ class PrebufferTest(unittest.TestCase):
         gen = bridge._current_gen()
         bridge.playback_q.put((gen, b"\x02" * 100))
         bridge.playback_q.put((gen, VB._END_OF_UTTERANCE))
-        self.assertTrue(bridge._play_streamed(b"\x02" * 100, "null", _TTS_RATE, gen))
+        self.assertTrue(bridge.player.play_streamed(b"\x02" * 100, "null", _TTS_RATE, gen))
         self.assertEqual(_FakeAplay.instances[0].writes, [b"\x02" * 200])
 
     def test_slow_stream_starts_after_cap(self):
@@ -346,7 +346,7 @@ class PrebufferTest(unittest.TestCase):
         gen = bridge._current_gen()
         t0 = time.monotonic()
         threading.Timer(1.6, lambda: bridge.playback_q.put((gen, VB._END_OF_UTTERANCE))).start()
-        bridge._play_streamed(b"\x03" * 10, "null", _TTS_RATE, gen)
+        bridge.player.play_streamed(b"\x03" * 10, "null", _TTS_RATE, gen)
         self.assertEqual(_FakeAplay.instances[0].writes[0], b"\x03" * 10)
         self.assertLess(time.monotonic() - t0, 3.0)
 
@@ -357,9 +357,9 @@ class PrebufferTest(unittest.TestCase):
         bridge.playback_q.put((gen, ext))
         bridge.playback_q.put((gen, b"\x01" * 4))
         bridge.playback_q.put((gen, VB._END_OF_UTTERANCE))
-        bridge._play_streamed(b"\x01" * 4, "null", _TTS_RATE, gen)
+        bridge.player.play_streamed(b"\x01" * 4, "null", _TTS_RATE, gen)
         self.assertEqual(_FakeAplay.instances[0].writes, [b"\x01" * 4, b"\x01" * 4])
-        self.assertEqual(list(bridge._player_backlog), [(gen, ext)])
+        self.assertEqual(list(bridge.player.backlog), [(gen, ext)])
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +370,7 @@ class BargeInTest(unittest.TestCase):
         bridge, hid = _bridge()
         _recording(bridge)  # player un-idled for the reply
         proc = _FakeAplay()
-        bridge._player_proc = proc
+        bridge.player.proc = proc
         gen0 = bridge._current_gen()
         ext = VB._ExternalUtterance(b"\x01", threading.Event())
         bridge.playback_q.put((gen0, b"rest of reply"))
@@ -391,7 +391,7 @@ class BargeInTest(unittest.TestCase):
 
     def test_press_while_muted_and_reply_plays_also_stops(self):
         bridge, hid = _bridge()
-        bridge._player_proc = _FakeAplay()
+        bridge.player.proc = _FakeAplay()
         bridge._on_hid_press()
         self.assertTrue(bridge.recording.is_set())
         self.assertEqual(hid.leds[-1], False)
@@ -399,7 +399,7 @@ class BargeInTest(unittest.TestCase):
     def test_press_while_processing_still_mutes(self):
         bridge, hid = _bridge()
         bridge._set_state(VB.State.PROCESSING, auto_idled=True)
-        bridge._player_proc = _FakeAplay()  # a thinking tick is audible
+        bridge.player.proc = _FakeAplay()  # a thinking tick is audible
         gen0 = bridge._current_gen()
         bridge._on_hid_press()
         self.assertEqual(bridge._current_gen(), gen0)
@@ -415,7 +415,7 @@ class BargeInTest(unittest.TestCase):
             return p
 
         with mock.patch.object(VB, "_aplay_popen", side_effect=popen):
-            t = threading.Thread(target=bridge._player_loop, daemon=True)
+            t = threading.Thread(target=bridge.player.run, daemon=True)
             t.start()
             gen = bridge._current_gen()
             bridge.playback_q.put((gen, b"\x01" * 100))

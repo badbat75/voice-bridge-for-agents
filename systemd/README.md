@@ -1,6 +1,6 @@
 # Deploying the voice-bridge as a (user) systemd service
 
-Two files in this directory:
+Four files in this directory:
 
 - `voice-bridge.service` — the unit. Runs `voice-bridge.py`
   from the in-tree `.venv`. **This is a user unit**: it lives under
@@ -9,6 +9,13 @@ Two files in this directory:
   running user's home), so the unit resolves to `~/MCP/voice-bridge`.
   Edit the `MCP/voice-bridge` suffix in `WorkingDirectory=` and
   `ExecStart=` if your checkout lives elsewhere under `$HOME`.
+- `voice-bridge-mcp.socket` + `voice-bridge-mcp.service` — the MCP
+  voice tools (`mcp_voice_server.py`). systemd listens on
+  `127.0.0.1:9080`; the first connection starts the service, which exits
+  after `mcp_server.idle_exit_s` (default 600 s) without requests, so the
+  ~50 MB of mcp/uvicorn/pydantic is only resident while the tools are in
+  use. Only the `.socket` is enabled. After editing either:
+  `systemctl --user daemon-reload && systemctl --user restart voice-bridge-mcp.socket`.
 - `99-voice-bridge.rules` — udev rule that grants the
   `plugdev` group read/write on the Jabra SPEAK 510's `/dev/hidraw*`
   node. The rule does NOT trigger the service — the bridge handles

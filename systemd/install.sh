@@ -21,6 +21,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(dirname "$HERE")"
 
 SERVICE_NAME="voice-bridge.service"
+# The MCP voice tools: a socket-activated pair (the .socket is enabled, the
+# .service is started by it on the first connection).
+MCP_SOCKET_NAME="voice-bridge-mcp.socket"
+MCP_SERVICE_NAME="voice-bridge-mcp.service"
 RULES_NAME="99-voice-bridge.rules"
 SERVICE_SRC="$HERE/$SERVICE_NAME"
 RULES_SRC="$HERE/$RULES_NAME"
@@ -69,9 +73,9 @@ cleanup_legacy_system_install() {
 uninstall() {
     echo "Uninstalling $SERVICE_NAME (user)"
     ensure_user_session_env
-    systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
-    systemctl --user disable "$SERVICE_NAME" 2>/dev/null || true
-    rm -f "$SERVICE_DST"
+    systemctl --user stop "$SERVICE_NAME" "$MCP_SOCKET_NAME" "$MCP_SERVICE_NAME" 2>/dev/null || true
+    systemctl --user disable "$SERVICE_NAME" "$MCP_SOCKET_NAME" 2>/dev/null || true
+    rm -f "$SERVICE_DST" "$USER_UNIT_DIR/$MCP_SOCKET_NAME" "$USER_UNIT_DIR/$MCP_SERVICE_NAME"
     sudo rm -f "$RULES_DST"
     systemctl --user daemon-reload
     sudo udevadm control --reload-rules
@@ -101,7 +105,7 @@ show_status() {
     fi
     echo
     echo "=== systemctl --user status ==="
-    systemctl --user status "$SERVICE_NAME" --no-pager 2>&1 || true
+    systemctl --user status "$SERVICE_NAME" "$MCP_SOCKET_NAME" "$MCP_SERVICE_NAME" --no-pager 2>&1 || true
     echo
     echo "=== last 20 log lines ==="
     journalctl --user -u "$SERVICE_NAME" -n 20 --no-pager 2>&1 || true
@@ -158,7 +162,7 @@ install_unit() {
 
     echo "Linking $SERVICE_NAME via systemctl --user link"
     mkdir -p "$USER_UNIT_DIR"
-    systemctl --user link "$SERVICE_SRC"
+    systemctl --user link "$SERVICE_SRC" "$HERE/$MCP_SOCKET_NAME" "$HERE/$MCP_SERVICE_NAME"
 
     echo "Linking $RULES_NAME"
     sudo ln -sf "$RULES_SRC" "$RULES_DST"
@@ -175,6 +179,7 @@ install_unit() {
 
     echo "Enabling and starting the unit"
     systemctl --user enable --now "$SERVICE_NAME"
+    systemctl --user enable --now "$MCP_SOCKET_NAME"
 
     echo
     show_status

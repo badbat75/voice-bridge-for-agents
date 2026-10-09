@@ -15,20 +15,20 @@ the 409 only applies to long-polling. Requires `telegram_bot_token` in
 voice-bridge.secrets.json.
 
 A `say_to_speaker` tool is the speaker-side analogue of `say_to_telegram`:
-it synthesizes text and plays it aloud on the bridge's ALSA output device
-(`output_device`) via aplay, reusing the bridge's own playback helpers.
-Output mixes through sw_dmix, so it coexists with whatever the bridge is
-playing; it needs `aplay` on PATH and `audio`-group access.
+it synthesizes text here and hands the PCM to the running bridge over its
+local speaker socket (`speaker_socket.py`), so it plays through the bridge's
+player exactly like a reply.
 
 Design notes:
-- **Embedded in the bridge process.** This module is a library. The bridge's
-  `main()` calls `configure(cfg, stt=..., tts=..., bridge=...)` then
-  `serve_background()` to run the MCP HTTP server in a daemon thread inside
-  the bridge process, so one process and one config load share the same
-  STT/TTS provider instances between the voice client and these tools.
-  `configure()` performs all setup; the import itself only defines the tools
-  and the `FastMCP` app. Toggle it with `mcp_server.enabled` in
-  `voice-bridge.json`.
+- **Its own process, started on demand.** `voice-bridge-mcp.socket` makes
+  systemd listen on the MCP port; the first connection starts
+  `voice-bridge-mcp.service` (this module's `main()`), which loads the same
+  `voice-bridge.json` and builds its own providers. After
+  `mcp_server.idle_exit_s` (default 600) with no request in flight it exits,
+  and systemd starts it again on the next call (~4–5 s cold start on the Pi
+  3B+, well inside zeroclaw's 60 s tool timeout). The bridge no longer carries
+  mcp/uvicorn/pydantic (~45 MB) all day. The server is `stateless_http`, so a
+  client's session survives the restarts.
 - **All container <-> PCM conversion goes through ffmpeg, uniformly.** STT
   decodes whatever the client sent to S16LE mono PCM, then calls the
   provider's `transcribe(pcm, rate)`. TTS calls `synthesize(text)` (which
@@ -43,14 +43,15 @@ Design notes:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -75,11 +76,9 @@ _OUTPUT_FORMATS = {
 
 
 # Runtime state, populated by `configure()`. Kept module-global because the
-# `@mcp.tool()` functions read them at call time. The bridge process calls
-# `configure(cfg, stt=..., tts=..., bridge=...)` to inject the same config,
-# provider instances, and the running VoiceBridge (so `say_to_speaker` can
-# play through its player), then `serve_background()` — one process, one
-# config load, shared providers (see the bridge's main()).
+# `@mcp.tool()` functions read them at call time. `main()` calls
+# `configure(cfg, stt=..., tts=..., bridge=...)` with this process's
+# providers and a `SpeakerClient` (anything with the bridge's `play_pcm`).
 _bridge = None
 _cfg: dict = {}
 _stt = None
@@ -100,26 +99,21 @@ _TG_CHAT_ID = ""
 _OUT_DIR = ""
 
 # The FastMCP app is created at import time (the `@mcp.tool()` decorators
-# below need it); `serve_background()` passes host/port to uvicorn from the
-# injected config.
-mcp = FastMCP("voice-bridge-voice")
+# below need it). Stateless: every request stands alone, so the idle exit
+# never strands a client's session id.
+mcp = FastMCP("voice-bridge-voice", stateless_http=True)
 
 
 def configure(cfg: dict, *, stt, tts, bridge) -> "FastMCP":
-    """Resolve the injected config + providers into the module globals the
-    tools read. Called once by the bridge's `main()` before
-    `serve_background()`.
-
-    The bridge injects the same `cfg` and `stt`/`tts` instances it uses, plus
-    the running `VoiceBridge` (whose `play_pcm()` `say_to_speaker` uses to
-    speak through the bridge's player). Returns the `mcp` app.
-    """
+    """Resolve the config + providers into the module globals the tools
+    read. `bridge` is anything with `play_pcm(pcm, text=...)` — in
+    production a `speaker_socket.SpeakerClient`. Returns the `mcp` app."""
     global _bridge, _cfg, _stt, _tts, _TTS_RATE
     global _HOST, _PORT, _TG_TOKEN, _TG_CHAT_ID, _OUT_DIR
 
-    # The providers are safe to share with FastMCP's threadpool-dispatched
-    # tool calls: ElevenLabsVoice reuses one thread-safe httpx-backed SDK
-    # client, DeepgramVoice builds a fresh async client per call.
+    # The providers are safe under FastMCP's threadpool-dispatched tool
+    # calls: ElevenLabsVoice reuses one thread-safe httpx-backed SDK client,
+    # DeepgramVoice builds a fresh async client per call.
     _bridge = bridge
     _cfg = cfg
     _stt = stt
@@ -142,27 +136,64 @@ def configure(cfg: dict, *, stt, tts, bridge) -> "FastMCP":
     return mcp
 
 
-def serve_background() -> threading.Thread:
-    """Run the MCP HTTP server in a daemon thread inside the bridge process.
+class _IdleTracker:
+    """ASGI wrapper counting HTTP requests in flight and the time the last
+    one ended, for the idle exit."""
 
-    uvicorn installs SIGINT/SIGTERM handlers, which only work in the main
-    thread — so we disable them here and let the host process (the bridge)
-    own the signals. The server runs its own asyncio loop inside the thread.
-    Returns the started thread. Call `configure()` first.
-    """
-    import uvicorn  # lazy: only needed when actually serving
+    def __init__(self, app) -> None:
+        self.app = app
+        self.active = 0
+        self.last = time.monotonic()
 
-    app = mcp.streamable_http_app()
-    config = uvicorn.Config(app, host=_HOST, port=_PORT, log_level="info")
-    server = uvicorn.Server(config)
-    server.install_signal_handlers = lambda: None  # bridge owns the signals
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        self.active += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.active -= 1
+            self.last = time.monotonic()
 
-    def _run() -> None:
-        asyncio.run(server.serve())
 
-    t = threading.Thread(target=_run, name="mcp-http", daemon=True)
-    t.start()
-    return t
+def _exit_when_idle(server, tracker: "_IdleTracker", idle_s: float) -> None:
+    while not server.should_exit:
+        time.sleep(min(10.0, idle_s))
+        if tracker.active == 0 and time.monotonic() - tracker.last >= idle_s:
+            log.info("idle for %.0fs: exiting (systemd restarts on the next call)", idle_s)
+            server.should_exit = True
+
+
+def _systemd_socket() -> "socket.socket | None":
+    """The listening socket systemd passed (socket activation), if any."""
+    if os.environ.get("LISTEN_PID") != str(os.getpid()) or os.environ.get("LISTEN_FDS") != "1":
+        return None
+    return socket.socket(fileno=3)
+
+
+def main() -> None:
+    """Standalone entry point (`voice-bridge-mcp.service`)."""
+    import uvicorn
+
+    import speaker_socket
+    from bridge_config import _build_voice_provider, load_config
+
+    logging.basicConfig(level=logging.INFO,
+                        format="[voice-bridge-mcp] %(levelname)s %(message)s")
+    cfg = load_config()
+    configure(cfg, stt=_build_voice_provider("stt", cfg), tts=_build_voice_provider("tts", cfg),
+              bridge=speaker_socket.SpeakerClient(cfg["speaker_socket"]))
+    tracker = _IdleTracker(mcp.streamable_http_app())
+    server = uvicorn.Server(uvicorn.Config(tracker, host=_HOST, port=_PORT, log_level="warning"))
+    idle_s = float((cfg.get("mcp_server") or {}).get("idle_exit_s", 600))
+    if idle_s > 0:
+        threading.Thread(target=_exit_when_idle, args=(server, tracker, idle_s),
+                         name="mcp-idle", daemon=True).start()
+    sock = _systemd_socket()
+    log.info("serving %s (idle exit %s)",
+             "on the systemd socket" if sock else f"http://{_HOST}:{_PORT}",
+             f"{idle_s:.0f}s" if idle_s > 0 else "off")
+    server.run(sockets=[sock] if sock else None)
 
 
 def _decode_to_pcm(path: str, rate: int = _STT_RATE) -> bytes:
@@ -515,7 +546,4 @@ def say_to_speaker(text: str) -> dict:
 
 
 if __name__ == "__main__":
-    raise SystemExit(
-        "The MCP server runs inside the bridge process. Set "
-        "mcp_server.enabled: true in voice-bridge.json and start voice-bridge."
-    )
+    main()

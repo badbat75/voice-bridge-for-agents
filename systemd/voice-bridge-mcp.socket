@@ -1,0 +1,13 @@
+[Unit]
+Description=Voice Bridge MCP voice tools — listening socket (starts the server on demand)
+# systemd holds the MCP port; the first connection starts
+# voice-bridge-mcp.service, which exits again after `mcp_server.idle_exit_s`
+# without requests. Keep the address in step with `mcp_server.host/port` in
+# voice-bridge.json and the client's URL (zeroclaw: http://127.0.0.1:9080/mcp).
+
+[Socket]
+ListenStream=127.0.0.1:9080
+Accept=no
+
+[Install]
+WantedBy=sockets.target

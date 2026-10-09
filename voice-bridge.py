@@ -30,20 +30,22 @@ import functools
 import logging
 import queue
 import signal
-import subprocess
 import sys
 import threading
 import time
-from collections import deque
 from typing import Iterable, Iterator
 
 import pyaudio
 
 import endpointer
+import speaker_socket
 import wake_word
 from deezer_connect_plugin import DeezerConnectPlugin
 from endpointer import Endpointer
 from jabra_hid import HidMuteMonitor
+from player import END_OF_UTTERANCE as _END_OF_UTTERANCE  # noqa: F401  (re-exported)
+from player import ExternalUtterance as _ExternalUtterance
+from player import Player
 from stt_compare import SttComparer
 
 # The helpers live in their own modules; they are imported by name here so
@@ -131,41 +133,13 @@ def _transition(method):
     return locked
 
 
-# Sentinel pushed into `playback_q` after each utterance's audio chunks
-# so the player thread knows to close the current aplay process and
-# wait for the next utterance. Plain None would conflict with empty-
-# chunk filtering elsewhere; an explicit object is unambiguous.
-class _EndOfUtterance:
-    pass
-
-
-_END_OF_UTTERANCE = _EndOfUtterance()
-# Returned by `_next_reply_item` when the reply was cut by a gen change.
-_STALE = object()
-
 # Most idle audio `wake_q` holds; Whistle normally drains it in well under 1 s.
 _WAKE_Q_SECONDS = 10.0
 
-
-# A whole externally-supplied utterance (the MCP `say_to_speaker` tool),
-# enqueued as ONE atomic item rather than chunk+marker so it can never
-# interleave with the worker's streamed reply chunks on `playback_q`. The
-# player plays `pcm` end-to-end as its own utterance and fires `done` when
-# the playback (and no-clip drain) finishes, releasing a blocked caller.
-class _ExternalUtterance:
-    """`duck`: lower the music while it plays. `cue`: a thinking cue (tick
-    or "un attimo") — it doesn't count as a reply for the idle window.
-    `question`: the speech expects an answer (see `_after_external`)."""
-
-    def __init__(self, pcm: bytes, done: "threading.Event", *,
-                 label: str = "say_to_speaker", duck: bool = True,
-                 cue: bool = False, question: bool = False) -> None:
-        self.pcm = pcm
-        self.done = done
-        self.label = label
-        self.duck = duck
-        self.cue = cue
-        self.question = question
+# How long the recorder keeps the mic stream open (reading and discarding)
+# after it stops being needed, so a quick mute→resume doesn't pay a reopen.
+# PROCESSING keeps it open regardless: the reply reopens the mic seconds later.
+_MIC_HOLD_S = 5.0
 
 
 class _ThinkingCue:
@@ -254,7 +228,7 @@ class VoiceBridge:
       - `_endpointer_loop` RMS VAD; emits utterances on `silence_timeout_ms`
                            pauses, triggers auto-idle on `idle_timeout_ms`
       - `_worker_loop`     STT → gateway SSE → TTS streaming
-      - `_player_loop`     one aplay subprocess per utterance
+      - `player.run`       one aplay subprocess per utterance (player.py)
 
     Pipeline items carry the generation (`_gen`) they were produced
     under; downstream stages drop anything whose generation has been
@@ -285,12 +259,10 @@ class VoiceBridge:
 
         # `audio_q` is unbounded: the endpointer is O(N) over a 1024-
         # sample chunk per ~64 ms — easily faster than the recorder, so
-        # the queue should stay near-empty in practice. The other queues
-        # are also unbounded; backpressure is naturally bounded by an
-        # utterance's duration (~10s of audio = ~250KB at 24kHz).
+        # the queue should stay near-empty in practice. `utterance_q` is
+        # bounded in practice by `_enqueue_utterance` (one waiting turn).
         self.audio_q: "queue.Queue[tuple[int, bytes]]" = queue.Queue()
         self.utterance_q: "queue.Queue[tuple[int, bytes, int]]" = queue.Queue()
-        self.playback_q: "queue.Queue[tuple[int, bytes | _EndOfUtterance]]" = queue.Queue()
 
         self.shutdown_event = threading.Event()
         # The bridge's mode; only `_set_state` writes it. With HID enabled
@@ -303,8 +275,13 @@ class VoiceBridge:
         # (set below). `recording` is derived: it gates the recorder thread.
         self._state = State.RECORDING if not cfg.get("hid_mute_enabled") else State.MUTED
         self.recording = threading.Event()
+        # Derived: set whenever the recorder has a reader for the mic
+        # (`recording` or `_wake_armed`). The recorder parks on it while the
+        # stream is closed, instead of polling both.
+        self._mic_wanted = threading.Event()
         if self._state is State.RECORDING:
             self.recording.set()
+            self._mic_wanted.set()
 
         self._gen = 0
         self._gen_lock = threading.Lock()
@@ -332,12 +309,6 @@ class VoiceBridge:
         # the user explicitly muted via HID it is clear and the player
         # respects the press — playback happens, the mic stays muted.
         self._auto_idled = False
-
-        # The active aplay process, if any. Held under `_player_lock`
-        # so a hard-cancel from the HID thread can `kill()` it without
-        # racing the player thread's setup/teardown.
-        self._player_proc: subprocess.Popen | None = None
-        self._player_lock = threading.Lock()
 
         # Wake-word activation. `_wake_armed` (derived: set exactly in
         # IDLE_LISTENING) = idle but listening for the wake phrase: the
@@ -371,6 +342,7 @@ class VoiceBridge:
             if self._state is State.MUTED:
                 self._state = State.IDLE_LISTENING
                 self._wake_armed.set()
+                self._mic_wanted.set()
 
         # Spoken "un attimo" clips for the thinking cue (any activation mode).
         self._thinking_acks = None
@@ -395,11 +367,20 @@ class VoiceBridge:
         # Set after a say_to_speaker announcement that asked nothing: the
         # next auto-idle goes back to sleep without a goodbye or tone.
         self._quiet_idle = False
-        # Pick-up time of the turn in flight, for the timing log.
-        self._turn_t0: float | None = None
-        # External utterances that arrived while a streamed reply was
-        # playing; the player plays them right after it.
-        self._player_backlog: "deque[tuple[int, object]]" = deque()
+        # Everything the speaker plays on the bridge's behalf (player.py).
+        # `popen` resolves `_aplay_popen` through this module at call time,
+        # so tests can patch it here.
+        self.player = Player(
+            cfg, self.shutdown_event,
+            current_gen=self._current_gen,
+            ducked=self._ducked,
+            on_reply_start=self._unidle_for_reply,
+            on_reply_done=self._after_reply,
+            on_external_done=self._after_external,
+            on_audio_end=self._idle_reset_pending.set,
+            popen=lambda *a, **kw: _aplay_popen(*a, **kw),
+        )
+        self.playback_q = self.player.q
 
         # Shadow STT comparison (`stt_compare.enabled`): the remote STT stays
         # authoritative; Whistle's take on the same PCM is only logged.
@@ -431,18 +412,10 @@ class VoiceBridge:
             return n
 
     def _kill_player(self) -> None:
-        with self._player_lock:
-            proc = self._player_proc
-        if proc is None:
-            return
-        try:
-            proc.kill()
-        except Exception as exc:
-            log.warning("kill aplay failed: %s", exc)
+        self.player.kill()
 
     def _is_playing(self) -> bool:
-        with self._player_lock:
-            return self._player_proc is not None
+        return self.player.is_playing()
 
     # -- state transitions ---------------------------------------------
     # -- deezer ducking --------------------------------------------------
@@ -515,6 +488,7 @@ class VoiceBridge:
         (self._wake_armed.set if armed else self._wake_armed.clear)()
         if not records:
             self.recording.clear()
+        (self._mic_wanted.set if records or armed else self._mic_wanted.clear)()
         if muted != old_muted:
             self.hid.set_led(muted=muted)
 
@@ -540,7 +514,7 @@ class VoiceBridge:
             return
         log.info("Idle (%s): closing mic, in-flight pipeline continues", source)
         # auto_idled: the player un-idles when the in-flight reply starts
-        # playing — see `_player_loop`. In wake mode idle-but-listening:
+        # playing — see `Player.run`. In wake mode idle-but-listening:
         # the firmware mic must stay open or the wake loop would hear only
         # zeros, so the LED stays off too.
         self._set_state(State.IDLE_LISTENING if self.wake_mode else State.MUTED,
@@ -588,20 +562,11 @@ class VoiceBridge:
 
     def _reply_playing(self) -> bool:
         """A reply (or other player output) is audible or queued to be."""
-        return self._is_playing() or not self.playback_q.empty() or bool(self._player_backlog)
+        return self.player.busy()
 
     def _drain_playback(self) -> None:
         """Empty the player queues, releasing any blocked `play_pcm` caller."""
-        items = list(self._player_backlog)
-        self._player_backlog.clear()
-        while True:
-            try:
-                items.append(self.playback_q.get_nowait())
-            except queue.Empty:
-                break
-        for _gen, item in items:
-            if isinstance(item, _ExternalUtterance):
-                item.done.set()
+        self.player.drain()
 
     def _stop_reply(self) -> None:
         """HID press during playback: cut the reply and listen right away.
@@ -637,6 +602,7 @@ class VoiceBridge:
             # No queue drain, no gen bump, no aplay kill — those would
             # discard the very thing the user pressed mute to send.
             self._force_commit.set()
+            self._wake_endpointer()
             # An explicit mute is a privacy mute in wake mode too: firmware
             # silenced, wake word off, only the button resumes.
             self._set_state(State.MUTED)
@@ -756,11 +722,21 @@ class VoiceBridge:
 
     # -- thread loops --------------------------------------------------
     def _hid_loop(self) -> None:
-        # Blocks on the monitor's press event; the timeout only bounds how
-        # long a shutdown can go unnoticed.
+        # Blocks on the monitor's press event; `stop()` interrupts it, so the
+        # timeout is only a safety net.
         while not self.shutdown_event.is_set():
-            if self.hid.wait_press(0.5):
+            if self.hid.wait_press(30.0) and not self.shutdown_event.is_set():
                 self._on_hid_press()
+
+    # Loops block on their queue; this bounds how long one can miss a
+    # shutdown that sent no wake token (tests set `shutdown_event` directly).
+    _SAFETY_TIMEOUT_S = 1.0
+
+    def _wake_endpointer(self) -> None:
+        """A stale-gen token: wakes the endpointer's blocking get so it sees
+        a force-commit / shutdown with no mic chunks flowing. Only the
+        endpointer thread drains `audio_q`, so the token can't be lost."""
+        self.audio_q.put((-1, b""))
 
     def _recorder_loop(self) -> None:
         pa = pyaudio.PyAudio()
@@ -792,10 +768,24 @@ class VoiceBridge:
                     log.warning("Recorder: PyAudio rebuild failed: %s — retry in 1s", exc)
             return None
 
+        # When the mic last stopped being needed (None while it is).
+        unneeded_since: float | None = None
         try:
             while not self.shutdown_event.is_set():
                 listening = self.recording.is_set() or self._wake_armed.is_set()
-                if not listening:
+                if listening:
+                    unneeded_since = None
+                elif unneeded_since is None:
+                    unneeded_since = time.monotonic()
+                # Keep an open stream through the pause for processing and a
+                # short grace after that: every turn used to close the mic at
+                # commit and reopen it when the reply started (~3 reopens per
+                # turn). Chunks read meanwhile are discarded below; a MUTED
+                # device delivers firmware silence anyway.
+                hold = stream is not None and not listening and (
+                    self._state is State.PROCESSING
+                    or time.monotonic() - unneeded_since < _MIC_HOLD_S)
+                if not listening and not hold:
                     if stream is not None:
                         try:
                             stream.close()
@@ -803,9 +793,8 @@ class VoiceBridge:
                             pass
                         stream = None
                         log.info("Recorder: stream closed")
-                    # Park on `recording`. A timeout lets us notice
-                    # shutdown even if no toggle ever arrives.
-                    self.recording.wait(0.2)
+                    # Park until someone needs the mic (`stop()` sets it too).
+                    self._mic_wanted.wait(self._SAFETY_TIMEOUT_S * 5)
                     continue
 
                 if stream is None:
@@ -851,6 +840,7 @@ class VoiceBridge:
                     self.audio_q.put((self._current_gen(), data))
                 elif self._wake_armed.is_set():
                     self._put_wake_chunk(data)
+                # else: held open while not needed — discarded.
         finally:
             if stream is not None:
                 try:
@@ -896,7 +886,7 @@ class VoiceBridge:
         gate = wake_word.SpeechGate(self.cfg["sample_rate"], self.cfg["chunk_size"], self._wake_cfg)
         while not self.shutdown_event.is_set():
             try:
-                chunk = self.wake_q.get(timeout=0.2)
+                chunk = self.wake_q.get(timeout=self._SAFETY_TIMEOUT_S)
             except queue.Empty:
                 continue
             if not self._wake_armed.is_set() or self._speaking_ack.is_set():
@@ -982,7 +972,7 @@ class VoiceBridge:
                     self._enqueue_utterance(cur_gen, result[1], sr)
 
             try:
-                gen, data = self.audio_q.get(timeout=0.2)
+                gen, data = self.audio_q.get(timeout=self._SAFETY_TIMEOUT_S)
             except queue.Empty:
                 continue
             if gen != cur_gen:
@@ -1008,7 +998,7 @@ class VoiceBridge:
                     and not self._idle_reset_pending.is_set()):
                 # The `_idle_reset_pending` guard closes a race at the tail
                 # of a reply: the player sets it just before clearing
-                # `_player_proc`, so "not playing" with a pending reset means
+                # `player.proc`, so "not playing" with a pending reset means
                 # the next tick zeroes the stale playback-long silence first.
                 self._enter_idle(source=f"silence>{idle_ms}ms")
                 ep.silence = 0
@@ -1089,8 +1079,12 @@ class VoiceBridge:
             if (self._state is State.PROCESSING and self.utterance_q.empty()
                     and not self._reply_playing()):
                 self._resume_after_processing()
+            # While PROCESSING the loop head above has to re-check when the
+            # player goes quiet (a cue was still playing), so poll; otherwise
+            # block.
+            timeout = 0.2 if self._state is State.PROCESSING else self._SAFETY_TIMEOUT_S
             try:
-                gen, pcm, sr = self.utterance_q.get(timeout=0.2)
+                gen, pcm, sr = self.utterance_q.get(timeout=timeout)
             except queue.Empty:
                 continue
             self._worker_busy.set()
@@ -1117,7 +1111,7 @@ class VoiceBridge:
                          extra)
 
             t0 = time.monotonic()
-            self._turn_t0 = t0
+            self.player.turn_t0 = t0
             timing: dict[str, float] = {}
             # Dead-air feedback from pick-up until the first reply audio.
             cue = _ThinkingCue(self, gen).start()
@@ -1229,12 +1223,6 @@ class VoiceBridge:
                  " ".join(f"{k}={v:.2f}" for k, v in timing.items()) or "n/a",
                  cue.cues_played)
 
-    def _next_playback(self, timeout: float):
-        """Next player item: deferred external utterances first, then the queue."""
-        if self._player_backlog:
-            return self._player_backlog.popleft()
-        return self.playback_q.get(timeout=timeout)
-
     def _set_idle_window(self, key: str) -> None:
         """Put the idle window named by config `key` in force (any of the
         `idle_*_ms` keys); a missing key falls back to `idle_timeout_ms`."""
@@ -1268,175 +1256,6 @@ class VoiceBridge:
         if not self._replies_since_resume:
             self._quiet_idle = True
 
-    def _player_loop(self) -> None:
-        device = self.cfg["output_device"]
-        sample_rate = self.cfg["tts_sample_rate"]
-        while not self.shutdown_event.is_set():
-            try:
-                gen, item = self._next_playback(timeout=0.2)
-            except queue.Empty:
-                continue
-            # Externally-supplied speech (MCP say_to_speaker) and thinking
-            # cues arrive as one atomic item; play it as its own utterance
-            # via the same path, then release the blocked caller.
-            # play_pcm() already did the unmute transition before enqueuing.
-            if isinstance(item, _ExternalUtterance):
-                if gen == self._current_gen():
-                    ctx = self._ducked(item.label) if item.duck else contextlib.nullcontext()
-                    with ctx:
-                        self._play_blob(item.pcm, device, sample_rate)
-                    if gen == self._current_gen() and not item.cue:  # not cut by a barge-in
-                        self._after_external(item.question)
-                item.done.set()
-                continue
-
-            # Skip end-of-utterance markers that arrive with no
-            # preceding audio (e.g. worker bailed before producing any
-            # PCM), and stale-gen anything.
-            if isinstance(item, _EndOfUtterance) or gen != self._current_gen():
-                continue
-
-            # If the bridge auto-idled while this turn was still being
-            # processed (worker → TTS), the device is currently muted
-            # and the mic is closed. Resume recording before playing the
-            # reply so the user can talk back the moment it ends; reset
-            # the idle silence counter so the next idle window measures
-            # from end-of-playback. Only fires for *auto*-idle — if the
-            # user explicitly pressed HID to mute, `_auto_idled` is
-            # clear and we leave the mic muted (the press wins).
-            self._unidle_for_reply()
-
-            with self._ducked("reply"):
-                if self._play_streamed(item, device, sample_rate, gen):
-                    self._after_reply()
-
-    def _next_reply_item(self, gen: int, timeout: float):
-        """Next item of the reply streaming under `gen`: PCM bytes,
-        `_END_OF_UTTERANCE`, `_STALE` (cut by a gen change) or None (nothing
-        yet). External utterances met meanwhile are deferred to the backlog
-        (played right after the reply); stale ones release their caller."""
-        try:
-            gen2, item = self.playback_q.get(timeout=timeout)
-        except queue.Empty:
-            return None
-        if gen2 != gen or gen2 != self._current_gen():
-            if isinstance(item, _ExternalUtterance):
-                item.done.set()
-            return _STALE
-        if isinstance(item, _ExternalUtterance):
-            self._player_backlog.append((gen2, item))
-            return None
-        return item
-
-    def _prebuffer(self, first: bytes, gen: int, sample_rate: int) -> "tuple[list[bytes], bool, bool]":
-        """Collect `playback_prebuffer_ms` of PCM before the first aplay
-        write. ElevenLabs v3 often sends one chunk and then stalls ~0.5 s;
-        writing that chunk alone makes aplay start and underrun (click).
-        Waits at most prebuffer + 1 s, so a slow stream still starts.
-
-        Returns (chunks, ended, stale): `ended` when the end-of-utterance
-        marker was reached, `stale` when the gen changed meanwhile."""
-        ms = int(self.cfg.get("playback_prebuffer_ms", 0))
-        chunks = [first]
-        if ms <= 0:
-            return chunks, False, False
-        want = sample_rate * 2 * ms // 1000
-        have = len(first)
-        deadline = time.monotonic() + ms / 1000.0 + 1.0
-        while have < want and not self.shutdown_event.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            item = self._next_reply_item(gen, min(0.05, remaining))
-            if item is None:
-                continue
-            if item is _STALE:
-                return chunks, False, True
-            if item is _END_OF_UTTERANCE:
-                return chunks, True, False
-            chunks.append(item)
-            have += len(item)
-        return chunks, False, False
-
-    def _play_streamed(self, item: bytes, device: str, sample_rate: int,
-                       gen: int | None = None) -> bool:
-        """Play one reply: `item` is its first PCM chunk, the rest is pulled
-        off `playback_q` until the end-of-utterance marker. Returns True when
-        the reply played to its end (not cut by a stale gen / barge-in)."""
-        if gen is None:
-            gen = self._current_gen()
-        chunks, ended, stale = self._prebuffer(item, gen, sample_rate)
-        if stale:
-            return False
-        completed = False
-        with self._aplay_session(device, sample_rate) as proc:
-            if self._turn_t0 is not None:
-                log.info("Turn: first audio %.2fs after pick-up", time.monotonic() - self._turn_t0)
-                self._turn_t0 = None
-            if not self._write_chunk(proc, b"".join(chunks)):
-                return False
-            if ended:
-                return True
-            while not self.shutdown_event.is_set():
-                item = self._next_reply_item(gen, 0.2)
-                if item is None:
-                    continue
-                if item is _STALE:
-                    # Barge-in mid-utterance: aplay has likely been killed
-                    # already; break so it is closed cleanly.
-                    break
-                if item is _END_OF_UTTERANCE:
-                    completed = True
-                    break
-                if not self._write_chunk(proc, item):
-                    break
-        return completed and gen == self._current_gen()
-
-    def _play_blob(self, pcm: bytes, device: str, sample_rate: int) -> None:
-        """Play one complete PCM blob as a single utterance (external
-        speech, thinking cues) — same aplay session as a streamed reply."""
-        with self._aplay_session(device, sample_rate) as proc:
-            self._write_chunk(proc, pcm)
-
-    @contextlib.contextmanager
-    def _aplay_session(self, device: str, sample_rate: int):
-        """One aplay for one utterance, registered as `_player_proc`.
-
-        While registered, `_is_playing()` is true, so the endpointer can't
-        auto-idle and a barge-in can `_kill_player()` it. On exit the tail is
-        played out without chopping it (bounded so a hung aplay can't pin
-        the thread — see `_drain_aplay`: a fixed timeout + kill would clip
-        the reply and, via `sw_dmix`'s mixing, overlap the next utterance).
-        `_player_proc` stays set throughout the drain, so the audible tail
-        still counts as playing.
-
-        Order matters at the end: the idle reset is signalled BEFORE the
-        handle is cleared. The endpointer's idle check also gates on
-        `_idle_reset_pending`, so whenever `_player_proc` becomes None the
-        flag is already set and the endpointer can never see "not playing +
-        stale silence_count" and auto-idle the instant the reply ends; its
-        next tick zeroes `silence_count`, restarting the idle window here."""
-        proc = _aplay_popen(device, sample_rate, bufsize=0)
-        with self._player_lock:
-            self._player_proc = proc
-        try:
-            yield proc
-        finally:
-            _drain_aplay(proc, sample_rate, abort=self.shutdown_event)
-            self._idle_reset_pending.set()
-            with self._player_lock:
-                self._player_proc = None
-
-    @staticmethod
-    def _write_chunk(proc: subprocess.Popen, chunk: bytes) -> bool:
-        if not chunk:
-            return True
-        try:
-            proc.stdin.write(chunk)
-            return True
-        except BrokenPipeError:
-            return False
-
     # -- lifecycle -----------------------------------------------------
     def start(self) -> None:
         # Pin deezer-connect to its configured baseline volume on boot
@@ -1450,7 +1269,7 @@ class VoiceBridge:
             ("recorder", self._recorder_loop),
             ("endpointer", self._endpointer_loop),
             ("worker", self._worker_loop),
-            ("player", self._player_loop),
+            ("player", self.player.run),
         ]
         if self.wake_mode:
             # Boot idle-but-listening: firmware mic open (the HID monitor
@@ -1471,9 +1290,14 @@ class VoiceBridge:
 
     def stop(self) -> None:
         self.shutdown_event.set()
-        # Wake any thread parked on `recording.wait()` so it notices
-        # shutdown immediately instead of waiting out its timeout.
+        # Wake every parked thread so it notices shutdown at once.
         self.recording.set()
+        self._mic_wanted.set()
+        self._wake_endpointer()
+        self.player.wake()
+        interrupt = getattr(self.hid, "interrupt", None)
+        if interrupt is not None:
+            interrupt()
         # Kill the active aplay so the player loop's wait returns
         # without hitting the 2s timeout.
         self._kill_player()
@@ -1555,27 +1379,20 @@ def main() -> None:
     else:
         log.info("Ready — listening (always-on mic, HID button disabled)")
 
-    # Serve the MCP voice tools from inside this process when
-    # `mcp_server.enabled` is true, sharing this process's config and the
-    # same provider instances. Best-effort: a failure to start the MCP server
-    # is caught and logged so the always-on voice client keeps running.
+    # The MCP voice server is its own socket-activated unit
+    # (voice-bridge-mcp.socket); its `say_to_speaker` reaches this process's
+    # player through the local speaker socket. Best-effort: the voice client
+    # keeps running without it.
     if (cfg.get("mcp_server") or {}).get("enabled"):
         try:
-            import mcp_voice_server
-            mcp_voice_server.configure(cfg, stt=stt, tts=tts, bridge=bridge)
-            mcp_voice_server.serve_background()
-            log.info("MCP server: http://%s:%d",
-                     mcp_voice_server._HOST, mcp_voice_server._PORT)
+            speaker_socket.serve(cfg["speaker_socket"], bridge.play_pcm)
         except Exception:
-            log.exception(
-                "MCP server failed to start; voice client continues"
-            )
+            log.exception("Speaker socket failed to start; voice client continues")
 
     # Block here until SIGTERM/SIGINT. Worker threads do all the work;
     # main is only around to own the signal handlers and the cleanup.
     try:
-        while not bridge.shutdown_event.wait(1.0):
-            pass
+        bridge.shutdown_event.wait()  # the signal handler sets it
     finally:
         bridge.stop()
         hid.stop()

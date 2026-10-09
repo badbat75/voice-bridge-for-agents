@@ -61,9 +61,36 @@ log = logging.getLogger(__name__)
 # and the thread returns immediately.
 _RECONNECT_BACKOFF_S = 2.0
 # Upper bound on one `select()` wait for a report while the device is
-# attached. A report wakes it at once; the timeout only bounds how long
-# `stop()` (and a stuck fd) can go unnoticed.
-_READ_IDLE_S = 0.5
+# attached. A report wakes it at once, and so does `_shutdown.set()` (it
+# writes to a self-pipe the select also watches), so this is only a safety
+# net for a stuck fd — not a polling interval.
+_READ_IDLE_S = 30.0
+
+
+class _WakingEvent(threading.Event):
+    """An Event whose `set()` also makes a pipe readable, so a `select()`
+    can sleep on the device and still wake the moment shutdown is asked."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rfd, self._wfd = os.pipe()
+        os.set_blocking(self.rfd, False)
+        os.set_blocking(self._wfd, False)
+
+    def set(self) -> None:
+        super().set()
+        try:
+            os.write(self._wfd, b"x")
+        except OSError:
+            pass  # pipe full: it is readable already
+
+    def clear(self) -> None:
+        super().clear()
+        try:
+            while os.read(self.rfd, 64):
+                pass
+        except OSError:
+            pass
 
 
 class HidMuteMonitor:
@@ -89,7 +116,7 @@ class HidMuteMonitor:
         self._unmute_event = threading.Event()
         # Set by stop() to wake the poll thread out of any blocking wait
         # (read-idle sleep or reconnect backoff) and tear it down.
-        self._shutdown = threading.Event()
+        self._shutdown = _WakingEvent()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._device: str | None = None
@@ -113,6 +140,11 @@ class HidMuteMonitor:
             self._unmute_event.clear()
             return True
         return False
+
+    def interrupt(self) -> None:
+        """Wake a `wait_press()` caller without a press (bridge shutdown);
+        the caller checks its own shutdown flag before acting."""
+        self._unmute_event.set()
 
     @staticmethod
     def _find_device() -> str | None:
@@ -246,9 +278,10 @@ class HidMuteMonitor:
                 # Sleep in the kernel until a report arrives. An unplug
                 # makes the fd readable too (POLLHUP/POLLERR), so the read
                 # below sees the error and the reconnect path runs.
-                ready, _, _ = select.select([self._fd], [], [], _READ_IDLE_S)
-                if not ready:
-                    continue
+                ready, _, _ = select.select([self._fd, self._shutdown.rfd], [], [],
+                                            _READ_IDLE_S)
+                if self._fd not in ready:
+                    continue  # timeout, or shutdown (checked at the loop top)
                 n = os.read(self._fd, 64)
             except BlockingIOError:
                 continue  # spurious wakeup on the non-blocking fd

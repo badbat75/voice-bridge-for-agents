@@ -199,8 +199,22 @@ def load_whistle() -> None:
         if _whistle is None:
             # cactus-needle reports usage to its vendor unless told not to.
             os.environ.setdefault("NEEDLE_TELEMETRY", "0")
+            # Offline first: with the weights cached, needle still made three
+            # Hugging Face round-trips per boot (a download-counter ping and
+            # a config check), and without network the wake word waited on
+            # their timeouts. Only a cold cache needs the Hub: retry online
+            # (huggingface_hub reads the flag per call, so flipping it works).
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
             from needle import Whistle
-            _whistle = Whistle()
+            try:
+                _whistle = Whistle()
+            except Exception as exc:
+                if os.environ.get("HF_HUB_OFFLINE") != "1":
+                    raise
+                log.warning("Whistle: offline load failed (%s) — retrying online", exc)
+                import huggingface_hub.constants as hf_constants
+                hf_constants.HF_HUB_OFFLINE = False
+                _whistle = Whistle()
 
 
 _S16_SCALE = 1.0 / 32768.0

@@ -13,6 +13,7 @@ import json
 import os
 import re
 
+import speaker_socket
 import wake_word
 from deepgram_voice import DeepgramVoice
 from elevenlabs_voice import VALID_TTS_STREAM_MODES, ElevenLabsVoice
@@ -125,6 +126,11 @@ def load_config() -> dict:
     cfg["output_volume_percent"] = int(ov.get("percent", 100))
 
     cfg["voice_model"] = cfg.get("voice_model") or "openclaw"
+
+    # Unix socket the bridge serves `play_pcm` on for the MCP server's
+    # `say_to_speaker` (see speaker_socket.py). Read by both processes.
+    mcp_cfg = cfg.get("mcp_server") or {}
+    cfg["speaker_socket"] = mcp_cfg.get("speaker_socket") or speaker_socket.default_path()
 
     # Which gateway protocol the worker speaks. `openclaw` (default) posts
     # to `/v1/chat/completions` with OpenAI-style SSE; `zeroclaw` posts to

@@ -72,7 +72,7 @@
   "stt_provider": "elevenlabs",
   "tts_provider": "elevenlabs",
   "stt_compare": {
-    "enabled": true,
+    "enabled": false,
     "language": "it",
     "log_path": "data/stt-compare.tsv"
   },
@@ -128,6 +128,7 @@
   "mcp_server": {
     "enabled": true,
     "host": "127.0.0.1",
-    "port": 9080
+    "port": 9080,
+    "idle_exit_s": 600
   }
 }
