@@ -211,6 +211,35 @@ class ThinkingCueTest(unittest.TestCase):
         self.assertEqual([it.pcm for it in items], [b"\x07\x07"])
         self.assertEqual(items[0].label, "thinking-ack")
 
+    def test_spoken_cue_after_a_wait_even_without_tool_call_then_still_phrases(self):
+        bridge, cue = self._cue(delay_ms=10_000, repeat_ms=10_000,
+                                speak_after_ms=60, still_after_ms=80)
+        bridge._thinking_acks = mock.Mock()
+        bridge._thinking_acks.pick.return_value = ("elevenlabs", "Un attimo.", b"\x07\x07")
+        bridge._still_acks = mock.Mock()
+        bridge._still_acks.pick.return_value = ("elevenlabs", "Ci sto ancora lavorando.", b"\x08\x08")
+        cue.start()
+        self.assertTrue(_wait_until(lambda: cue.cues_played >= 3, 1.0))
+        cue.on_event("tool_call", {})      # already spoke: no second "Un attimo"
+        time.sleep(0.03)
+        cue.stop()
+        items = [it for _g, it in _drain_q(bridge.playback_q)]
+        self.assertEqual([it.pcm for it in items[:3]], [b"\x07\x07", b"\x08\x08", b"\x08\x08"])
+        self.assertEqual([it.label for it in items[:2]], ["thinking-ack", "thinking-still"])
+        self.assertEqual(bridge._thinking_acks.pick.call_count, 1)
+
+    def test_tool_call_speaks_before_the_wait_and_resets_it(self):
+        bridge, cue = self._cue(delay_ms=10_000, repeat_ms=10_000,
+                                speak_after_ms=150, still_after_ms=0)
+        bridge._thinking_acks = mock.Mock()
+        bridge._thinking_acks.pick.return_value = ("elevenlabs", "Un attimo.", b"\x07\x07")
+        cue.start()
+        cue.on_event("tool_call", {})
+        self.assertTrue(_wait_until(lambda: cue.cues_played == 1, 0.1))
+        time.sleep(0.3)
+        cue.stop()
+        self.assertEqual(cue.cues_played, 1, "still_after_ms 0: nothing spoken after the first")
+
     def test_no_cue_after_stop(self):
         bridge, cue = self._cue(delay_ms=0)
         cue.stop()

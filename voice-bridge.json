@@ -93,6 +93,13 @@
       "[warm] Ci sto lavorando.",
       "[calm] Dammi un secondo.",
       "[warm] Ci penso io."
+    ],
+    "speak_after_ms": 10000,
+    "still_after_ms": 10000,
+    "still_phrases": [
+      "[calm] Ci sto ancora lavorando.",
+      "[warm] Ancora un momento.",
+      "[calm] Ci vuole ancora un attimo."
     ]
   },
   "session_key": "agent:main:voice-bridge",

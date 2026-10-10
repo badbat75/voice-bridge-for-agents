@@ -157,10 +157,14 @@ class _ThinkingCue:
     """Per-turn "still working" feedback between pick-up and the first
     reply audio, so the user never sits through 10–25 s of dead air.
 
-    - the first `tool_call` frame plays a spoken cue ("Un attimo.") once,
-      unless the model had already spoken before calling the tool;
     - after `delay_ms` with no reply audio, a soft tick, repeated every
-      `repeat_ms`.
+      `repeat_ms`;
+    - a spoken cue ("Un attimo.") once: on the first `tool_call` frame
+      (unless the model had already spoken before calling the tool), or
+      after `speak_after_ms` of waiting, whichever comes first — a slow
+      model with no tool call is just as silent;
+    - from then on, every `still_after_ms`, a "still working" phrase
+      (`still_phrases`), so a 40 s wait is never ticks alone.
 
     Cues go through the player queue (serialized, never mixed with the
     reply) and don't duck the music. `stop()` is called before the first
@@ -174,6 +178,9 @@ class _ThinkingCue:
         self._enabled = bool(tc.get("enabled"))
         self._delay = max(0, int(tc.get("delay_ms", 3000))) / 1000.0
         self._repeat = max(100, int(tc.get("repeat_ms", 5000))) / 1000.0
+        # 0 = off for both.
+        self._speak_after = max(0, int(tc.get("speak_after_ms", 0))) / 1000.0
+        self._still_after = max(0, int(tc.get("still_after_ms", 0))) / 1000.0
         self._stop = threading.Event()
         self._tool = threading.Event()
         # Wakes `_run` early (tool_call or stop) instead of polling.
@@ -213,20 +220,27 @@ class _ThinkingCue:
 
     def _run(self) -> None:
         rate = int(self._bridge.cfg["tts_sample_rate"])
-        next_tick = time.monotonic() + self._delay
+        t0 = time.monotonic()
+        next_tick = t0 + self._delay
+        never = float("inf")
+        # When the next spoken cue is due: the first one on a tool call or
+        # after `speak_after`, later ones every `still_after`.
+        next_speak = t0 + self._speak_after if self._speak_after else never
         spoke = False
         while True:
-            self._wake.wait(max(0.0, next_tick - time.monotonic()))
+            self._wake.wait(max(0.0, min(next_tick, next_speak) - time.monotonic()))
             self._wake.clear()
             if self._stop.is_set():
                 return
             now = time.monotonic()
-            if self._tool.is_set() and not spoke:
+            if (self._tool.is_set() and not spoke) or now >= next_speak:
+                bank = self._bridge._still_acks if spoke else self._bridge._thinking_acks
+                label = "thinking-still" if spoke else "thinking-ack"
                 spoke = True
-                bank = self._bridge._thinking_acks
+                next_speak = now + self._still_after if self._still_after else never
                 clip = bank.pick() if bank else None
-                if self._enqueue(clip[2] if clip else None, "thinking-ack"):
-                    log.info("Thinking cue: %r", clip[1])
+                if self._enqueue(clip[2] if clip else None, label):
+                    log.info("Thinking cue at %.1fs: %r", now - t0, clip[1])
                     next_tick = now + self._repeat
                     continue
             if now >= next_tick:
@@ -371,6 +385,12 @@ class VoiceBridge:
         if (cfg.get("thinking_cue") or {}).get("enabled") and tphrases:
             self._thinking_acks = wake_word.AckBank(
                 cfg, tphrases, voice, ack_dir, tts, kind="thinking")
+        # "Ci sto ancora lavorando" clips for a long wait.
+        self._still_acks = None
+        sphrases = (cfg.get("thinking_cue") or {}).get("still_phrases") or []
+        if (cfg.get("thinking_cue") or {}).get("enabled") and sphrases:
+            self._still_acks = wake_word.AckBank(
+                cfg, sphrases, voice, ack_dir, tts, kind="thinking-still")
 
         # Frame-level voice check at commit (None = off).
         self._speech_vad = _make_speech_vad(cfg)
@@ -1366,6 +1386,8 @@ class VoiceBridge:
                       ("sleep-acks", lambda: self._sleep_acks.prepare(self.shutdown_event))]
         if self._thinking_acks:
             loops.append(("thinking-acks", lambda: self._thinking_acks.prepare(self.shutdown_event)))
+        if self._still_acks:
+            loops.append(("still-acks", lambda: self._still_acks.prepare(self.shutdown_event)))
         if self._stt_compare:
             self._stt_compare.start()
         for name, fn in loops:

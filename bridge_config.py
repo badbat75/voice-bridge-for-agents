@@ -290,6 +290,9 @@ def load_config() -> dict:
         "delay_ms": int(tc.get("delay_ms", 3000)),
         "repeat_ms": int(tc.get("repeat_ms", 5000)),
         "phrases": list(tc.get("phrases") or []),
+        "speak_after_ms": int(tc.get("speak_after_ms", 0)),
+        "still_after_ms": int(tc.get("still_after_ms", 0)),
+        "still_phrases": list(tc.get("still_phrases") or []),
     }
 
     return cfg
