@@ -683,8 +683,8 @@ class VoiceBridge:
     def _resume(self, prefill: "Iterable[bytes]" = ()) -> None:
         """Idle/muted → recording. Shared by HID press and wake word.
 
-        `prefill`: mic chunks captured before the resume (the wake word's
-        trailing command) that the endpointer must see first."""
+        `prefill`: mic chunks captured before the resume (queued while
+        Whistle transcribed the wake word) that the endpointer must see first."""
         # Bump gen so any stragglers from before (e.g. an old
         # in-progress speech buffer the endpointer might have under
         # the previous gen) are shed by downstream stages.
@@ -699,32 +699,29 @@ class VoiceBridge:
         self._set_state(State.RECORDING)
 
     @_transition
-    def _on_wake(self, text: str, segment: bytes = b"", backlog: "Iterable[bytes]" = (),
-                 command: str = "") -> None:
+    def _on_wake(self, text: str, backlog: "Iterable[bytes]" = ()) -> None:
         """Wake phrase heard while idle: listen at once, ack in parallel.
 
-        The mic opens before the ack plays, so "Hey Binary… metti la
-        musica" said in one breath isn't cut. `backlog` (audio queued while
-        Whistle transcribed) always goes to the endpointer; `segment` (the
-        wake segment itself) too when Whistle heard words after the phrase
-        (`command`) — STT then gets the whole sentence. With a command under
-        way a soft tick replaces the spoken ack, so it doesn't talk over it."""
+        The wake word only wakes: whatever else was in the same breath is
+        not taken as a request, the user speaks after the spoken ack. (It
+        used to be: words Whistle heard after the phrase sent the wake
+        segment to STT and swapped the ack for a tick. A misheard "hey
+        binary" — "Hey, bye-bye." — then looked like phrase + command: no
+        "Dimmi", and the wake word itself went to the agent as a turn.
+        Removed 2026-10-10.) The mic opens before the ack plays; `backlog`
+        (audio queued while Whistle transcribed) goes to the endpointer."""
         if self._state is not State.IDLE_LISTENING:
             return
-        log.info("Wake word: %r%s", text, f" + command {command!r}" if command else "")
-        prefill = list(self._split_chunks(segment)) if command else []
-        prefill += list(backlog)
+        log.info("Wake word: %r", text)
+        prefill = list(backlog)
         speaking = self._is_playing()
         self._resume(prefill=prefill)
         if speaking:
             return  # a reply is already speaking; the resume is the ack
         rate = int(self.cfg["tts_sample_rate"])
-        if command:
-            clip = ("tone", "(wake tick)", _make_tick_pcm(rate))
-        else:
-            clip = self._wake_acks.pick() if self._wake_acks else None
-            if clip is None:
-                clip = ("tone", "(beep)", _make_beep_pcm(rate, freq=880, duration=0.08))
+        clip = self._wake_acks.pick() if self._wake_acks else None
+        if clip is None:
+            clip = ("tone", "(beep)", _make_beep_pcm(rate, freq=880, duration=0.08))
         threading.Thread(target=self._play_wake_ack, args=(clip,),
                          name="vb-wake-ack", daemon=True).start()
 
@@ -1016,23 +1013,29 @@ class VoiceBridge:
             except Exception as exc:
                 log.warning("Wake word: transcribe failed: %s", exc)
                 continue
-            command = self._wake_detector.detect(text)
-            hit = command is not None
-            log.info("Wake segment %.1fs → %r in %.2fs%s",
-                     len(segment) / (2 * self.cfg["sample_rate"]), text,
-                     time.monotonic() - t0, " (wake)" if hit else "")
-            capture.save(segment, text, hit)
-            if hit:
-                # Audio queued while Whistle transcribed is the start of
-                # what the user says next: hand it to the endpointer.
-                backlog = []
-                while True:
-                    try:
-                        backlog.append(self.wake_q.get_nowait())
-                    except queue.Empty:
-                        break
-                self._on_wake(text, segment, backlog, command)
-                gate.reset()
+            # This thread IS the wake word: an exception escaping here
+            # leaves the bridge deaf with no sign of it (2026-10-10: a
+            # wrong method name killed it at the first segment and nothing
+            # answered "hey binary" for hours). Log and keep listening.
+            try:
+                hit = self._wake_detector.heard(text)
+                log.info("Wake segment %.1fs → %r in %.2fs%s",
+                         len(segment) / (2 * self.cfg["sample_rate"]), text,
+                         time.monotonic() - t0, " (wake)" if hit else "")
+                capture.save(segment, text, hit)
+                if hit:
+                    # Audio queued while Whistle transcribed is the start of
+                    # what the user says next: hand it to the endpointer.
+                    backlog = []
+                    while True:
+                        try:
+                            backlog.append(self.wake_q.get_nowait())
+                        except queue.Empty:
+                            break
+                    self._on_wake(text, backlog)
+                    gate.reset()
+            except Exception:
+                log.exception("Wake word: segment handling failed, still listening")
 
     def _endpointer_loop(self) -> None:
         """Drive the `Endpointer` (see endpointer.py) from `audio_q`.
@@ -1260,6 +1263,17 @@ class VoiceBridge:
             log.info("Worker: non-speech transcription %s, skipping", text)
             return
         if gen != self._current_gen():
+            return
+        if self._wake_detector and self._wake_detector.is_only_phrase(text):
+            # The wake word alone reached STT (said again mid-conversation,
+            # or its tail caught after a slow wake). It is a
+            # call, not a request: answer "Dimmi" here instead of sending
+            # "Hey binary" to the agent as if it were a question.
+            log.info("Worker: %r is only the wake word, acking instead of asking the agent", text)
+            cue.stop()
+            clip = self._wake_acks.pick() if self._wake_acks else None
+            if clip:
+                self._play_wake_ack(clip)
             return
         log.info("User: %s", text)
         self._run_text_turn(gen, text, t0, timing, cue)

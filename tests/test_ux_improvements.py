@@ -737,6 +737,28 @@ class MaxUtteranceTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Agent reports (report_to_user)
 # ---------------------------------------------------------------------------
+class WakeWordOnlyTranscriptTest(unittest.TestCase):
+    def test_bare_wake_word_gets_an_ack_not_a_gateway_turn(self):
+        import wake_word
+        bridge, _ = _bridge()
+        bridge._wake_detector = wake_word.WakeDetector(wake_word.wake_config(
+            {"wake_word": {"phrases": ["hey binary"], "fuzzy_threshold": 0.65}}))
+        bridge._wake_acks = mock.Mock()
+        bridge._wake_acks.pick.return_value = ("elevenlabs", "Dimmi.", b"\x05\x05")
+        gateway = mock.Mock()
+        gen = bridge._current_gen()
+        for heard, asked in (("Hey binary", False), ("Hey binary, che ore sono?", True)):
+            bridge.stt.transcribe.return_value = heard
+            gateway.reset_mock()
+            gateway.return_value = iter(["Sono le tre."])
+            with mock.patch.object(VB, "gateway_chat_stream_zeroclaw_ws", gateway), \
+                    mock.patch.object(VB, "play_audio") as play:
+                bridge._run_turn(gen, b"\x00" * 3200, _SR, time.monotonic(), {},
+                                 VB._ThinkingCue(bridge, gen))
+            self.assertEqual(gateway.called, asked, heard)
+            self.assertEqual(play.called, not asked, heard)
+
+
 class AgentReportTest(unittest.TestCase):
     def _bridge(self):
         bridge, hid = _bridge(thinking_cue={"enabled": True, "delay_ms": 0, "repeat_ms": 100})

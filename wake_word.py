@@ -94,7 +94,21 @@ def normalize(text: str) -> str:
 
 
 def _phrase_end(words: list[str], phrases, aliases=(), fuzzy: float = 0.0) -> int | None:
-    """Index just past the wake phrase in `words` (normalized), or None.
+    return _phrase_span(words, phrases, aliases, fuzzy)[0]
+
+
+def is_only_phrase(text: str, phrases, aliases=(), fuzzy: float = 0.0) -> bool:
+    """`text` is the wake phrase and nothing else (one stray word allowed
+    before it: "oh hey binary")."""
+    words = normalize(text).split()
+    end, _exact = _phrase_span(words, phrases, aliases, fuzzy)
+    longest = max((len(normalize(p).split()) for p in (*phrases, *aliases)), default=0)
+    return end is not None and end == len(words) and len(words) <= longest + 1
+
+
+def _phrase_span(words: list[str], phrases, aliases=(), fuzzy: float = 0.0) -> tuple[int | None, bool]:
+    """(index just past the wake phrase in `words` (normalized) or None,
+    whether the match was exact).
 
     An exact phrase/alias on word boundaries wins; else, when `fuzzy` > 0,
     the window of 1..n+1 heard words whose letters (spaces dropped, so "hey
@@ -104,9 +118,9 @@ def _phrase_end(words: list[str], phrases, aliases=(), fuzzy: float = 0.0) -> in
         pw = normalize(p).split()
         for i in range(len(words) - len(pw) + 1):
             if pw and words[i:i + len(pw)] == pw:
-                return i + len(pw)
+                return i + len(pw), True
     if fuzzy <= 0:
-        return None
+        return None, False
     best, end = 0.0, None
     for p in phrases:
         target = normalize(p).replace(" ", "")
@@ -115,21 +129,13 @@ def _phrase_end(words: list[str], phrases, aliases=(), fuzzy: float = 0.0) -> in
                 r = difflib.SequenceMatcher(None, "".join(words[i:i + n]), target).ratio()
                 if r >= fuzzy and r > best:
                     best, end = r, i + n
-    return end
+    return end, False
 
 
 def matches(text: str, phrases: list[str], aliases=(), fuzzy: float = 0.0) -> bool:
     """Exact word-boundary match on phrases + aliases, else a fuzzy match
     on the phrases when `fuzzy` > 0."""
     return _phrase_end(normalize(text).split(), phrases, aliases, fuzzy) is not None
-
-
-def command_after(text: str, phrases: list[str], aliases=(), fuzzy: float = 0.0) -> str:
-    """Words heard after the wake phrase — "hey binary metti la musica" →
-    "metti la musica" — or "" when there are none (or no match at all)."""
-    words = normalize(text).split()
-    end = _phrase_end(words, phrases, aliases, fuzzy)
-    return " ".join(words[end:]) if end is not None else ""
 
 
 class SegmentCapture:
@@ -311,12 +317,8 @@ class WakeDetector:
     def heard(self, text: str) -> bool:
         return matches(text, self.phrases, self.aliases, self.fuzzy)
 
-    def detect(self, text: str) -> str | None:
-        """None when the wake phrase wasn't heard; else what was said after
-        it in the same breath ("" if nothing). One search for both."""
-        words = normalize(text).split()
-        end = _phrase_end(words, self.phrases, self.aliases, self.fuzzy)
-        return None if end is None else " ".join(words[end:])
+    def is_only_phrase(self, text: str) -> bool:
+        return is_only_phrase(text, self.phrases, self.aliases, self.fuzzy)
 
 
 RETRY_MIN_S, RETRY_MAX_S = 30.0, 600.0

@@ -30,6 +30,7 @@ from __future__ import annotations
 import array
 import importlib.util
 import os
+import threading
 import time
 import sys
 import unittest
@@ -124,15 +125,14 @@ class ValidateLanguageTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 wake_word.validate_language("wake_word.language", lang)
 
-    def test_command_after_the_phrase(self):
-        ca = wake_word.command_after
-        self.assertEqual(ca("Hey Binary, metti la musica.", ["hey binary"]), "metti la musica")
-        self.assertEqual(ca("Hey Binary.", ["hey binary"]), "")
-        self.assertEqual(ca("hey bye harry stop", ["hey binary"], ["hey bye harry"]), "stop")
-        self.assertEqual(ca("Hey, binally. What do you cosa parla", ["hey binary"], fuzzy=0.8),
-                         "what do you cosa parla")
-        self.assertEqual(ca("hey binally", ["hey binary"], fuzzy=0.8), "")
-        self.assertEqual(ca("hey bud ciao", ["hey binary"], fuzzy=0.8), "")
+    def test_is_only_phrase(self):
+        det = wake_word.WakeDetector(wake_word.wake_config(
+            {"wake_word": {"phrases": ["hey binary"], "fuzzy_threshold": 0.65}}))
+        for text in ("Hey binary", "Hey, Binary!", "Oh, hey binary.", "Hey binari"):
+            self.assertTrue(det.is_only_phrase(text), text)
+        for text in ("Hey binary metti la musica", "Sì", "Papà. Papà. Sì, sì",
+                     "Ho detto che hey binary non risponde", "Ehi, vai, Ani"):
+            self.assertFalse(det.is_only_phrase(text), text)
 
     def test_matches_whistle_package(self):
         try:
@@ -371,25 +371,22 @@ class WakeTransitionsTest(unittest.TestCase):
         bridge, _, vb = _bridge("wake_word")
         backlog = [b"\1\1" * 1024, b"\2\2" * 1024]
         with mock.patch.object(vb, "play_audio"):
-            bridge._on_wake("hey binary", b"\9\9" * 3000, backlog, "")
+            bridge._on_wake("hey binary", backlog)
             self._join_ack()
         gen = bridge._current_gen()
-        # No command: the wake segment itself is not sent, the backlog is.
+        # The wake segment itself is never sent, the backlog is.
         self.assertEqual(_drain(bridge.audio_q), [(gen, c) for c in backlog])
 
-    def test_command_in_same_breath_sends_segment_and_ticks(self):
+    def test_words_after_the_phrase_are_not_a_command(self):
+        # "Hey binary metti la musica" in one breath: it wakes and says
+        # "Dimmi", the wake segment is not sent to STT.
         bridge, _, vb = _bridge("wake_word")
         bridge._wake_acks._clips.append(("elevenlabs", "Dimmi.", b"\0\0" * 10))
-        segment = b"\3\3" * 2500  # 2500 samples → chunks of 1024, 1024, 452
         with mock.patch.object(vb, "play_audio") as play:
-            bridge._on_wake("hey binary metti la musica", segment, [b"\4\4" * 1024],
-                            "metti la musica")
+            bridge._on_wake("hey binary metti la musica", [b"\4\4" * 1024])
             self._join_ack()
-        chunks = [c for _g, c in _drain(bridge.audio_q)]
-        self.assertEqual([len(c) for c in chunks], [2048, 2048, 904, 2048])
-        self.assertEqual(b"".join(chunks[:3]), segment)
-        # A tick, not "Dimmi." spoken over the user.
-        self.assertEqual(play.call_args.args[1], vb._make_tick_pcm(24000))
+        self.assertEqual([c for _g, c in _drain(bridge.audio_q)], [b"\4\4" * 1024])
+        self.assertEqual(play.call_args.args[1], b"\0\0" * 10)
 
     def test_wake_ignored_when_disarmed(self):
         bridge, _, vb = _bridge("wake_word")
@@ -488,6 +485,52 @@ class WakeTransitionsTest(unittest.TestCase):
             bridge._put_wake_chunk(bytes([i % 256]))
         self.assertEqual(bridge.wake_q.qsize(), cap)
         self.assertEqual(bridge.wake_q.get_nowait(), bytes([5]))
+
+    def _run_wake_loop(self, bridge, vb, heard):
+        """The real `_wake_loop` and the real WakeDetector matching; only
+        Whistle itself and the energy gate are faked."""
+        bridge._wake_detector.load = mock.Mock()
+        bridge._wake_detector.transcribe = mock.Mock(side_effect=heard)
+
+        class _Gate:
+            def __init__(self, *_a):
+                pass
+
+            def feed(self, chunk):
+                return chunk * 4
+
+            def reset(self):
+                pass
+
+        with mock.patch.object(vb.wake_word, "SpeechGate", _Gate), \
+                mock.patch.object(vb, "play_audio"):
+            t = threading.Thread(target=bridge._wake_loop, daemon=True)
+            t.start()
+            for _ in heard:
+                bridge._put_wake_chunk(b"\1\1" * 1024)
+                deadline = time.monotonic() + 2
+                while not bridge.wake_q.empty() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            time.sleep(0.1)
+            alive = t.is_alive()
+            bridge.shutdown_event.set()
+            t.join(2)
+        return alive
+
+    def test_wake_loop_end_to_end_wakes_on_the_phrase(self):
+        bridge, _, vb = _bridge("wake_word")
+        alive = self._run_wake_loop(bridge, vb, ["Grazie.", "Hey Binary."])
+        self.assertTrue(alive, "the wake thread must survive its segments")
+        self.assertIs(bridge._state, vb.State.RECORDING)
+        self.assertEqual(bridge._wake_detector.transcribe.call_count, 2)
+
+    def test_wake_loop_survives_a_failing_segment(self):
+        bridge, _, vb = _bridge("wake_word")
+        real = bridge._wake_detector.heard
+        bridge._wake_detector.heard = mock.Mock(side_effect=[RuntimeError("boom"), real("hey binary")])
+        alive = self._run_wake_loop(bridge, vb, ["x", "Hey Binary."])
+        self.assertTrue(alive)
+        self.assertIs(bridge._state, vb.State.RECORDING)
 
     def test_whistle_load_failure_falls_back_to_button(self):
         bridge, hid, _ = _bridge("wake_word")
