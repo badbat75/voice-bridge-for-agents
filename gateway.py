@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import urllib.request
 from typing import Iterable, Iterator
 
@@ -70,7 +71,17 @@ _NO_REPLY_LEAD = " \t\n.…"
 
 
 def _is_no_reply(text: str) -> bool:
-    return (text or "").strip().lstrip(_NO_REPLY_LEAD).strip() in NO_REPLY_SENTINELS
+    text = (text or "").replace(TOOL_BOUNDARY, "")
+    return text.strip().lstrip(_NO_REPLY_LEAD).strip() in NO_REPLY_SENTINELS
+
+
+# Yielded by the WS leg in place of a `tool_call` frame that arrives after
+# answer text: the model paused to run a tool, so the text so far is a
+# finished segment. The HTTP TTS paths synthesize the buffered segment when
+# they see it instead of waiting for the tool result's first delta; the
+# websocket TTS path and the turn log drop it. A control character, so it
+# can never occur in model text.
+TOOL_BOUNDARY = "\x1e"
 
 
 def _filter_no_reply(stream: Iterable[str]) -> Iterator[str]:
@@ -294,6 +305,9 @@ def gateway_chat_stream_zeroclaw_ws(
                          base_url, agent, session_id)
                 ws.send(json.dumps({"type": "message", "content": text}))
                 sent = True
+                t_sent = time.monotonic()
+                first_frame = first_text = think_first = think_last = None
+                counts = {"thinking": 0, "tool_call": 0}
                 while True:
                     raw = ws.recv(timeout=120)
                     try:
@@ -301,18 +315,48 @@ def gateway_chat_stream_zeroclaw_ws(
                     except (json.JSONDecodeError, TypeError):
                         continue
                     ftype = frame.get("type")
+                    if first_frame is None:
+                        first_frame = (ftype, time.monotonic() - t_sent)
                     if ftype == "chunk":
                         delta = frame.get("content")
                         if delta:
+                            if not yielded:
+                                first_text = time.monotonic() - t_sent
                             yielded = True
                             yield delta
                         continue
+                    if ftype in counts:
+                        counts[ftype] += 1
+                    if ftype == "thinking":
+                        think_last = time.monotonic() - t_sent
+                        if think_first is None:
+                            think_first = think_last
+                    if ftype == "tool_call" and yielded:
+                        # The model stopped mid-reply to call a tool, so the
+                        # text so far is a finished segment ("Chiamo subito
+                        # il worker."). Without the marker the TTS paths
+                        # held it until the tool result's next delta —
+                        # 70 s later for a worker delegation, by which time
+                        # the thing it announced had already happened.
+                        frame = {**frame, "text_before": True}
+                        yield TOOL_BOUNDARY
                     if on_event is not None:
                         try:
                             on_event(ftype, frame)
                         except Exception:
                             log.exception("WS on_event callback failed")
                     if ftype == "done":
+                        # Where the gateway's time goes: a long wait before
+                        # the first frame is the model (thinking shows up as
+                        # `thinking` frames only if the provider streams it).
+                        log.info("WS turn: first frame %s at %.1fs, first text at %s, "
+                                 "thinking frames=%d (%s), tool calls=%d, done at %.1fs",
+                                 first_frame[0], first_frame[1],
+                                 "%.1fs" % first_text if first_text is not None else "n/a",
+                                 counts["thinking"],
+                                 "%.1f–%.1fs" % (think_first, think_last)
+                                 if think_first is not None else "none",
+                                 counts["tool_call"], time.monotonic() - t_sent)
                         return
                     elif ftype == "error":
                         log.error("WS gateway error frame: %s",

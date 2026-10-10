@@ -33,7 +33,10 @@ class SpeakerSocketTest(unittest.TestCase):
                 raise RuntimeError("player exploded")
             return len(pcm) / 48000
 
-        self.server = speaker_socket.serve(self.path, play_pcm, poll_interval=0.1)
+        self.reports = []
+        self.server = speaker_socket.serve(
+            self.path, play_pcm, poll_interval=0.1,
+            report=lambda text, source="agent": self.reports.append((source, text)))
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.client = speaker_socket.SpeakerClient(self.path, timeout=5)
@@ -42,6 +45,16 @@ class SpeakerSocketTest(unittest.TestCase):
         pcm = b"\x01\x02" * 24000
         self.assertAlmostEqual(self.client.play_pcm(pcm, text="Ciao?"), 1.0)
         self.assertEqual(self.calls, [(pcm, "Ciao?")])
+
+    def test_report_is_handed_over_without_pcm(self):
+        self.client.report("Aorus è acceso", source="worker")
+        self.assertEqual(self.reports, [("worker", "Aorus è acceso")])
+        self.assertEqual(self.calls, [])
+
+    def test_report_refused_when_bridge_takes_none(self):
+        self.server.report = None
+        with self.assertRaisesRegex(RuntimeError, "no agent reports"):
+            self.client.report("x")
 
     def test_socket_is_private(self):
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode) & 0o077, 0)

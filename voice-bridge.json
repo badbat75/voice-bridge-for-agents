@@ -67,7 +67,12 @@
       "hey bye harry",
       "hey bye ali"
     ],
-    "goodbye_after_turn_only": true
+    "goodbye_after_turn_only": true,
+    "capture": {
+      "enabled": true,
+      "dir": "data/wake-segments",
+      "max_files": 300
+    }
   },
   "stt_provider": "elevenlabs",
   "tts_provider": "elevenlabs",

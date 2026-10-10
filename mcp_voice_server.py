@@ -106,7 +106,8 @@ mcp = FastMCP("voice-bridge-voice", stateless_http=True)
 
 def configure(cfg: dict, *, stt, tts, bridge) -> "FastMCP":
     """Resolve the config + providers into the module globals the tools
-    read. `bridge` is anything with `play_pcm(pcm, text=...)` — in
+    read. `bridge` is anything with `play_pcm(pcm, text=...)` and
+    `report(text, source=...)` — in
     production a `speaker_socket.SpeakerClient`. Returns the `mcp` app."""
     global _bridge, _cfg, _stt, _tts, _TTS_RATE
     global _HOST, _PORT, _TG_TOKEN, _TG_CHAT_ID, _OUT_DIR
@@ -543,6 +544,27 @@ def say_to_speaker(text: str) -> dict:
     seconds = _bridge.play_pcm(pcm, text=text)
     log.info("say_to_speaker: %d chars -> %.1fs", len(text), seconds)
     return {"ok": True, "chars": len(text), "seconds": round(seconds, 2)}
+
+
+@mcp.tool()
+def report_to_user(text: str, source: str = "worker") -> dict:
+    """Tell the user, through the voice agent, the outcome of a task that was
+    delegated to you in the background.
+
+    Call it ONCE when the task is finished (or has failed), with a short
+    factual result: "Aorus is on and reachable", "the invoice could not be
+    sent: SMTP refused the login". `source` is your agent name. The text is
+    not spoken as is: it is handed to the voice agent inside its ongoing
+    conversation with the user, and the voice agent tells them in its own
+    words, so later turns know what was said. Returns as soon as the message
+    is queued (`{ok, queued}`); it is delivered when nobody is talking.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("text is empty")
+    _bridge.report(text, source=(source or "agent").strip() or "agent")
+    log.info("report_to_user (%s): %d chars queued", source, len(text))
+    return {"ok": True, "queued": True}
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ from __future__ import annotations
 import array
 import importlib.util
 import os
+import time
 import sys
 import unittest
 from unittest import mock
@@ -511,6 +512,34 @@ class WhistleTranscribeTest(unittest.TestCase):
         self.assertEqual([len(c) for c in calls], [wake_word._MAX_PASS, 3])
         self.assertEqual(calls[0].typecode, "f")
         self.assertEqual(list(calls[0][:4]), [0.0, 0.5, -1.0, 32767 / 32768])
+
+
+class SegmentCaptureTest(unittest.TestCase):
+    def test_saves_wav_and_index_and_prunes(self):
+        import tempfile, wave
+        with tempfile.TemporaryDirectory() as d:
+            cap = wake_word.SegmentCapture({"enabled": True, "dir": "seg", "max_files": 2}, 16000, d)
+            names = []
+            for i, (text, hit) in enumerate([("Hey, Barnari.", False), ("Hey Binary.", True),
+                                             ("Thank\tyou.", False)]):
+                names.append(cap.save(b"\x01\x00" * 16000, text, hit))
+                time.sleep(0.002)
+            self.assertTrue(names[0].endswith("-miss.wav") and names[1].endswith("-hit.wav"))
+            left = sorted(n for n in os.listdir(os.path.join(d, "seg")) if n.endswith(".wav"))
+            self.assertEqual(left, sorted(names[1:]), "only the newest max_files are kept")
+            with wave.open(os.path.join(d, "seg", names[2])) as w:
+                self.assertEqual((w.getframerate(), w.getnframes()), (16000, 16000))
+            rows = open(os.path.join(d, "seg", "index.tsv"), encoding="utf-8").read().splitlines()
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(rows[2].split("\t")[2:], ["1.00", "miss", "Thank you."])
+
+    def test_disabled_writes_nothing_and_errors_never_raise(self):
+        self.assertIsNone(wake_word.SegmentCapture({"enabled": False}, 16000).save(b"\0\0", "x", False))
+        cap = wake_word.SegmentCapture({"enabled": True, "dir": "x"}, 16000, "/proc/nope")
+        self.assertIsNone(cap.save(b"\0\0", "x", False))
+
+    def test_config_default_is_off(self):
+        self.assertFalse(wake_word.wake_config({})["capture"]["enabled"])
 
 
 if __name__ == "__main__":

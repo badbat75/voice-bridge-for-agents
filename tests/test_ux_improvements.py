@@ -199,6 +199,9 @@ class ThinkingCueTest(unittest.TestCase):
         cue.on_event("thinking", {})
         time.sleep(0.1)
         self.assertEqual(cue.cues_played, 0, "only tool_call triggers the spoken cue")
+        cue.on_event("tool_call", {"text_before": True})
+        time.sleep(0.1)
+        self.assertEqual(cue.cues_played, 0, "no spoken cue when the model already spoke")
         cue.on_event("tool_call", {})
         cue.on_event("tool_call", {})
         self.assertTrue(_wait_until(lambda: cue.cues_played == 1))
@@ -305,6 +308,21 @@ class HybridTtsTest(unittest.TestCase):
         log = []
         self._run(self._voice(), ["Fatto", " subito"], log)
         self.assertEqual([e for e in log if e[0] == "tts"], [("tts", "Fatto subito")])
+
+    def test_tool_boundary_speaks_each_segment_as_it_ends(self):
+        # "Chiamo il worker." then a 70 s tool call: the sentence must play
+        # while the tool runs, not after it, in every HTTP mode.
+        TB = VB.TOOL_BOUNDARY
+        for voice in (self._voice(), self._voice(early=False),
+                      ElevenLabsVoice(api_key="k", voice_id="v", tts_model="eleven_v3")):
+            log = []
+            self._run(voice, ["... Chiamo il ", "worker", TB, " Fatto, è acceso. ", "Serve altro?"], log)
+            tts = [e for e in log if e[0] == "tts"]
+            self.assertEqual(tts[0], ("tts", "... Chiamo il worker"))
+            self.assertLess(log.index(tts[0]), log.index(("delta", " Fatto, è acceso. ")),
+                            "the segment must be synthesized before the tool result arrives")
+            self.assertEqual("".join(t for _k, t in tts[1:]).replace(" ", ""),
+                             "Fatto,èacceso.Servealtro?")
 
     def test_flag_off_keeps_whole_reply(self):
         log = []
@@ -658,6 +676,75 @@ class MaxUtteranceTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Agent reports (report_to_user)
+# ---------------------------------------------------------------------------
+class AgentReportTest(unittest.TestCase):
+    def _bridge(self):
+        bridge, hid = _bridge(thinking_cue={"enabled": True, "delay_ms": 0, "repeat_ms": 100})
+        bridge.tts.synthesize_stream.side_effect = lambda it: (b"R" * 10 for _ in it)
+        self.sent = []
+
+        def gateway(_url, _tok, text, *_a, **_kw):
+            self.sent.append(text)
+            yield "Aorus è acceso."
+
+        p = mock.patch.object(VB, "gateway_chat_stream_zeroclaw_ws", gateway)
+        p.start()
+        self.addCleanup(p.stop)
+        return bridge
+
+    def _run_worker(self, bridge, until):
+        t = threading.Thread(target=bridge._worker_loop, daemon=True)
+        t.start()
+        ok = _wait_until(until, 3.0)
+        bridge.shutdown_event.set()
+        t.join(2)
+        return ok
+
+    def test_report_becomes_a_turn_in_the_agent_session(self):
+        bridge = self._bridge()
+        State = type(bridge._state)
+        bridge._set_state(State.MUTED)
+        bridge.report("Aorus è acceso ed è in rete.", source="worker")
+        self.assertTrue(self._run_worker(bridge, lambda: not bridge.playback_q.empty()))
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("worker", self.sent[0])
+        self.assertIn("non dall'utente", self.sent[0])
+        self.assertTrue(self.sent[0].endswith("Aorus è acceso ed è in rete."))
+        bridge.stt.transcribe.assert_not_called()
+        items = [it for _g, it in _drain_q(bridge.playback_q)]
+        self.assertEqual(items[0], b"R" * 10, "no thinking cue before a report's reply")
+        self.assertTrue(bridge._auto_idled, "the reply must be able to open the mic")
+        bridge._unidle_for_reply()
+        self.assertIs(bridge._state, State.RECORDING)
+
+    def test_report_waits_while_the_user_is_talking(self):
+        bridge = self._bridge()
+        _recording(bridge)
+        bridge._user_speaking.set()
+        bridge.report("Fatto.", source="worker")
+        self.assertIsNone(bridge._next_report())
+        bridge._user_speaking.clear()
+        bridge._set_state(type(bridge._state).PROCESSING, auto_idled=True)
+        self.assertIsNone(bridge._next_report(), "a user turn in flight goes first")
+        _recording(bridge)
+        self.assertEqual(bridge._next_report(), ("worker", "Fatto."))
+
+    def test_silent_agent_does_not_beep_on_a_report(self):
+        bridge = self._bridge()
+        with mock.patch.object(VB, "gateway_chat_stream_zeroclaw_ws",
+                               lambda *a, **k: iter(["... NO_REPLY"])):
+            bridge._run_report("worker", "niente da dire")
+        items = [it for _g, it in _drain_q(bridge.playback_q)]
+        self.assertEqual(items, [VB._END_OF_UTTERANCE])
+
+    def test_empty_report_is_rejected(self):
+        bridge = self._bridge()
+        with self.assertRaises(ValueError):
+            bridge.report("   ")
+
+
+# ---------------------------------------------------------------------------
 # 7. WS gateway failures
 # ---------------------------------------------------------------------------
 class _FakeWs:
@@ -696,6 +783,20 @@ class WsGatewayTest(unittest.TestCase):
         self.assertEqual(out, ["Fatto."])
         self.assertEqual(events, ["thinking", "tool_call", "done"])
         self.assertEqual(ws.sent, [{"type": "message", "content": "ciao"}])
+
+    def test_tool_call_after_text_flushes_a_sentence_boundary(self):
+        # "Verifico subito." then a tool call: the whitespace yielded on the
+        # tool_call lets the TTS sentence splitter commit the sentence now,
+        # and the cue is told text already preceded the tool.
+        ws = _FakeWs([{"type": "chunk", "content": "... Verifico subito."},
+                      {"type": "tool_call", "name": "shell"},
+                      {"type": "chunk", "content": " Fatto."},
+                      {"type": "done"}])
+        events = []
+        out = self._run(lambda *a, **k: ws, on_event=lambda t, f: events.append((t, f.get("text_before"))))
+        self.assertEqual(out, ["... Verifico subito.", VB.TOOL_BOUNDARY, " Fatto."])
+        self.assertEqual(events, [("tool_call", True), ("done", None)])
+        self.assertTrue(VB._is_no_reply("... NO_REPLY" + VB.TOOL_BOUNDARY))
 
     def test_connect_failure_is_retried_once(self):
         calls = []

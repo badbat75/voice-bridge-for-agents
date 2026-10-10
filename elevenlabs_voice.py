@@ -26,6 +26,8 @@ from typing import Iterable, Iterator
 
 import elevenlabs
 
+from gateway import TOOL_BOUNDARY
+
 log = logging.getLogger(__name__)
 
 
@@ -215,13 +217,27 @@ class ElevenLabsVoice:
         `_stream_sentence` call with the full text. Audio chunks are still
         forwarded as they arrive from the HTTP stream, so playback starts
         as soon as ElevenLabs emits its first bytes — the latency cost is
-        waiting for the gateway to finish, not for TTS to finish."""
-        text = "".join(d for d in text_iter if d).strip()
-        if not text:
-            return
+        waiting for the gateway to finish, not for TTS to finish.
+
+        A `TOOL_BOUNDARY` splits the reply: the text before it is spoken
+        right away (the model paused for a tool), the rest is one call."""
         try:
-            client = self._client()
-            yield from self._stream_sentence(client, text)
+            client = None
+            buf = ""
+            for delta in text_iter:
+                if not delta:
+                    continue
+                if delta == TOOL_BOUNDARY:
+                    segment, buf = buf.strip(), ""
+                    if segment:
+                        client = client or self._client()
+                        yield from self._stream_sentence(client, segment)
+                    continue
+                buf += delta
+            text = buf.strip()
+            if text:
+                client = client or self._client()
+                yield from self._stream_sentence(client, text)
         except Exception as exc:
             log.error("TTS streaming error: %s", exc)
 
@@ -239,6 +255,13 @@ class ElevenLabsVoice:
             first_done = False
             for delta in text_iter:
                 if not delta:
+                    continue
+                if delta == TOOL_BOUNDARY:
+                    # The model paused for a tool: speak what it said so far.
+                    segment, buf = buf.strip(), ""
+                    if segment:
+                        first_done = True
+                        yield from self._stream_sentence(client, segment)
                     continue
                 buf += delta
                 if not first_done:
@@ -267,7 +290,7 @@ class ElevenLabsVoice:
         try:
             kwargs = {
                 "voice_id": self._voice_id,
-                "text": iter(text_iter),
+                "text": (d for d in text_iter if d != TOOL_BOUNDARY),
                 "model_id": self._tts_model,
                 "output_format": self._tts_output_format,
             }
@@ -305,6 +328,11 @@ class ElevenLabsVoice:
         try:
             for delta in text_iter:
                 if not delta:
+                    continue
+                if delta == TOOL_BOUNDARY:
+                    tail, buf = buf.strip(), ""
+                    if tail:
+                        yield from self._stream_sentence(client, tail)
                     continue
                 buf += delta
                 while True:

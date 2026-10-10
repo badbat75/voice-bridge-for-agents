@@ -10,6 +10,10 @@ hundred KB, no threads while idle beyond the accept loop):
     response: one JSON line {"ok": true, "seconds": float}
               or {"ok": false, "error": str}
 
+A second request hands the voice agent a message from another agent
+(`report_to_user`): {"op": "report", "text": str, "source": str}, no PCM;
+the reply {"ok": true} comes back as soon as the bridge has queued it.
+
 The response is sent when playback has finished (`play_pcm` blocks), so the
 tool keeps its "returns when spoken" contract. The socket lives in
 `$XDG_RUNTIME_DIR/voice-bridge/` (user-private, tmpfs), mode 0600.
@@ -30,6 +34,8 @@ log = logging.getLogger("voice-bridge")
 # Bigger than any sane announcement (~5 min at 24 kHz); a guard against a
 # garbage length field, not a product limit.
 _MAX_BYTES = 16 * 1024 * 1024
+# The header line carries the spoken text or a whole agent report.
+_MAX_HEAD = 64 * 1024
 
 
 def default_path() -> str:
@@ -50,13 +56,20 @@ def _read_exact(f, n: int) -> bytes:
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         try:
-            head = json.loads(self.rfile.readline(4096) or b"{}")
-            n = int(head.get("bytes", 0))
-            if not 0 < n <= _MAX_BYTES:
-                raise ValueError(f"bad PCM length {n}")
-            pcm = _read_exact(self.rfile, n)
-            seconds = self.server.play_pcm(pcm, text=head.get("text") or None)
-            reply = {"ok": True, "seconds": seconds}
+            head = json.loads(self.rfile.readline(_MAX_HEAD) or b"{}")
+            if head.get("op") == "report":
+                if self.server.report is None:
+                    raise RuntimeError("this bridge takes no agent reports")
+                self.server.report(str(head.get("text") or ""),
+                                   source=str(head.get("source") or "agent"))
+                reply = {"ok": True}
+            else:
+                n = int(head.get("bytes", 0))
+                if not 0 < n <= _MAX_BYTES:
+                    raise ValueError(f"bad PCM length {n}")
+                pcm = _read_exact(self.rfile, n)
+                seconds = self.server.play_pcm(pcm, text=head.get("text") or None)
+                reply = {"ok": True, "seconds": seconds}
         except Exception as exc:
             log.warning("speaker socket: request failed: %s", exc)
             reply = {"ok": False, "error": str(exc)}
@@ -70,8 +83,9 @@ class _Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
 
 
-def serve(path: str, play_pcm, poll_interval: float = 5.0) -> "_Server":
-    """Serve `play_pcm(pcm, text=...)` on `path` in a daemon thread.
+def serve(path: str, play_pcm, poll_interval: float = 5.0, report=None) -> "_Server":
+    """Serve `play_pcm(pcm, text=...)` on `path` in a daemon thread, and
+    `report(text, source=...)` (agent reports) when given.
 
     `poll_interval` is how often the accept loop wakes to check for
     `shutdown()` (connections wake it at once); the bridge never calls
@@ -87,6 +101,7 @@ def serve(path: str, play_pcm, poll_interval: float = 5.0) -> "_Server":
     finally:
         os.umask(old)
     server.play_pcm = play_pcm
+    server.report = report
     threading.Thread(target=server.serve_forever, args=(poll_interval,),
                      name="vb-speaker-sock", daemon=True).start()
     log.info("Speaker socket: %s", path)
@@ -100,17 +115,26 @@ class SpeakerClient:
         self.path = path
         self.timeout = timeout
 
-    def play_pcm(self, pcm: bytes, *, text: str | None = None) -> float:
-        head = json.dumps({"text": text or "", "bytes": len(pcm)}).encode() + b"\n"
+    def _call(self, head: dict, body: bytes = b"") -> dict:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(self.timeout)
                 s.connect(self.path)
-                s.sendall(head)
-                s.sendall(pcm)
+                s.sendall(json.dumps(head).encode() + b"\n")
+                if body:
+                    s.sendall(body)
                 reply = json.loads(s.makefile("rb").readline() or b"{}")
         except (FileNotFoundError, ConnectionRefusedError) as exc:
             raise RuntimeError(f"voice-bridge is not running ({self.path}: {exc})") from exc
         if not reply.get("ok"):
             raise RuntimeError(f"voice-bridge speaker error: {reply.get('error', 'no reply')}")
+        return reply
+
+    def play_pcm(self, pcm: bytes, *, text: str | None = None) -> float:
+        reply = self._call({"text": text or "", "bytes": len(pcm)}, pcm)
         return float(reply.get("seconds", 0.0))
+
+    def report(self, text: str, *, source: str = "agent") -> None:
+        """Queue `text` as a message to the voice agent (see
+        `VoiceBridge.report`); returns once the bridge has taken it."""
+        self._call({"op": "report", "text": text, "source": source})

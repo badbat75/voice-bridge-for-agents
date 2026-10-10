@@ -44,6 +44,8 @@ import os
 import random
 import re
 import threading
+import time
+import wave
 from collections import deque
 
 log = logging.getLogger("voice-bridge")
@@ -68,6 +70,10 @@ DEFAULTS = {
     "goodbye_after_turn_only": True,
     "acks": [],
     "sleep_acks": [],
+    # Keep the audio of every segment Whistle was asked about (hit or not),
+    # to tune matching on real takes instead of guessing from transcripts.
+    # Room audio on disk: off by default, bounded, under the gitignored data/.
+    "capture": {"enabled": False, "dir": "data/wake-segments", "max_files": 300},
     "ack_cache_dir": "~/.cache/voice-bridge/acks",
 }
 
@@ -78,6 +84,7 @@ def wake_config(cfg: dict) -> dict:
     out["phrases"] = [normalize(p) for p in out["phrases"] if normalize(p)]
     out["aliases"] = [normalize(p) for p in out.get("aliases") or [] if normalize(p)]
     out["fuzzy_threshold"] = float(out.get("fuzzy_threshold") or 0.0)
+    out["capture"] = {**DEFAULTS["capture"], **(out.get("capture") or {})}
     return out
 
 
@@ -123,6 +130,46 @@ def command_after(text: str, phrases: list[str], aliases=(), fuzzy: float = 0.0)
     words = normalize(text).split()
     end = _phrase_end(words, phrases, aliases, fuzzy)
     return " ".join(words[end:]) if end is not None else ""
+
+
+class SegmentCapture:
+    """Saves wake segments as WAV + one `index.tsv` row each (time, file,
+    seconds, hit, what Whistle heard); keeps the newest `max_files`.
+    Failures are logged once and never reach the wake loop."""
+
+    def __init__(self, ccfg: dict, sample_rate: int, base_dir: str = "") -> None:
+        self.enabled = bool(ccfg.get("enabled"))
+        self.dir = os.path.join(base_dir, ccfg.get("dir") or "data/wake-segments")
+        self.max_files = max(1, int(ccfg.get("max_files") or 300))
+        self.sample_rate = sample_rate
+        self._warned = False
+
+    def save(self, pcm: bytes, text: str, hit: bool) -> str | None:
+        if not self.enabled:
+            return None
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            now = time.time()
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+            name = f"{stamp}-{int(now * 1000) % 1000:03d}-{'hit' if hit else 'miss'}.wav"
+            with wave.open(os.path.join(self.dir, name), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(self.sample_rate)
+                w.writeframes(pcm)
+            with open(os.path.join(self.dir, "index.tsv"), "a", encoding="utf-8") as f:
+                f.write("\t".join((stamp, name, f"{len(pcm) / (2 * self.sample_rate):.2f}",
+                                   "hit" if hit else "miss",
+                                   " ".join(text.split()))) + "\n")
+            wavs = sorted(n for n in os.listdir(self.dir) if n.endswith(".wav"))
+            for old in wavs[:-self.max_files]:
+                os.unlink(os.path.join(self.dir, old))
+            return name
+        except Exception as exc:
+            if not self._warned:
+                self._warned = True
+                log.warning("Wake capture: could not save segment: %s", exc)
+            return None
 
 
 def _rms(pcm: bytes) -> float:

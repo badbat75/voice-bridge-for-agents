@@ -28,6 +28,7 @@ import contextlib
 import enum
 import functools
 import logging
+import os
 import queue
 import signal
 import sys
@@ -76,6 +77,7 @@ from gateway import (  # noqa: F401  (re-exported)
     GATEWAY_FALLBACK_REPLY,
     GATEWAY_LOST_REPLY,
     GATEWAY_UNREACHABLE_REPLY,
+    TOOL_BOUNDARY,
     _expects_answer,
     _filter_no_reply,
     _is_no_reply,
@@ -142,11 +144,21 @@ _WAKE_Q_SECONDS = 10.0
 _MIC_HOLD_S = 5.0
 
 
+# How an agent report (`VoiceBridge.report`) is put to the voice agent. It
+# arrives on the user's channel, so it has to say it is not the user.
+_REPORT_TEMPLATE = (
+    "[Messaggio automatico dall'agente «{source}», non dall'utente: è l'esito "
+    "di un compito che gli avevi delegato. Riferiscilo all'utente a voce, in "
+    "breve.]\n{text}"
+)
+
+
 class _ThinkingCue:
     """Per-turn "still working" feedback between pick-up and the first
     reply audio, so the user never sits through 10–25 s of dead air.
 
-    - the first `tool_call` frame plays a spoken cue ("Un attimo.") once;
+    - the first `tool_call` frame plays a spoken cue ("Un attimo.") once,
+      unless the model had already spoken before calling the tool;
     - after `delay_ms` with no reply audio, a soft tick, repeated every
       `repeat_ms`.
 
@@ -174,8 +186,12 @@ class _ThinkingCue:
             threading.Thread(target=self._run, name="vb-thinking", daemon=True).start()
         return self
 
-    def on_event(self, ftype: str, _frame: dict) -> None:
-        if ftype == "tool_call":
+    def on_event(self, ftype: str, frame: dict) -> None:
+        # A tool call after the model already said something ("Verifico
+        # subito.") needs no spoken cue: that sentence is already on its
+        # way to the speaker (see the WS leg), a "Ci penso io" on top of it
+        # would be noise.
+        if ftype == "tool_call" and not frame.get("text_before"):
             self._tool.set()
             self._wake.set()
 
@@ -328,6 +344,11 @@ class VoiceBridge:
         # for the next one — i.e. a turn is in flight. A goodbye on auto-idle
         # is skipped while a reply is still on its way.
         self._worker_busy = threading.Event()
+        # Messages from other agents for the voice agent (`report()`), each
+        # delivered as a turn of its own once nobody is talking.
+        self._reports: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        # Set while the endpointer is inside an utterance.
+        self._user_speaking = threading.Event()
         self._wake_cfg = self._wake_detector = self._wake_acks = self._sleep_acks = None
         # Acks speak in the reply voice: they reuse the reply's TTS instance.
         voice = cfg.get("tts_provider", "elevenlabs")
@@ -720,6 +741,49 @@ class VoiceBridge:
             done.wait(timeout=seconds + 15.0)
         return seconds
 
+    def report(self, text: str, *, source: str = "agent") -> None:
+        """Hand the voice agent a message from another agent (the MCP
+        `report_to_user` tool): a delegated task's outcome, to be told to
+        the user. It becomes a turn of its own in the voice agent's session
+        — same context, same voice — so the agent knows later that it said
+        it. Returns at once; the worker delivers it when nobody is talking
+        (`_next_report`)."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("empty report")
+        log.info("Report from %s queued: %s", source, text[:120])
+        self._reports.put((source, text))
+
+    def _next_report(self) -> tuple[str, str] | None:
+        """A queued agent report, if now is a good moment: no user turn
+        waiting or in flight, nothing playing, the user not mid-sentence."""
+        if (self._state is State.PROCESSING or self._user_speaking.is_set()
+                or not self.utterance_q.empty() or self._reply_playing()):
+            return None
+        try:
+            return self._reports.get_nowait()
+        except queue.Empty:
+            return None
+
+    @_transition
+    def _arm_for_report(self) -> None:
+        """A report turn starts while the bridge isn't recording: mark it
+        auto-idled so the reply opens the mic (`_unidle_for_reply`) and the
+        user can answer — what `say_to_speaker` does."""
+        if self._state is not State.RECORDING:
+            self._set_state(self._state, auto_idled=True)
+
+    def _run_report(self, source: str, text: str) -> None:
+        gen = self._current_gen()
+        self._arm_for_report()
+        t0 = time.monotonic()
+        self.player.turn_t0 = t0
+        log.info("Report from %s → voice agent: %s", source, text[:200])
+        # No thinking cue (nobody is waiting on this turn, ticks out of the
+        # blue would be noise) and no beep if the agent stays silent.
+        self._run_text_turn(gen, _REPORT_TEMPLATE.format(source=source, text=text),
+                            t0, {}, _ThinkingCue(self, gen), beep_on_silence=False)
+
     # -- thread loops --------------------------------------------------
     def _hid_loop(self) -> None:
         # Blocks on the monitor's press event; `stop()` interrupts it, so the
@@ -884,6 +948,12 @@ class VoiceBridge:
                  self._wake_cfg["phrases"], self._wake_cfg["language"],
                  self._wake_cfg["rms_threshold"])
         gate = wake_word.SpeechGate(self.cfg["sample_rate"], self.cfg["chunk_size"], self._wake_cfg)
+        capture = wake_word.SegmentCapture(
+            self._wake_cfg["capture"], self.cfg["sample_rate"],
+            os.path.dirname(os.path.abspath(__file__)))
+        if capture.enabled:
+            log.info("Wake capture: saving segments to %s (newest %d kept)",
+                     capture.dir, capture.max_files)
         while not self.shutdown_event.is_set():
             try:
                 chunk = self.wake_q.get(timeout=self._SAFETY_TIMEOUT_S)
@@ -907,6 +977,7 @@ class VoiceBridge:
             log.info("Wake segment %.1fs → %r in %.2fs%s",
                      len(segment) / (2 * self.cfg["sample_rate"]), text,
                      time.monotonic() - t0, " (wake)" if hit else "")
+            capture.save(segment, text, hit)
             if hit:
                 # Audio queued while Whistle transcribed is the start of
                 # what the user says next: hand it to the endpointer.
@@ -939,6 +1010,7 @@ class VoiceBridge:
             nonlocal ducked
             if ep.in_speech != ducked:
                 ducked = ep.in_speech
+                (self._user_speaking.set if ducked else self._user_speaking.clear)()
                 (self._duck_acquire if ducked else self._duck_release)(reason)
 
         def committed(pcm: bytes, gen: int) -> None:
@@ -1082,7 +1154,14 @@ class VoiceBridge:
             # While PROCESSING the loop head above has to re-check when the
             # player goes quiet (a cue was still playing), so poll; otherwise
             # block.
-            timeout = 0.2 if self._state is State.PROCESSING else self._SAFETY_TIMEOUT_S
+            # Same while agent reports wait for a quiet moment.
+            report = self._next_report()
+            if report is not None:
+                self._worker_busy.set()
+                self._run_report(*report)
+                continue
+            waiting = self._state is State.PROCESSING or not self._reports.empty()
+            timeout = 0.2 if waiting else self._SAFETY_TIMEOUT_S
             try:
                 gen, pcm, sr = self.utterance_q.get(timeout=timeout)
             except queue.Empty:
@@ -1139,7 +1218,11 @@ class VoiceBridge:
         if gen != self._current_gen():
             return
         log.info("User: %s", text)
+        self._run_text_turn(gen, text, t0, timing, cue)
 
+    def _run_text_turn(self, gen: int, text: str, t0: float, timing: dict,
+                       cue: "_ThinkingCue", *, beep_on_silence: bool = True) -> None:
+        """Gateway → TTS → playback_q for one message to the agent."""
         backend = self.cfg.get("gateway_backend", "openclaw")
         if backend == "zeroclaw_ws":
             log.info("Worker: → gateway %s (backend=zeroclaw_ws agent=%s session=%s)",
@@ -1181,7 +1264,8 @@ class VoiceBridge:
                 if gen != self._current_gen():
                     return
                 timing.setdefault("first_token", time.monotonic() - t0)
-                collected.append(delta)
+                if delta != TOOL_BOUNDARY:
+                    collected.append(delta)
                 yield delta
             timing["gateway_done"] = time.monotonic() - t0
 
@@ -1201,7 +1285,8 @@ class VoiceBridge:
             cue.stop()
             full_reply = "".join(collected).strip()
             self._reply_is_question = _expects_answer(full_reply)
-            if _is_no_reply(full_reply) and gen == self._current_gen():
+            if (_is_no_reply(full_reply) and gen == self._current_gen()
+                    and beep_on_silence):
                 # Agent said "stay silent" — play a short low beep so
                 # the user gets feedback that the turn was processed
                 # but nothing needed saying.
@@ -1385,7 +1470,8 @@ def main() -> None:
     # keeps running without it.
     if (cfg.get("mcp_server") or {}).get("enabled"):
         try:
-            speaker_socket.serve(cfg["speaker_socket"], bridge.play_pcm)
+            speaker_socket.serve(cfg["speaker_socket"], bridge.play_pcm,
+                                 report=bridge.report)
         except Exception:
             log.exception("Speaker socket failed to start; voice client continues")
 

@@ -27,6 +27,8 @@ from typing import Any, Coroutine, Iterable, Iterator
 
 import deepgram
 
+from gateway import TOOL_BOUNDARY
+
 log = logging.getLogger(__name__)
 
 
@@ -125,7 +127,7 @@ class DeepgramVoice:
         gateway-stream + full TTS round-trip, same as the non-streaming
         path.
         """
-        text = "".join(text_iter).strip()
+        text = "".join(d for d in text_iter if d != TOOL_BOUNDARY).strip()
         if not text:
             return
         audio = self.synthesize(text)
