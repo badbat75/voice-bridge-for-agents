@@ -62,7 +62,7 @@
       "[relaxed] Ok, a dopo.",
       "[cheerful] Va bene, ciao!"
     ],
-    "fuzzy_threshold": 0.8,
+    "fuzzy_threshold": 0.65,
     "aliases": [
       "hey bye harry",
       "hey bye ali"
