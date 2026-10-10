@@ -28,7 +28,9 @@ Each stage has its own failure message, so a missing piece of zeroclaw
 config (worker without the tool, agent delegating synchronously) is named.
 
 Run:  .venv/bin/python tests/test_delegation_live.py
-Env:  VB_LIVE_SLEEP (worker task length, default 15), VB_LIVE_TIMEOUT (default 240)
+Env:  VB_LIVE_SLEEP (worker task length, default 15), VB_LIVE_TIMEOUT (default 240),
+      VB_LIVE_PROMPT (say it the way a user would, to test the agents' own
+      instructions instead of the explicit recipe)
 """
 
 from __future__ import annotations
@@ -154,7 +156,8 @@ class LiveAsyncDelegation(unittest.TestCase):
 
         reply = []
         for delta in gateway.gateway_chat_stream_zeroclaw_ws(
-                cfg["gateway_base_url"], cfg["gateway_token"], _PROMPT.format(n=_SLEEP),
+                cfg["gateway_base_url"], cfg["gateway_token"],
+                os.environ.get("VB_LIVE_PROMPT") or _PROMPT.format(n=_SLEEP),
                 cfg.get("gateway_agent", "default"), cfg.get("session_key", "voice-bridge"),
                 on_event=on_event):
             if delta != gateway.TOOL_BOUNDARY:
