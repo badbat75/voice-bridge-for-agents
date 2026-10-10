@@ -177,6 +177,26 @@ class AckBankTest(unittest.TestCase):
         warm.synthesize.assert_not_called()
         self.assertEqual(sorted(c[2] for c in bank._clips), [b"Dimmi.", b"Eccomi."])
 
+    def test_clip_is_cut_at_its_first_long_pause(self):
+        rate = 24000
+        tone = lambda ms: array.array("h", [8000, -8000] * (rate * ms // 2000)).tobytes()
+        hiss = lambda ms: array.array("h", [40, -40] * (rate * ms // 2000)).tobytes()
+        # Speech with a short inner pause, 5 s of noise floor, then a repeat.
+        padded = tone(400) + hiss(300) + tone(500) + hiss(5000) + tone(600)
+        cut = wake_word.trim_clip(padded, rate)
+        self.assertAlmostEqual(len(cut) / 2 / rate, 1.2 + wake_word.CLIP_TAIL_MS / 1000, delta=0.06)
+        self.assertTrue(padded.startswith(cut))
+        clean = tone(400) + hiss(300) + tone(500) + hiss(100)
+        self.assertEqual(wake_word.trim_clip(clean, rate), clean, "a clean clip is left alone")
+        self.assertEqual(wake_word.trim_clip(b"", rate), b"")
+        tts = mock.Mock()
+        tts.synthesize.return_value = padded
+        bank = self._bank(tts, phrases=("Un attimo.",))
+        bank.prepare()
+        self.assertEqual(bank._clips[0][2], cut, "the bank serves the trimmed clip")
+        with open(os.path.join(self.cache, self._files()[0]), "rb") as f:
+            self.assertEqual(f.read(), padded, "the cache keeps the voice's own audio")
+
     def test_clips_live_in_a_per_voice_folder(self):
         self._bank(self._echo_tts()).prepare()
         self.assertTrue(all(f.startswith("wake/deepgram-aura-2-livia-it/") for f in self._files()))

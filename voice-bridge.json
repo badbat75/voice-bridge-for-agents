@@ -131,7 +131,8 @@
     "enabled": true,
     "base_url": "http://localhost:8980",
     "default_volume_percent": 100,
-    "ducking_percent": 50,
+    "ducking_percent": 5,
+    "duck_while_listening": true,
     "request_timeout_s": 1.0
   },
   "telegram": {

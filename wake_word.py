@@ -321,6 +321,42 @@ class WakeDetector:
 
 RETRY_MIN_S, RETRY_MAX_S = 30.0, 600.0
 
+# A clip ends at its first pause this long; that much is kept after the
+# last loud window so the final syllable isn't clipped.
+CLIP_PAUSE_MS, CLIP_TAIL_MS = 700, 150
+
+
+def trim_clip(pcm: bytes, rate: int) -> bytes:
+    """Cut a clip at its first long pause.
+
+    eleven_v3 sometimes pads a one-second phrase with several seconds of
+    near-silence, or says it a second time after the gap (seen 2026-10-10:
+    "Un attimo." came back 7.1 s and 8.1 s long). The player holds the
+    speaker, and the music down, for the whole clip, and the reply waits
+    behind it. "Loud" is relative to the clip's own peak, so the generated
+    noise floor doesn't count as speech."""
+    samples = array.array("h")
+    samples.frombytes(pcm[:len(pcm) & ~1])
+    win = max(1, rate // 20)  # 50 ms
+    levels = []
+    for i in range(0, len(samples), win):
+        seg = samples[i:i + win]
+        levels.append(math.sqrt(sum(x * x for x in seg) / len(seg)))
+    if not levels:
+        return pcm
+    quiet = max(levels) * 0.1
+    pause = max(1, CLIP_PAUSE_MS // 50)
+    last_loud = None
+    for i, level in enumerate(levels):
+        if level > quiet:
+            last_loud = i
+        elif last_loud is not None and i - last_loud >= pause:
+            break
+    if last_loud is None:
+        return pcm
+    end = (last_loud + 1) * win + rate * CLIP_TAIL_MS // 1000
+    return pcm[:end * 2] if end * 2 < len(pcm) else pcm
+
 
 class AckBank:
     """Short spoken clips in the reply voice, disk-cached per voice.
@@ -391,6 +427,18 @@ class AckBank:
         return " ".join(re.sub(r"\[[^\]]*\]", " ", text).split())
 
     def _load_or_synthesize(self, text: str, path: str) -> bytes | None:
+        pcm = self._cached_or_synthesized(text, path)
+        if not pcm:
+            return None
+        # Trimmed on the way out, so the cache keeps what the voice sent.
+        trimmed = trim_clip(pcm, int(self.cfg["tts_sample_rate"]))
+        if len(trimmed) < len(pcm):
+            log.info("Wake acks (%s): %r trimmed %.1fs → %.1fs", self.kind, text,
+                     len(pcm) / 2 / int(self.cfg["tts_sample_rate"]),
+                     len(trimmed) / 2 / int(self.cfg["tts_sample_rate"]))
+        return trimmed
+
+    def _cached_or_synthesized(self, text: str, path: str) -> bytes | None:
         if os.path.exists(path) and os.path.getsize(path) > 0:
             with open(path, "rb") as f:
                 return f.read()

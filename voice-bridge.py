@@ -167,7 +167,9 @@ class _ThinkingCue:
       (`still_phrases`), so a 40 s wait is never ticks alone.
 
     Cues go through the player queue (serialized, never mixed with the
-    reply) and don't duck the music. `stop()` is called before the first
+    reply). A spoken cue ducks the music like any other speech; a tick
+    doesn't (it's quiet, and a volume dip every `repeat_ms` would be
+    worse than the tick). `stop()` is called before the first
     reply chunk is queued; the lock makes "check stopped + enqueue"
     atomic, so no cue can land behind the reply."""
 
@@ -207,14 +209,14 @@ class _ThinkingCue:
             self._stop.set()
         self._wake.set()
 
-    def _enqueue(self, pcm: bytes | None, label: str) -> bool:
+    def _enqueue(self, pcm: bytes | None, label: str, duck: bool = False) -> bool:
         if not pcm:
             return False
         with self._lock:
             if self._stop.is_set():
                 return False
             self._bridge.playback_q.put((self._gen, _ExternalUtterance(
-                pcm, threading.Event(), label=label, duck=False, cue=True)))
+                pcm, threading.Event(), label=label, duck=duck, cue=True)))
             self.cues_played += 1
             return True
 
@@ -239,7 +241,7 @@ class _ThinkingCue:
                 spoke = True
                 next_speak = now + self._still_after if self._still_after else never
                 clip = bank.pick() if bank else None
-                if self._enqueue(clip[2] if clip else None, label):
+                if self._enqueue(clip[2] if clip else None, label, duck=True):
                     log.info("Thinking cue at %.1fs: %r", now - t0, clip[1])
                     next_tick = now + self._repeat
                     continue
@@ -280,6 +282,11 @@ class VoiceBridge:
         # in voice-bridge.json under `deezer_connect`. Constructed by
         # main() so tests can inject a fake.
         self.deezer = deezer or DeezerConnectPlugin(cfg.get("deezer_connect"))
+        # `deezer_connect.duck_while_listening`: one more hold for the whole
+        # conversation — see `_hold_listening_duck`.
+        self._duck_while_listening = bool(
+            (cfg.get("deezer_connect") or {}).get("duck_while_listening"))
+        self._listening_duck = False
         # Ducking holds — see `_duck_acquire`.
         self._duck_lock = threading.Lock()
         self._duck_holds = 0
@@ -465,7 +472,8 @@ class VoiceBridge:
     # committed to STT) or the bridge (one hold per aplay — reply, ack,
     # goodbye, beep, say_to_speaker). Holds overlap (talking over a reply,
     # an ack racing the player), so they're counted: duck on 0→1, unduck
-    # on 1→0. Mute/idle state no longer affects ducking.
+    # on 1→0. Mute/idle state doesn't affect ducking, unless
+    # `duck_while_listening` adds its conversation-long hold (below).
     #
     # The volume I/O (HTTP to the deezer-connect BFF, up to 2 × timeout)
     # runs on the `vb-duck` thread once `start()` has launched it, so the
@@ -511,6 +519,21 @@ class VoiceBridge:
         finally:
             self._duck_release(reason)
 
+    def _hold_listening_duck(self, want: bool) -> None:
+        """Keep the music down for the whole conversation (RECORDING and
+        PROCESSING), not only while the endpointer hears speech.
+
+        With the player loud the mic hears the music: the endpointer
+        committed it as utterances ("Pei Ning", "A sorte, dà"), each one a
+        ~10 s turn with the mic closed, and ducking only on "speech" made
+        the volume pump. Opt-in (`deezer_connect.duck_while_listening`): it
+        needs a bridge that leaves RECORDING on its own (wake word or
+        auto-idle), or the music would stay down for good."""
+        if not self._duck_while_listening or want == self._listening_duck:
+            return
+        self._listening_duck = want
+        (self._duck_acquire if want else self._duck_release)("listening")
+
     @_transition
     def _set_state(self, new: State, *, auto_idled: bool = False) -> None:
         """Enter `new` and derive the rest: `recording`, `_wake_armed` and
@@ -532,6 +555,7 @@ class VoiceBridge:
         (self._mic_wanted.set if records or armed else self._mic_wanted.clear)()
         if muted != old_muted:
             self.hid.set_led(muted=muted)
+        self._hold_listening_duck(new in (State.RECORDING, State.PROCESSING))
 
     @_transition
     def _enter_idle(self, source: str) -> None:
@@ -1414,6 +1438,7 @@ class VoiceBridge:
         with self._duck_lock:
             q, self._duck_q = self._duck_q, None
             self._duck_holds = 0
+            self._listening_duck = False
         if q is not None:
             q.put(None)
             self._duck_thread.join(timeout=3.0)

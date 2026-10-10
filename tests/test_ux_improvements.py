@@ -3,7 +3,8 @@
 
   1. Thinking cue          — tick after `delay_ms` of dead air, a spoken
                              "un attimo" on the first `tool_call`, never a
-                             cue behind the reply, cues don't duck music.
+                             cue behind the reply, spoken cues duck the
+                             music, ticks don't.
      Hybrid TTS            — `tts_first_sentence_early`: first sentence
                              synthesized before the gateway finishes, the
                              rest in one call.
@@ -188,7 +189,7 @@ class ThinkingCueTest(unittest.TestCase):
         items = [it for _g, it in _drain_q(bridge.playback_q)]
         self.assertTrue(all(isinstance(it, VB._ExternalUtterance) for it in items))
         self.assertTrue(all(it.cue and not it.duck for it in items),
-                        "cues must not duck the music or count as replies")
+                        "ticks must not duck the music or count as replies")
         self.assertEqual(items[0].pcm, VB._make_tick_pcm(_TTS_RATE))
 
     def test_tool_call_plays_spoken_cue_once(self):
@@ -210,6 +211,8 @@ class ThinkingCueTest(unittest.TestCase):
         items = [it for _g, it in _drain_q(bridge.playback_q)]
         self.assertEqual([it.pcm for it in items], [b"\x07\x07"])
         self.assertEqual(items[0].label, "thinking-ack")
+        self.assertTrue(items[0].cue and items[0].duck,
+                        "a spoken cue ducks the music but is not a reply")
 
     def test_spoken_cue_after_a_wait_even_without_tool_call_then_still_phrases(self):
         bridge, cue = self._cue(delay_ms=10_000, repeat_ms=10_000,
@@ -226,6 +229,7 @@ class ThinkingCueTest(unittest.TestCase):
         items = [it for _g, it in _drain_q(bridge.playback_q)]
         self.assertEqual([it.pcm for it in items[:3]], [b"\x07\x07", b"\x08\x08", b"\x08\x08"])
         self.assertEqual([it.label for it in items[:2]], ["thinking-ack", "thinking-still"])
+        self.assertTrue(all(it.duck for it in items[:3]), "still phrases duck too")
         self.assertEqual(bridge._thinking_acks.pick.call_count, 1)
 
     def test_tool_call_speaks_before_the_wait_and_resets_it(self):
@@ -284,6 +288,32 @@ class ThinkingCueTest(unittest.TestCase):
             t.join(1)
         bridge.deezer.duck.assert_not_called()
         self.assertEqual(bridge._replies_since_resume, 0, "a cue is not a reply")
+
+
+class ListeningDuckTest(unittest.TestCase):
+    """`deezer_connect.duck_while_listening`: the music stays down from the
+    resume to the idle, through PROCESSING, on one hold."""
+
+    def test_music_stays_down_for_the_whole_conversation(self):
+        bridge, _ = _bridge(deezer_connect={"duck_while_listening": True})
+        S = type(bridge._state)
+        bridge._set_state(S.RECORDING)
+        bridge.deezer.duck.assert_called_once()
+        with bridge._ducked("reply"):       # a reply inside the conversation
+            bridge._set_state(S.PROCESSING)
+        bridge._set_state(S.RECORDING)
+        bridge.deezer.duck.assert_called_once()
+        bridge.deezer.unduck.assert_not_called()
+        bridge._set_state(S.MUTED)
+        bridge.deezer.unduck.assert_called_once()
+        bridge._set_state(S.MUTED)
+        bridge.deezer.unduck.assert_called_once()
+
+    def test_off_by_default(self):
+        bridge, _ = _bridge()
+        _recording(bridge)
+        bridge._set_state(type(bridge._state).PROCESSING)
+        bridge.deezer.duck.assert_not_called()
 
 
 class HybridTtsTest(unittest.TestCase):
