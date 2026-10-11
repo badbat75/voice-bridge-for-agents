@@ -26,11 +26,19 @@ threshold, so every short follow-up came out unknown):
 - **Adapted voiceprint** (`adapt`, off by default): embeddings of real
   turns, labelled by the conversation rather than by their own score — a
   turn counts only in a conversation where a phrase matched the *enrolled*
-  voiceprint with margin (`confident`) — are averaged into a second
-  voiceprint per speaker, and a voice is scored against the better of the
-  two. The enrolled one is the anchor: an adapted voiceprint that drifts
-  away from it (`min_anchor_similarity`) is thrown away. Only vectors are
-  kept, never audio.
+  voiceprint with margin (`confident`) — are kept as samples, and a voice
+  is also scored against the `top_k` samples closest to it (not their
+  mean: a few takes from across the room would drown among the many from
+  close by). A short turn that matched nobody counts too if the confident
+  one comes later in the same conversation. The enrolled voiceprint is the
+  anchor: samples whose mean drifts away from it (`min_anchor_similarity`)
+  are thrown away. Only vectors are kept, never audio.
+
+Distance changes a voice more than anything else here (2026-10-11: the same
+speaker, 0.37 from across the room and 0.81 close by half a minute later),
+so the wizard also takes `far_sentences` from where the user usually talks
+and keeps them as a second enrolled voiceprint, never averaged with the
+close one. `far_phrases` run that part alone for a voice already known.
 
 Profiles are voiceprints (biometric data): they live under the gitignored
 `data/`. This is recognition for convenience, not authentication — a
@@ -41,6 +49,7 @@ from __future__ import annotations
 
 import array
 import datetime
+import difflib
 import json
 import logging
 import math
@@ -83,7 +92,10 @@ DEFAULTS = {
         # Used from `min_samples` on; the oldest go after `max_samples`.
         "min_samples": 5,
         "max_samples": 40,
-        # Adapted vs enrolled voiceprint: below this the samples are dropped.
+        # The adapted score is the mean over this many closest samples.
+        "top_k": 3,
+        # Mean of the samples vs the enrolled voiceprint: below this they
+        # are dropped.
         "min_anchor_similarity": 0.60,
     },
     # How long a turn waits for the identification after STT has returned.
@@ -94,6 +106,10 @@ DEFAULTS = {
     # Said after the wake word, these start the wizard instead of a turn.
     "enroll_phrases": ["facciamo conoscenza", "impara la mia voce",
                        "impara a riconoscermi", "registra la mia voce"],
+    # Said after the wake word by a known voice (or followed by its name),
+    # these run only the takes from a distance. Checked before the above.
+    "far_phrases": ["impara la mia voce da lontano", "riconoscimi da lontano",
+                    "facciamo conoscenza da lontano", "impara a riconoscermi da lontano"],
     # One take per sentence.
     "sentences": [
         "Oggi è una bella giornata e ho voglia di ascoltare un po' di musica.",
@@ -102,11 +118,26 @@ DEFAULTS = {
         "Ricordami di chiamare il dottore giovedì alle quattro e mezza.",
         "Mi piace cucinare la pasta con il pomodoro fresco e il basilico.",
     ],
+    # After those, one take per sentence from where the user usually talks
+    # ([] = no far takes).
+    "far_sentences": [
+        "Metti un po' di musica tranquilla mentre preparo la cena.",
+        "Quanto manca alla fine del timer che ho messo prima?",
+        "Spegni tutto, per favore, che stiamo uscendo di casa.",
+    ],
     # A take shorter than this is asked again.
     "min_take_s": 2.0,
     # A take less similar than this to the ones before it is asked again
     # (somebody else talking, or mostly noise).
     "take_consistency": 0.35,
+    # A take must also be the sentence that was asked: the STT text has to
+    # be this close to it (difflib ratio on the letters, 0 = not checked).
+    # A voice the STT can't make out is too faint to learn from — and from
+    # that far the agent wouldn't understand a request either.
+    "take_text_match": 0.6,
+    # The same for a far take, against the close voiceprint or the far takes
+    # before it, whichever is closer: distance alone costs a lot.
+    "far_take_consistency": 0.25,
 }
 
 # The wizard's fixed lines. `[tone]` tags are acted by eleven_v3 and
@@ -120,6 +151,14 @@ GOOD = ["[cheerful] Perfetto.", "[warm] Benissimo.", "[cheerful] Ottimo."]
 TOO_SHORT = "[warm] Era un po' corta. Riproviamo."
 UNCLEAR = "[warm] Non ti ho sentito bene. Riproviamo."
 DONE = "[cheerful] Fatto! D'ora in poi riconoscerò la tua voce."
+FAR_INTRO = ("[warm] Adesso allontanati e mettiti dove stai di solito quando mi parli. "
+             "Parla da lì, con la voce di sempre.")
+FAR_ONLY_INTRO = ("[warm] Va bene, imparo a riconoscerti anche da lontano. Allontanati e "
+                  "mettiti dove stai di solito quando mi parli, poi parla da lì con la "
+                  "voce di sempre.")
+FAR_DONE = "[cheerful] Fatto! Ora ti riconosco anche da lontano."
+FAR_CLOSER = "[warm] Da lì non ti sento bene. Avvicinati un po' e riprova."
+FAR_SKIPPED = "[calm] Va bene, ci fermiamo qui. Da vicino ti riconosco già."
 CANCELLED = "[calm] Va bene, lasciamo stare."
 TIMEOUT = "[calm] Non sento nessuno, ci fermiamo qui. Riproviamo quando vuoi."
 GIVE_UP = "[calm] Non riesco a sentirti bene. Riproviamo più tardi."
@@ -136,8 +175,8 @@ def config(cfg: dict) -> dict:
     user = cfg.get("speaker_id") or {}
     out = {**DEFAULTS, **user}
     out["adapt"] = {**DEFAULTS["adapt"], **(user.get("adapt") or {})}
-    out["enroll_phrases"] = [wake_word.normalize(p) for p in out["enroll_phrases"]
-                             if wake_word.normalize(p)]
+    for key in ("enroll_phrases", "far_phrases"):
+        out[key] = [wake_word.normalize(p) for p in out[key] if wake_word.normalize(p)]
     return out
 
 
@@ -147,9 +186,13 @@ def take_prompt(sentence: str) -> str:
 
 def prompts(scfg: dict) -> list[str]:
     """Every fixed line the wizard can say — what the bridge caches."""
-    return ([INTRO, ASK_NAME, NAME_AGAIN, GREET, *GOOD, TOO_SHORT, UNCLEAR, DONE,
-             CANCELLED, TIMEOUT, GIVE_UP, FAILED]
-            + [take_prompt(s) for s in scfg["sentences"]])
+    lines = ([INTRO, ASK_NAME, NAME_AGAIN, GREET, *GOOD, TOO_SHORT, UNCLEAR, DONE,
+              CANCELLED, TIMEOUT, GIVE_UP, FAILED]
+             + [take_prompt(s) for s in scfg["sentences"]])
+    if scfg["far_sentences"]:
+        lines += [FAR_INTRO, FAR_ONLY_INTRO, FAR_DONE, FAR_CLOSER, FAR_SKIPPED]
+        lines += [take_prompt(s) for s in scfg["far_sentences"]]
+    return list(dict.fromkeys(lines))
 
 
 def _unit(vec) -> list[float]:
@@ -189,11 +232,13 @@ class _Pending:
 
 class Match(NamedTuple):
     """One utterance against the profiles: the closest `name`, its `score`
-    (the better of `enrolled` and `adapted`, None while there is no adapted
-    voiceprint), the embedding and the utterance's length."""
+    (the best of `enrolled` — the close voiceprint — `far` and `adapted`,
+    None for the ones that speaker doesn't have), the embedding and the
+    utterance's length."""
     name: str
     score: float
     enrolled: float
+    far: float | None
     adapted: float | None
     embedding: list
     seconds: float
@@ -210,9 +255,10 @@ class SpeakerId:
         self._extractor = None
         self._lock = threading.Lock()  # model load + inference, one at a time
         self.profiles: dict[str, list[float]] = {}  # enrolled voiceprints
+        self._far: dict[str, list[float]] = {}  # the same, from a distance
         self._adapt = scfg["adapt"]
         self._samples: dict[str, list[list[float]]] = {}
-        self._adapted: dict[str, list[float]] = {}
+        self._adapted: set[str] = set()  # speakers whose samples are in use
         # This conversation, worker thread only: who was recognized, who
         # with margin, and the samples waiting for that.
         self._conv_name: str | None = None
@@ -249,51 +295,80 @@ class SpeakerId:
     def _read_profiles(self) -> None:
         speakers = self._read_file()["speakers"]
         self.profiles = {name: _unit(p["embedding"]) for name, p in speakers.items()}
+        self._far = {name: _unit(p["far"]["embedding"])
+                     for name, p in speakers.items() if p.get("far")}
         if not self.profiles:
             return
         log.info("Speaker id: %d known voice(s): %s", len(self.profiles),
-                 ", ".join(self.profiles))
+                 ", ".join(n + (" (+ far)" if n in self._far else "") for n in self.profiles))
         if self._adapt["enabled"]:
             for name, p in speakers.items():
                 self._samples[name] = (p.get("adapted") or {}).get("samples") or []
                 self._refresh_adapted(name)
 
     def save_profile(self, name: str, embeddings) -> None:
-        """Store `name` as the mean of its takes (replaces an older profile,
-        adapted samples included: they belonged to the old voiceprint)."""
+        """Store `name` as the mean of its takes. It replaces an older
+        profile, far takes included (the wizard asks them again); adapted
+        samples stay if they are still like the new voiceprint."""
         data = self._read_file()
         mean = _mean(embeddings)
-        data["speakers"][name] = {
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        old = ((data["speakers"].get(name) or {}).get("adapted") or {}).get("samples") or []
+        kept = [x for x in old if _cosine(x, mean) >= float(self._adapt["min_score"])]
+        data["speakers"][name] = {"embedding": mean, "takes": len(embeddings), "updated": now}
+        if kept:
+            data["speakers"][name]["adapted"] = {"samples": kept, "updated": now}
+        self._write_file(data)
+        self.profiles[name] = mean
+        self._far.pop(name, None)
+        self._samples[name] = kept
+        if self._adapt["enabled"]:
+            self._refresh_adapted(name)
+        log.info("Speaker id: saved the voice of %s (%d takes, %d of %d samples kept)",
+                 name, len(embeddings), len(kept), len(old))
+
+    def save_far(self, name: str, embeddings) -> None:
+        """Add to `name`'s profile the mean of takes made from a distance: a
+        second enrolled voiceprint, never averaged with the close one."""
+        data = self._read_file()
+        if name not in data["speakers"]:
+            raise OSError(f"no profile for {name}")
+        mean = _mean(embeddings)
+        data["speakers"][name]["far"] = {
             "embedding": mean,
             "takes": len(embeddings),
             "updated": datetime.datetime.now().isoformat(timespec="seconds"),
         }
         self._write_file(data)
-        self.profiles[name] = mean
-        self._samples.pop(name, None)
-        self._adapted.pop(name, None)
-        log.info("Speaker id: saved the voice of %s (%d takes)", name, len(embeddings))
+        self._far[name] = mean
+        log.info("Speaker id: saved the voice of %s from a distance (%d takes, "
+                 "%.2f to the close one)", name, len(embeddings),
+                 _cosine(mean, self.profiles[name]))
 
     # -- adapted voiceprint ----------------------------------------------
+    def _enrolled(self, embedding, name: str) -> tuple[float, float | None]:
+        """`embedding` against `name`'s close and far voiceprints."""
+        far = _cosine(embedding, self._far[name]) if name in self._far else None
+        return _cosine(embedding, self.profiles[name]), far
+
     def _refresh_adapted(self, name: str) -> None:
-        """Rebuild `name`'s adapted voiceprint from its samples; drop them
-        if it has drifted from the enrolled one."""
+        """Decide whether `name`'s samples are used; drop them if together
+        they have drifted from the enrolled voiceprint."""
         samples = self._samples.get(name) or []
-        self._adapted.pop(name, None)
+        self._adapted.discard(name)
         if len(samples) < int(self._adapt["min_samples"]):
             if samples:
                 log.info("Speaker id: adapted voice of %s: %d of %d samples, not used yet",
                          name, len(samples), int(self._adapt["min_samples"]))
             return
-        adapted = _mean(samples)
-        near = _cosine(adapted, self.profiles[name])
+        near = max(x for x in self._enrolled(_mean(samples), name) if x is not None)
         if near < float(self._adapt["min_anchor_similarity"]):
             log.warning("Speaker id: adapted voice of %s is %.2f from the enrolled one "
                         "(min %.2f), dropping its %d samples", name, near,
                         float(self._adapt["min_anchor_similarity"]), len(samples))
             self._samples[name] = []
             return
-        self._adapted[name] = adapted
+        self._adapted.add(name)
         log.info("Speaker id: adapted voice of %s: %d samples, %.2f to the enrolled one",
                  name, len(samples), near)
 
@@ -310,16 +385,18 @@ class SpeakerId:
             }
             self._write_file(data)
 
-    def _collect(self, m: Match, named: bool) -> None:
+    def _collect(self, m: Match, mine: bool) -> None:
         """Keep `m` as a sample of its speaker if this conversation vouches
-        for it: a turn in it matched the enrolled voiceprint with margin.
-        Turns heard before that one wait in `_conv_pending`."""
+        for it: a turn in it matched an enrolled voiceprint with margin.
+        Turns heard before that one wait in `_conv_pending`. `mine`: the
+        turn may be `m.name`'s (attributed to them, or to nobody yet)."""
         a = self._adapt
         if not a["enabled"]:
             return
-        if named and m.seconds >= float(a["min_s"]) and m.enrolled >= float(a["min_score"]):
+        enrolled = max(m.enrolled, m.far if m.far is not None else m.enrolled)
+        if mine and m.seconds >= float(a["min_s"]) and enrolled >= float(a["min_score"]):
             self._conv_pending.append((m.name, m.embedding))
-        if m.enrolled >= float(a["confident"]):
+        if enrolled >= float(a["confident"]):
             self._conv_confident = m.name
         who = self._conv_confident  # `end_conversation` runs on other threads
         if who:
@@ -408,11 +485,16 @@ class SpeakerId:
     def embed_async(self, pcm: bytes, sample_rate: int) -> _Pending:
         return _Pending(lambda: self.embed(pcm, sample_rate), None)
 
-    def _score(self, embedding, name: str) -> tuple[float, float, float | None]:
-        """(`score`, enrolled, adapted) of `embedding` against `name`."""
-        enrolled = _cosine(embedding, self.profiles[name])
-        adapted = _cosine(embedding, self._adapted[name]) if name in self._adapted else None
-        return max(enrolled, adapted if adapted is not None else enrolled), enrolled, adapted
+    def _score(self, embedding, name: str) -> tuple[float, float, float | None, float | None]:
+        """(`score`, enrolled, far, adapted) of `embedding` against `name`."""
+        enrolled, far = self._enrolled(embedding, name)
+        adapted = None
+        if name in self._adapted:
+            top = sorted((_cosine(embedding, x) for x in self._samples[name]), reverse=True)
+            top = top[:max(1, int(self._adapt["top_k"]))]
+            adapted = sum(top) / len(top)
+        return (max(x for x in (enrolled, far, adapted) if x is not None),
+                enrolled, far, adapted)
 
     def best(self, embedding) -> tuple[str | None, float]:
         """Closest profile and its similarity (any score, even a poor one)."""
@@ -440,23 +522,27 @@ class SpeakerId:
         memory applied. Call once per turn sent to the agent, in order."""
         if m is None:
             return self.unknown
-        carry = float(self.cfg["carry_max_s"])
+        short = m.seconds <= float(self.cfg["carry_max_s"])
         note = ""
         if m.score >= self.threshold:
-            if m.name != self._conv_name:
+            if self._conv_name and m.name != self._conv_name:
                 self.end_conversation()  # somebody else took over
             name = self._conv_name = m.name
-        elif self._conv_name and m.seconds <= carry:
+        elif self._conv_name and short:
             name = self._conv_name
             note = f"; {m.seconds:.1f}s, kept from this conversation"
         else:
             name = None
-            self.end_conversation()  # long enough to tell, and it is nobody
-        if m.adapted is not None:
-            note = f"; enrolled {m.enrolled:.2f}, adapted {m.adapted:.2f}" + note
+            if not short:
+                self.end_conversation()  # long enough to tell, and it is nobody
+        if m.far is not None or m.adapted is not None:
+            parts = [("close", m.enrolled), ("far", m.far), ("adapted", m.adapted)]
+            note = "; " + ", ".join(f"{k} {v:.2f}" for k, v in parts if v is not None) + note
         log.info("Speaker: %s (closest %s, %.2f, threshold %.2f%s)",
                  name or self.unknown, m.name, m.score, self.threshold, note)
-        self._collect(m, named=name == m.name)
+        # A short turn that matched nobody may still be theirs: it waits for
+        # a confident turn later in this conversation.
+        self._collect(m, mine=name == m.name or (name is None and short))
         return name or self.unknown
 
     def identify(self, pcm: bytes, sample_rate: int) -> str:
@@ -476,7 +562,8 @@ class Step(NamedTuple):
 
 class Enrollment:
     """The "far conoscenza" wizard: ask the name, take one recording per
-    sentence, save the profile. One session at a time."""
+    sentence, save the profile, then the same from a distance
+    (`far_sentences`). One session at a time."""
 
     def __init__(self, sid: SpeakerId, scfg: dict) -> None:
         self.sid = sid
@@ -486,7 +573,15 @@ class Enrollment:
         self._stage = ""
         self._name = ""
         self._takes: list[list[float]] = []
+        self._far_takes: list[list[float]] = []
+        self._far_only = False
         self._name_tries = self._bad = 0
+
+    def is_far_request(self, text: str) -> bool:
+        """`text` asks for the takes from a distance only."""
+        return (bool(self.cfg["far_sentences"])
+                and len(wake_word.normalize(text).split()) <= 8
+                and wake_word.matches(text, self.cfg["far_phrases"]))
 
     def is_request(self, text: str) -> bool:
         """`text` (a transcript) asks to start the wizard."""
@@ -496,18 +591,22 @@ class Enrollment:
     @property
     def wants_voice(self) -> bool:
         """The next utterance is a take: it needs its embedding."""
-        return self.active and self._stage == "takes"
+        return self.active and self._stage in ("takes", "far")
 
-    def start(self, name: str = "") -> Step:
+    def start(self, name: str = "", far_only: bool = False) -> Step:
+        """`far_only`: just the takes from a distance, for a voice that is
+        already known (anybody else gets the whole wizard)."""
         with self._lock:
             self.active = True
             self._name = _clean_name(name)
-            self._takes = []
+            self._takes, self._far_takes = [], []
+            self._far_only = far_only and bool(self.cfg["far_sentences"])
             self._name_tries = self._bad = 0
             self.sid.warm()  # loads while the intro plays
             if self._name:
-                log.info("Enrollment: started for %s", self._name)
-                return self._first_take([INTRO])
+                log.info("Enrollment: started for %s%s", self._name,
+                         " (far takes)" if self._far_only else "")
+                return self._after_name([])
             log.info("Enrollment: started, asking the name")
             self._stage = "name"
             return Step([INTRO, ASK_NAME], True)
@@ -517,6 +616,8 @@ class Enrollment:
         with self._lock:
             if not self.active:
                 return Step([], False)
+            if self._stage == "far":
+                return self._end(FAR_SKIPPED, f"{reason}, far takes skipped")
             return self._end(TIMEOUT if reason == "timeout" else CANCELLED, reason)
 
     def on_utterance(self, text: str, embedding, seconds: float) -> Step:
@@ -528,10 +629,12 @@ class Enrollment:
             words = wake_word.normalize(text)
             if len(words.split()) <= 3 and any(
                     wake_word.matches(words, [w]) for w in _CANCEL_WORDS):
+                if self._stage == "far":
+                    return self._end(FAR_SKIPPED, "cancelled by voice, far takes skipped")
                 return self._end(CANCELLED, "cancelled by voice")
             if self._stage == "name":
                 return self._on_name(text)
-            return self._on_take(embedding, seconds)
+            return self._on_take(text, embedding, seconds)
 
     # -- stages (called with the lock held) --------------------------------
     def _end(self, line: str, why: str) -> Step:
@@ -544,6 +647,19 @@ class Enrollment:
         self._stage = "takes"
         return Step(before + [take_prompt(self.cfg["sentences"][0])], True)
 
+    def _first_far(self, before: list) -> Step:
+        self._stage = "far"
+        self._bad = 0
+        return Step(before + [take_prompt(self.cfg["far_sentences"][0])], True)
+
+    def _after_name(self, greeting: list) -> Step:
+        """The name is known: far takes alone if that was asked and the
+        close voiceprint is there, the whole wizard otherwise."""
+        if self._far_only and self._name in self.sid.profiles:
+            return self._first_far(greeting + [FAR_ONLY_INTRO])
+        self._far_only = False
+        return self._first_take(greeting or [INTRO])
+
     def _on_name(self, text: str) -> Step:
         name = _parse_name(text)
         if not name:
@@ -553,20 +669,37 @@ class Enrollment:
             return Step([NAME_AGAIN], True)
         self._name = name
         log.info("Enrollment: name %r", name)
-        return self._first_take([("tts", f"[cheerful] Piacere, {name}!", GREET)])
+        return self._after_name([("tts", f"[cheerful] Piacere, {name}!", GREET)])
 
-    def _on_take(self, embedding, seconds: float) -> Step:
-        sentences = self.cfg["sentences"]
-        again = take_prompt(sentences[len(self._takes)])
+    def _on_take(self, text: str, embedding, seconds: float) -> Step:
+        far = self._stage == "far"
+        sentences = self.cfg["far_sentences" if far else "sentences"]
+        takes = self._far_takes if far else self._takes
+        again = take_prompt(sentences[len(takes)])
         if embedding is None and seconds >= float(self.cfg["min_take_s"]):
             return self._end(FAILED, "no voice model")
+        heard = difflib.SequenceMatcher(
+            None, wake_word.normalize(text).replace(" ", ""),
+            wake_word.normalize(sentences[len(takes)]).replace(" ", "")).ratio()
         problem = None
         if embedding is None or seconds < float(self.cfg["min_take_s"]):
             problem = TOO_SHORT
-        elif self._takes:
-            score = _cosine(embedding, _mean(self._takes))
+        elif heard < float(self.cfg["take_text_match"]):
+            log.info("Enrollment: %stake %d, heard %r, %.2f like the sentence asked",
+                     "far " if far else "", len(takes) + 1, text, heard)
+            problem = FAR_CLOSER if far else UNCLEAR
+        elif far:
+            close = _cosine(embedding, self.sid.profiles[self._name])
+            others = _cosine(embedding, _mean(takes)) if takes else None
+            log.info("Enrollment: far take %d, %.1fs, %.2f like the close voice%s",
+                     len(takes) + 1, seconds, close,
+                     f", {others:.2f} like the far takes before" if takes else "")
+            if max(close, others if takes else close) < float(self.cfg["far_take_consistency"]):
+                problem = UNCLEAR
+        elif takes:
+            score = _cosine(embedding, _mean(takes))
             log.info("Enrollment: take %d, %.1fs, %.2f like the previous ones",
-                     len(self._takes) + 1, seconds, score)
+                     len(takes) + 1, seconds, score)
             if score < float(self.cfg["take_consistency"]):
                 problem = UNCLEAR
         if problem:
@@ -574,18 +707,25 @@ class Enrollment:
             if self._bad >= _MAX_BAD_TAKES:
                 return self._end(GIVE_UP, "too many bad takes")
             return Step([problem, again], True)
-        self._takes.append(embedding)
-        if len(self._takes) < len(sentences):
-            return Step([random.choice(GOOD), take_prompt(sentences[len(self._takes)])], True)
-        other, score = self.sid.best(_mean(self._takes))
-        if other and other != self._name and score >= self.sid.threshold:
-            log.warning("Enrollment: %s sounds like %s (%.2f) — they may be confused",
-                        self._name, other, score)
+        takes.append(embedding)
+        if len(takes) < len(sentences):
+            return Step([random.choice(GOOD), take_prompt(sentences[len(takes)])], True)
         try:
-            self.sid.save_profile(self._name, self._takes)
+            if far:
+                self.sid.save_far(self._name, takes)
+                return self._end(FAR_DONE, f"learned {self._name} from a distance")
+            other, score = self.sid.best(_mean(takes))
+            if other and other != self._name and score >= self.sid.threshold:
+                log.warning("Enrollment: %s sounds like %s (%.2f) — they may be confused",
+                            self._name, other, score)
+            self.sid.save_profile(self._name, takes)
         except OSError as exc:
             log.error("Enrollment: cannot save the profile: %s", exc)
             return self._end(FAILED, "profile not saved")
+        if self.cfg["far_sentences"]:
+            # The close voiceprint is saved: whatever happens to the far
+            # takes, this voice is known from here on.
+            return self._first_far([random.choice(GOOD), FAR_INTRO])
         return self._end(DONE, f"learned {self._name}")
 
 

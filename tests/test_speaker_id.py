@@ -51,7 +51,7 @@ def _scfg(tmp: str, **over) -> dict:
     return speaker_id.config({"speaker_id": {
         "enabled": True, "model_dir": tmp,
         "profiles_path": os.path.join(tmp, "speakers.json"),
-        "sentences": ["Uno.", "Due.", "Tre."], **over}})
+        "sentences": ["Uno.", "Due.", "Tre."], "far_sentences": [], **over}})
 
 
 class _Tmp(unittest.TestCase):
@@ -138,9 +138,49 @@ class ProfilesTest(_Tmp):
         self.assertEqual(self._hears(self._adaptive(), ANNA_FARTHER), "Anna")
         self.assertEqual(self._hears(speaker_id.SpeakerId(self.scfg), ANNA_FARTHER),
                          "Sconosciuto")
-        # Enrolling again starts over.
+        # Enrolling again keeps the samples that are still like the voice...
+        sid.save_profile("Anna", [ANNA_ISH])
+        self.assertEqual(len(self._adaptive()._samples["Anna"]), 2)
+        self.assertEqual(self._hears(self._adaptive(), ANNA_FARTHER), "Anna")
+        # ...and drops the others.
+        sid.save_profile("Anna", [[0.0, 0.0, 1.0]])
+        self.assertEqual(self._adaptive()._samples["Anna"], [])
+
+    def test_short_unknown_turn_counts_once_a_confident_one_follows(self):
+        sid = self._adaptive(min_samples=5)
         sid.save_profile("Anna", [ANNA])
-        self.assertEqual(self._hears(self._adaptive(), ANNA_FARTHER), "Sconosciuto")
+        self.assertEqual(self._hears(sid, ANNA_FARTHER, PCM_1S), "Sconosciuto")  # from afar
+        self.assertEqual(self._hears(sid, ANNA), "Anna")
+        self.assertEqual(len(sid._samples["Anna"]), 2)
+        sid.end_conversation()
+        # A long one that matched nobody is somebody else: never a sample.
+        self.assertEqual(self._hears(sid, ANNA_FARTHER), "Sconosciuto")
+        self.assertEqual(self._hears(sid, ANNA), "Anna")
+        self.assertEqual(len(sid._samples["Anna"]), 3)
+
+    def test_adapted_score_is_the_closest_samples_not_their_mean(self):
+        sid = self._adaptive(min_samples=5, top_k=2)
+        sid.save_profile("Anna", [ANNA])
+        self._hears(sid, ANNA)
+        for voice in [ANNA, ANNA, ANNA, ANNA_FAR, ANNA_FAR]:
+            self._hears(sid, voice)
+        sid.end_conversation()
+        sid.embed = lambda *_a: ANNA_FARTHER
+        m = sid.match(PCM_3S, 16000)
+        self.assertAlmostEqual(m.enrolled, 0.45, places=2)
+        self.assertGreater(m.adapted, 0.95)  # the two far samples; the mean gives 0.72
+        self.assertLess(speaker_id._cosine(ANNA_FARTHER, speaker_id._mean(sid._samples["Anna"])), 0.75)
+
+    def test_far_voiceprint_is_a_second_enrolled_one(self):
+        self.sid.save_profile("Anna", [ANNA])
+        self.assertEqual(self._hears(self.sid, ANNA_FARTHER), "Sconosciuto")
+        self.sid.save_far("Anna", [ANNA_FAR, ANNA_FARTHER])
+        again = speaker_id.SpeakerId(self.scfg)
+        self.assertEqual(self._hears(again, ANNA_FARTHER), "Anna")
+        self.assertEqual(self._hears(again, ANNA), "Anna")
+        self.assertEqual(again.profiles["Anna"], ANNA)  # not averaged in
+        with self.assertRaises(OSError):
+            self.sid.save_far("Bruno", [BRUNO])
 
     def test_samples_must_be_long_and_close_enough(self):
         sid = self._adaptive()
@@ -190,6 +230,80 @@ class EnrollmentTest(_Tmp):
         self.assertEqual(step, speaker_id.Step([speaker_id.DONE], False))
         self.assertFalse(self.en.active)
         self.assertIn("Anna", speaker_id.SpeakerId(self.scfg).profiles)
+
+    def _far_wizard(self):
+        scfg = _scfg(self.tmp, far_sentences=["Quattro.", "Cinque."])
+        sid = speaker_id.SpeakerId(scfg)
+        sid.warm = lambda: None
+        return sid, speaker_id.Enrollment(sid, scfg)
+
+    def test_far_takes_follow_the_close_ones(self):
+        sid, en = self._far_wizard()
+        en.start("Anna")
+        en.on_utterance("Uno.", ANNA, 3.0)
+        en.on_utterance("Due.", ANNA, 3.0)
+        step = en.on_utterance("Tre.", ANNA, 3.0)
+        self.assertEqual(step.say[1:], [speaker_id.FAR_INTRO, speaker_id.take_prompt("Quattro.")])
+        self.assertTrue(step.listen and en.wants_voice)
+        self.assertIn("Anna", sid.profiles)  # the close voiceprint is already saved
+        step = en.on_utterance("Quattro.", BRUNO, 3.0)  # not the same voice
+        self.assertEqual(step.say, [speaker_id.UNCLEAR, speaker_id.take_prompt("Quattro.")])
+        step = en.on_utterance("Quattro.", ANNA_FAR, 3.0)
+        self.assertEqual(step.say[1], speaker_id.take_prompt("Cinque."))
+        step = en.on_utterance("Cinque.", ANNA_FARTHER, 3.0)
+        self.assertEqual(step, speaker_id.Step([speaker_id.FAR_DONE], False))
+        self.assertIn("Anna", sid._far)
+
+    def test_a_take_must_be_the_sentence_asked(self):
+        sid, en = self._far_wizard()
+        en.start("Anna")
+        step = en.on_utterance("Che ore sono?", ANNA, 3.0)  # something else
+        self.assertEqual(step.say, [speaker_id.UNCLEAR, speaker_id.take_prompt("Uno.")])
+        for said in ("uno", "Due!", "Tre."):
+            en.on_utterance(said, ANNA, 3.0)
+        # From too far the STT hears little or nothing: come closer.
+        for said in ("", "[rumore di sottofondo]"):
+            step = en.on_utterance(said, ANNA_FAR, 3.0)
+            self.assertEqual(step.say, [speaker_id.FAR_CLOSER, speaker_id.take_prompt("Quattro.")])
+        self.assertEqual(en.on_utterance("Quattro", ANNA_FAR, 3.0).say[1],
+                         speaker_id.take_prompt("Cinque."))
+        # Not checked when turned off.
+        en2 = speaker_id.Enrollment(sid, _scfg(self.tmp, take_text_match=0))
+        en2.start("Bruno")
+        self.assertEqual(en2.on_utterance("Che ore sono?", BRUNO, 3.0).say[1],
+                         speaker_id.take_prompt("Due."))
+
+    def test_far_takes_can_be_skipped(self):
+        for stop in (lambda en: en.on_utterance("Basta.", None, 0.5),
+                     lambda en: en.cancel("timeout")):
+            sid, en = self._far_wizard()
+            en.start("Anna")
+            for said in ("Uno.", "Due.", "Tre."):
+                en.on_utterance(said, ANNA, 3.0)
+            self.assertEqual(stop(en), speaker_id.Step([speaker_id.FAR_SKIPPED], False))
+            self.assertIn("Anna", sid.profiles)
+            self.assertNotIn("Anna", sid._far)
+
+    def test_far_takes_alone_for_a_known_voice(self):
+        sid, en = self._far_wizard()
+        self.assertTrue(en.is_far_request("Impara la mia voce da lontano."))
+        self.assertFalse(en.is_far_request("Facciamo conoscenza!"))
+        sid.save_profile("Anna", [ANNA])
+        step = en.start("Anna", far_only=True)
+        self.assertEqual(step.say, [speaker_id.FAR_ONLY_INTRO, speaker_id.take_prompt("Quattro.")])
+        en.on_utterance("Quattro.", ANNA_FAR, 3.0)
+        self.assertEqual(en.on_utterance("Cinque.", ANNA_FAR, 3.0).say, [speaker_id.FAR_DONE])
+        self.assertEqual(sid.profiles["Anna"], ANNA)  # untouched
+        # Asked by a voice nobody knows: the name, then the whole wizard.
+        step = en.start(far_only=True)
+        self.assertEqual(step.say, [speaker_id.INTRO, speaker_id.ASK_NAME])
+        step = en.on_utterance("Mi chiamo Bruno.", None, 1.5)
+        self.assertEqual(step.say[1], speaker_id.take_prompt("Uno."))
+        # ...and the name of a known one: its far takes.
+        en.cancel("test")
+        en.start(far_only=True)
+        step = en.on_utterance("Anna.", None, 1.0)
+        self.assertEqual(step.say[1:], [speaker_id.FAR_ONLY_INTRO, speaker_id.take_prompt("Quattro.")])
 
     def test_name_given_skips_the_question(self):
         step = self.en.start("anna")
@@ -289,6 +403,18 @@ class BridgeTest(_Tmp):
         self.assertEqual(self.sent, ["[Sta parlando: Anna] Metti la musica.",
                                      "[Sta parlando: Anna] Ok.",
                                      "[Sta parlando: Sconosciuto] Ok."] * 2)
+
+    def test_far_request_starts_the_far_takes_of_who_asks(self):
+        self.b._speaker_id.cfg["far_sentences"] = ["Quattro."]
+        self.b._speaker_id.save_profile("Anna", [ANNA])
+        self.b._speaker_id.embed = lambda *_a: ANNA
+        self._turn("Impara la mia voce da lontano.")
+        self.assertEqual(self.said, [speaker_id.FAR_ONLY_INTRO, speaker_id.take_prompt("Quattro.")])
+        self.b._speaker_id.embed = lambda *_a: ANNA_FAR
+        self._turn("Quattro.")
+        self.assertEqual(self.said[-1], speaker_id.FAR_DONE)
+        self.assertIn("Anna", self.b._speaker_id._far)
+        self.assertEqual(self.sent, [])
 
     def test_wizard_runs_outside_the_agent(self):
         self.b._speaker_id.embed = lambda *_a: ANNA

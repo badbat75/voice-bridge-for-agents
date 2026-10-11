@@ -1413,6 +1413,15 @@ class VoiceBridge:
             if clip:
                 self._play_wake_ack(clip)
             return
+        if self._enroll and self._enroll.is_far_request(text):
+            # Takes from a distance, for whoever is asking (a voice that
+            # isn't known yet is asked its name and gets the whole wizard).
+            name = self._speaker_id.resolve(who.wait(self._speaker_id.cfg["wait_ms"] / 1000))
+            log.info("Worker: %r starts the far takes of the voice enrollment", text)
+            cue.stop()
+            self._enroll_step(self._enroll.start(
+                "" if name == self._speaker_id.unknown else name, far_only=True))
+            return
         if self._enroll and self._enroll.is_request(text):
             log.info("Worker: %r starts the voice enrollment", text)
             self._enroll_offered = True
