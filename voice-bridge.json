@@ -70,7 +70,7 @@
     ],
     "goodbye_after_turn_only": true,
     "capture": {
-      "enabled": true,
+      "enabled": false,
       "dir": "data/wake-segments",
       "max_files": 300
     }
