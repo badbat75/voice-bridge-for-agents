@@ -39,6 +39,7 @@ from typing import Iterable, Iterator
 import pyaudio
 
 import endpointer
+import speaker_id
 import speaker_socket
 import wake_word
 from deezer_connect_plugin import DeezerConnectPlugin
@@ -399,6 +400,24 @@ class VoiceBridge:
             self._still_acks = wake_word.AckBank(
                 cfg, sphrases, voice, ack_dir, tts, kind="thinking-still")
 
+        # Who is talking (`speaker_id.enabled`): every message to the agent
+        # is tagged with the speaker's name, and `_enroll` is the spoken
+        # wizard that learns a voice — see speaker_id.py.
+        self._speaker_id = self._enroll = self._enroll_clips = None
+        # Set while the wizard speaks: the worker leaves the mic paused.
+        self._enroll_speaking = threading.Event()
+        # With no voice known yet, the first wake word after boot starts
+        # the wizard by itself (once: a cancel is respected until restart).
+        self._enroll_offered = False
+        scfg = speaker_id.config(cfg)
+        if scfg["enabled"]:
+            self._speaker_id = speaker_id.SpeakerId(scfg, _HERE)
+            self._enroll = speaker_id.Enrollment(self._speaker_id, scfg)
+            # Lines of several sentences: only a long pause ends a clip.
+            self._enroll_clips = wake_word.AckBank(
+                cfg, speaker_id.prompts(scfg), voice, ack_dir, tts, kind="enroll",
+                pause_ms=2000)
+
         # Frame-level voice check at commit (None = off).
         self._speech_vad = _make_speech_vad(cfg)
 
@@ -585,6 +604,12 @@ class VoiceBridge:
         self._set_state(State.IDLE_LISTENING if self.wake_mode else State.MUTED,
                         auto_idled=True)
         self._drain_queue(self.audio_q)
+        if self._enroll and self._enroll.active:
+            # Nobody answered the wizard: it says so itself, no goodbye.
+            step = self._enroll.cancel("timeout")
+            threading.Thread(target=self._enroll_say, args=(step.say,),
+                             name="vb-enroll-timeout", daemon=True).start()
+            return
         if self.wake_mode:
             # Say goodbye — unless a reply is still on its way, in which
             # case the player un-idles for it and "a dopo" would be a lie.
@@ -647,6 +672,19 @@ class VoiceBridge:
 
     @_transition
     def _on_hid_press(self) -> None:
+        if self._enroll and self._enroll.active:
+            # The wizard owns the conversation: a press ends it and mutes.
+            # The gen bump sheds the take being said or processed, so it
+            # never reaches the agent as a turn.
+            log.info("HID press during enrollment: cancel and mute")
+            self._enroll.cancel("button")
+            self._bump_gen()
+            self._drain_queue(self.utterance_q)
+            self._set_state(State.MUTED)
+            return
+        if self.wake_mode:
+            self._toggle_privacy_mute()
+            return
         if self._state is State.PROCESSING:
             # Mic is only paused for the agent; a press here means "mute".
             # No gen bump, so the reply still plays — the mic stays muted.
@@ -678,6 +716,23 @@ class VoiceBridge:
         else:
             log.info("HID press: resume recording")
             self._resume()
+
+    def _toggle_privacy_mute(self) -> None:
+        """HID press with the wake word on: the button is a mic mute and
+        nothing else. It never starts a turn, never cuts a reply: what is
+        in flight still plays, muted. Unmuting goes back to waiting for the
+        wake word. (Until 2026-10-11 a press while a reply played stopped it
+        and listened, and a press while idle or muted started recording.)"""
+        if self._state is State.MUTED:
+            log.info("HID press: unmute (wake word armed)")
+            self._set_state(State.IDLE_LISTENING)
+            return
+        if self._state is State.RECORDING:
+            # What was being said is still sent — see the button-mode press.
+            self._force_commit.set()
+            self._wake_endpointer()
+        log.info("HID press: mute (wake word off, anything in flight still plays)")
+        self._set_state(State.MUTED)
 
     @_transition
     def _resume(self, prefill: "Iterable[bytes]" = ()) -> None:
@@ -718,6 +773,12 @@ class VoiceBridge:
         self._resume(prefill=prefill)
         if speaking:
             return  # a reply is already speaking; the resume is the ack
+        if self._enroll and not self._speaker_id.profiles and not self._enroll_offered:
+            log.info("No voice known yet: the first wake starts the enrollment")
+            self._enroll_offered = True
+            threading.Thread(target=self._enroll_step, args=(self._enroll.start(),),
+                             name="vb-enroll-first", daemon=True).start()
+            return
         rate = int(self.cfg["tts_sample_rate"])
         clip = self._wake_acks.pick() if self._wake_acks else None
         if clip is None:
@@ -824,6 +885,75 @@ class VoiceBridge:
         # blue would be noise) and no beep if the agent stays silent.
         self._run_text_turn(gen, _REPORT_TEMPLATE.format(source=source, text=text),
                             t0, {}, _ThinkingCue(self, gen), beep_on_silence=False)
+
+    # -- voice enrollment ("far conoscenza") ----------------------------
+    # The wizard (speaker_id.Enrollment) runs on the worker thread, one
+    # step per user utterance: while it is active the worker hands it what
+    # the user says instead of sending it to the agent. Its lines are played
+    # with the mic paused (PROCESSING), so a take is never the bridge's own
+    # voice coming back.
+    def _enroll_say(self, items) -> None:
+        """Play a step's lines back to back as one clip."""
+        rate = int(self.cfg["tts_sample_rate"])
+        gap = bytes(rate * 2 * 250 // 1000)
+        parts, said = [], []
+        for item in items:
+            text, fallback = (item[1], item[2]) if isinstance(item, tuple) else (item, None)
+            clip = self._enroll_clips.get(text)
+            # Not cached: a line with a name in it, or a cold cache.
+            pcm = clip[2] if clip else self._enroll_clips.synthesize(text)
+            if not pcm and fallback:
+                clip = self._enroll_clips.get(fallback)
+                pcm, text = (clip[2], fallback) if clip else (None, text)
+            parts.append(pcm or _make_beep_pcm(rate, freq=880, duration=0.08))
+            said.append(text)
+        if not parts:
+            return
+        try:
+            self._play_clip(("enroll", " ".join(said), gap.join(parts)))
+        except Exception:
+            log.exception("Enrollment playback failed")
+
+    def _enroll_step(self, step) -> None:
+        self._enroll_speaking.set()
+        try:
+            self._pause_for_processing()
+            self._enroll_say(step.say)
+        finally:
+            self._enroll_speaking.clear()
+        if step.listen:
+            self._listen_for_enrollment()
+        else:
+            self._after_enrollment()
+
+    @_transition
+    def _listen_for_enrollment(self) -> None:
+        """The wizard asked something: open the mic for the answer."""
+        if not self._enroll.active:
+            return  # cancelled (HID press) while the line played
+        self._set_idle_window("idle_after_question_ms")
+        self._idle_reset_pending.set()
+        self._set_state(State.RECORDING)
+
+    @_transition
+    def _after_enrollment(self) -> None:
+        """The wizard is over: back to a normal conversation."""
+        if self._state is not State.PROCESSING:
+            return
+        self._replies_since_resume += 1
+        self._set_idle_window("idle_after_reply_ms")
+        self._idle_reset_pending.set()
+        self._set_state(State.RECORDING)
+
+    def _run_enroll_turn(self, gen: int, pcm: bytes, sr: int) -> None:
+        """One utterance said to the wizard: the name, a take, or "annulla"."""
+        voice = self._speaker_id.embed_async(pcm, sr) if self._enroll.wants_voice else None
+        text = self.stt.transcribe(pcm, sr) or ""
+        embedding = voice.wait(20.0) if voice else None
+        if gen != self._current_gen():
+            return
+        log.info("Enrollment: heard %r", text)
+        self._enroll_step(self._enroll.on_utterance(text, embedding, len(pcm) / (sr * 2)))
 
     # -- thread loops --------------------------------------------------
     def _hid_loop(self) -> None:
@@ -1196,7 +1326,7 @@ class VoiceBridge:
             # pick-up → reply handed to the player (or turn dropped).
             self._worker_busy.clear()
             if (self._state is State.PROCESSING and self.utterance_q.empty()
-                    and not self._reply_playing()):
+                    and not self._reply_playing() and not self._enroll_speaking.is_set()):
                 self._resume_after_processing()
             # While PROCESSING the loop head above has to re-check when the
             # player goes quiet (a cue was still playing), so poll; otherwise
@@ -1236,6 +1366,10 @@ class VoiceBridge:
                 log.info("Worker: dropped %d extra utterance(s) queued behind the reply",
                          extra)
 
+            if self._enroll and self._enroll.active:
+                self._run_enroll_turn(gen, pcm, sr)
+                continue
+
             t0 = time.monotonic()
             self.player.turn_t0 = t0
             timing: dict[str, float] = {}
@@ -1252,6 +1386,8 @@ class VoiceBridge:
         dropped) on empty/non-speech STT or a stale generation."""
         log.info("Worker: STT (%d bytes ≈ %.2fs)", len(pcm), len(pcm) / (sr * 2))
         t_stt = time.monotonic()
+        # Identified while STT runs, on the first seconds of the utterance.
+        who = self._speaker_id.identify_async(pcm, sr) if self._speaker_id else None
         text = self.stt.transcribe(pcm, sr)
         timing["stt"] = time.monotonic() - t0
         if self._stt_compare:
@@ -1275,7 +1411,19 @@ class VoiceBridge:
             if clip:
                 self._play_wake_ack(clip)
             return
+        if self._enroll and self._enroll.is_request(text):
+            log.info("Worker: %r starts the voice enrollment", text)
+            self._enroll_offered = True
+            cue.stop()
+            self._enroll_step(self._enroll.start())
+            return
         log.info("User: %s", text)
+        if who:
+            # Every message says who is talking; "Sconosciuto" when the
+            # voice matches nobody (or the answer isn't there in time).
+            name = who.wait(self._speaker_id.cfg["wait_ms"] / 1000)
+            timing["speaker"] = time.monotonic() - t0
+            text = self._speaker_id.tag(name) + text
         self._run_text_turn(gen, text, t0, timing, cue)
 
     def _run_text_turn(self, gen: int, text: str, t0: float, timing: dict,
@@ -1426,6 +1574,9 @@ class VoiceBridge:
             loops.append(("thinking-acks", lambda: self._thinking_acks.prepare(self.shutdown_event)))
         if self._still_acks:
             loops.append(("still-acks", lambda: self._still_acks.prepare(self.shutdown_event)))
+        if self._speaker_id:
+            loops += [("speaker-id", lambda: self._speaker_id.prepare(self.shutdown_event)),
+                      ("enroll-clips", lambda: self._enroll_clips.prepare(self.shutdown_event))]
         if self._stt_compare:
             self._stt_compare.start()
         for name, fn in loops:

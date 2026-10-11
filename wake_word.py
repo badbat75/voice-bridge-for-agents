@@ -328,8 +328,8 @@ RETRY_MIN_S, RETRY_MAX_S = 30.0, 600.0
 CLIP_PAUSE_MS, CLIP_TAIL_MS = 700, 150
 
 
-def trim_clip(pcm: bytes, rate: int) -> bytes:
-    """Cut a clip at its first long pause.
+def trim_clip(pcm: bytes, rate: int, pause_ms: int = CLIP_PAUSE_MS) -> bytes:
+    """Cut a clip at its first pause of `pause_ms`.
 
     eleven_v3 sometimes pads a one-second phrase with several seconds of
     near-silence, or says it a second time after the gap (seen 2026-10-10:
@@ -347,7 +347,7 @@ def trim_clip(pcm: bytes, rate: int) -> bytes:
     if not levels:
         return pcm
     quiet = max(levels) * 0.1
-    pause = max(1, CLIP_PAUSE_MS // 50)
+    pause = max(1, pause_ms // 50)
     last_loud = None
     for i, level in enumerate(levels):
         if level > quiet:
@@ -366,9 +366,13 @@ class AckBank:
     `tts` is the bridge's own reply provider (named by `provider`), so acks
     never sound like a different speaker and no extra SDK client is built."""
 
-    def __init__(self, cfg: dict, phrases, provider: str, cache_dir: str, tts, kind: str = "wake") -> None:
+    def __init__(self, cfg: dict, phrases, provider: str, cache_dir: str, tts, kind: str = "wake",
+                 pause_ms: int = CLIP_PAUSE_MS) -> None:
         self.cfg = cfg
         self.kind = kind
+        # Clips are cut at their first pause this long (`trim_clip`); longer
+        # for lines of several sentences.
+        self.pause_ms = pause_ms
         self.phrases = list(phrases)
         self.provider = provider
         self.cache_dir = os.path.expanduser(cache_dir)
@@ -433,7 +437,7 @@ class AckBank:
         if not pcm:
             return None
         # Trimmed on the way out, so the cache keeps what the voice sent.
-        trimmed = trim_clip(pcm, int(self.cfg["tts_sample_rate"]))
+        trimmed = trim_clip(pcm, int(self.cfg["tts_sample_rate"]), self.pause_ms)
         if len(trimmed) < len(pcm):
             log.info("Wake acks (%s): %r trimmed %.1fs → %.1fs", self.kind, text,
                      len(pcm) / 2 / int(self.cfg["tts_sample_rate"]),
@@ -489,3 +493,17 @@ class AckBank:
     def pick(self) -> tuple[str, str, bytes] | None:
         with self._lock:
             return random.choice(self._clips) if self._clips else None
+
+    def get(self, text: str) -> tuple[str, str, bytes] | None:
+        """The clip that says exactly `text`, if it is ready."""
+        with self._lock:
+            return next((c for c in self._clips if c[1] == text), None)
+
+    def synthesize(self, text: str) -> bytes | None:
+        """`text` spoken now, uncached (a line with a name in it)."""
+        try:
+            pcm = self._tts.synthesize(self._spoken(self.provider, text))
+        except Exception as exc:
+            log.warning("Wake acks (%s): %s failed on %r: %s", self.kind, self.provider, text, exc)
+            return None
+        return trim_clip(pcm, int(self.cfg["tts_sample_rate"]), self.pause_ms) if pcm else None

@@ -105,13 +105,16 @@ TABLE = [
     ("wake_word", REC, False, "whistle_fails", REC, False),
     ("wake_word", IDLE, False, "wake", REC, False),
     ("wake_word", IDLE, True, "wake", REC, False),
-    ("wake_word", IDLE, False, "press", REC, False),
+    ("wake_word", IDLE, False, "press", MUTED, False),      # the button only mutes
+    ("wake_word", IDLE, False, "press_playing", MUTED, False),
+    ("wake_word", REC, False, "press_playing", MUTED, False),  # reply keeps playing
     ("wake_word", IDLE, True, "reply_starts", REC, False),
     ("wake_word", IDLE, False, "reply_starts", IDLE, False),
     ("wake_word", IDLE, False, "say_to_speaker", REC, False),
     ("wake_word", IDLE, True, "whistle_fails", MUTED, True),
     ("wake_word", MUTED, False, "wake", MUTED, False),       # privacy mute: button only
-    ("wake_word", MUTED, False, "press", REC, False),
+    ("wake_word", MUTED, False, "press", IDLE, False),      # unmute: wake word armed
+    ("wake_word", MUTED, False, "press_playing", IDLE, False),
     ("wake_word", PROC, True, "press", MUTED, False),
     ("wake_word", PROC, True, "wake", PROC, True),
 ]

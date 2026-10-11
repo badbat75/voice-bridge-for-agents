@@ -183,7 +183,10 @@ class Player:
         try:
             gen2, item = self.q.get(timeout=timeout)
         except queue.Empty:
-            return None
+            # A barge-in that drained the queue, end marker included, leaves
+            # nothing to come under `gen`: without this the reply would wait
+            # for it for good, aplay registered, the bridge "playing".
+            return _STALE if gen != self._gen() else None
         if gen2 != gen or gen2 != self._gen():
             if isinstance(item, ExternalUtterance):
                 item.done.set()

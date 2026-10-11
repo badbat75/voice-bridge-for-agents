@@ -427,6 +427,22 @@ class PrebufferTest(unittest.TestCase):
         self.assertEqual(_FakeAplay.instances[0].writes[0], b"\x03" * 10)
         self.assertLess(time.monotonic() - t0, 3.0)
 
+    def test_barge_in_that_drains_the_whole_queue_ends_the_reply(self):
+        """Seen 2026-10-11: a press just after the worker had queued the
+        last chunk drained the end marker too, and the player waited for
+        it for good with aplay registered — the bridge "playing" forever."""
+        bridge, _ = _bridge()
+        gen = bridge._current_gen()
+        done = threading.Event()
+        result = []
+        t = threading.Thread(target=lambda: (result.append(
+            bridge.player.play_streamed(b"\x01" * 4, "null", _TTS_RATE, gen)), done.set()))
+        t.start()
+        bridge._bump_gen()  # barge-in: nothing more arrives under `gen`
+        self.assertTrue(done.wait(3.0), "player still waiting for the drained reply")
+        self.assertEqual(result, [False])
+        self.assertFalse(bridge.player.is_playing())
+
     def test_external_utterance_mid_reply_is_deferred_not_written(self):
         bridge, _ = _bridge()
         gen = bridge._current_gen()

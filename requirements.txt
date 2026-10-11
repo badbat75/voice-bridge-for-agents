@@ -37,6 +37,8 @@ PyYAML==6.0.3
 referencing==0.37.0
 requests==2.33.1
 rpds-py==0.30.0
+sherpa-onnx==1.13.8
+sherpa-onnx-core==1.13.8
 sse-starlette==3.4.4
 starlette==1.1.0
 tqdm==4.70.1

@@ -82,6 +82,10 @@
     "language": "it",
     "log_path": "data/stt-compare.tsv"
   },
+  "speaker_id": {
+    "enabled": true,
+    "threshold": 0.5
+  },
   "tts_streaming_mode": "http_sentence",
   "tts_whole_reply": true,
   "tts_first_sentence_early": true,
