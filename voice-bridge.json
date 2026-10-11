@@ -84,7 +84,11 @@
   },
   "speaker_id": {
     "enabled": true,
-    "threshold": 0.5
+    "threshold": 0.5,
+    "carry_max_s": 2.5,
+    "adapt": {
+      "enabled": true
+    }
   },
   "tts_streaming_mode": "http_sentence",
   "tts_whole_reply": true,

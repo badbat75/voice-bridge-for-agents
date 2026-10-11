@@ -575,6 +575,8 @@ class VoiceBridge:
         if muted != old_muted:
             self.hid.set_led(muted=muted)
         self._hold_listening_duck(new in (State.RECORDING, State.PROCESSING))
+        if self._speaker_id and new in (State.MUTED, State.IDLE_LISTENING):
+            self._speaker_id.end_conversation()  # the next voice starts fresh
 
     @_transition
     def _enter_idle(self, source: str) -> None:
@@ -1387,7 +1389,7 @@ class VoiceBridge:
         log.info("Worker: STT (%d bytes ≈ %.2fs)", len(pcm), len(pcm) / (sr * 2))
         t_stt = time.monotonic()
         # Identified while STT runs, on the first seconds of the utterance.
-        who = self._speaker_id.identify_async(pcm, sr) if self._speaker_id else None
+        who = self._speaker_id.match_async(pcm, sr) if self._speaker_id else None
         text = self.stt.transcribe(pcm, sr)
         timing["stt"] = time.monotonic() - t0
         if self._stt_compare:
@@ -1420,8 +1422,9 @@ class VoiceBridge:
         log.info("User: %s", text)
         if who:
             # Every message says who is talking; "Sconosciuto" when the
-            # voice matches nobody (or the answer isn't there in time).
-            name = who.wait(self._speaker_id.cfg["wait_ms"] / 1000)
+            # voice matches nobody (or the answer isn't there in time). A
+            # short follow-up keeps the name this conversation already has.
+            name = self._speaker_id.resolve(who.wait(self._speaker_id.cfg["wait_ms"] / 1000))
             timing["speaker"] = time.monotonic() - t0
             text = self._speaker_id.tag(name) + text
         self._run_text_turn(gen, text, t0, timing, cue)

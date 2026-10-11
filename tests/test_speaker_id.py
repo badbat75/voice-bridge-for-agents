@@ -41,6 +41,10 @@ ANNA = [1.0, 0.0, 0.0]
 ANNA_ISH = speaker_id._unit([0.9, 0.2, 0.0])
 BRUNO = [0.0, 1.0, 0.0]
 PCM_3S = bytes(16000 * 2 * 3)
+PCM_1S = bytes(16000 * 2)
+# Anna in the room: 0.60 and 0.45 against her enrolled voiceprint.
+ANNA_FAR = speaker_id._unit([0.6, 0.8, 0.0])
+ANNA_FARTHER = speaker_id._unit([0.45, 0.89, 0.0])
 
 
 def _scfg(tmp: str, **over) -> dict:
@@ -81,6 +85,79 @@ class ProfilesTest(_Tmp):
             self.assertEqual(again.identify(PCM_3S, 16000), name)
         self.assertEqual(again.tag("Anna"), "[Sta parlando: Anna] ")
         self.assertEqual(again.tag(None), "[Sta parlando: Sconosciuto] ")
+
+    def _hears(self, sid, voice, pcm=PCM_3S) -> str:
+        sid.embed = lambda *_a: voice
+        return sid.identify(pcm, 16000)
+
+    def test_short_follow_up_keeps_the_conversation_speaker(self):
+        self.sid.save_profile("Anna", [ANNA])
+        self.assertEqual(self._hears(self.sid, BRUNO, PCM_1S), "Sconosciuto")  # nobody yet
+        self.assertEqual(self._hears(self.sid, ANNA), "Anna")
+        self.assertEqual(self._hears(self.sid, BRUNO, PCM_1S), "Anna")  # "ok"
+        self.sid.end_conversation()  # idle / mute
+        self.assertEqual(self._hears(self.sid, BRUNO, PCM_1S), "Sconosciuto")
+
+    def test_long_unknown_utterance_ends_the_memory(self):
+        self.sid.save_profile("Anna", [ANNA])
+        self.assertEqual(self._hears(self.sid, ANNA), "Anna")
+        self.assertEqual(self._hears(self.sid, BRUNO), "Sconosciuto")  # 3 s: somebody else
+        self.assertEqual(self._hears(self.sid, BRUNO, PCM_1S), "Sconosciuto")
+
+    def test_another_known_voice_takes_over(self):
+        self.sid.save_profile("Anna", [ANNA])
+        self.sid.save_profile("Bruno", [BRUNO])
+        self.assertEqual(self._hears(self.sid, ANNA), "Anna")
+        self.assertEqual(self._hears(self.sid, BRUNO, PCM_1S), "Bruno")
+        self.assertEqual(self._hears(self.sid, [0.0, 0.0, 1.0], PCM_1S), "Bruno")
+
+    def test_memory_off(self):
+        sid = speaker_id.SpeakerId(_scfg(self.tmp, carry_max_s=0))
+        sid.save_profile("Anna", [ANNA])
+        self.assertEqual(self._hears(sid, ANNA), "Anna")
+        self.assertEqual(self._hears(sid, BRUNO, PCM_1S), "Sconosciuto")
+
+    def _adaptive(self, **over):
+        return speaker_id.SpeakerId(_scfg(self.tmp, adapt={
+            "enabled": True, "min_samples": 2, **over}))
+
+    def test_adapted_voiceprint_learns_from_a_confident_conversation(self):
+        sid = self._adaptive()
+        sid.save_profile("Anna", [ANNA])
+        # Without a confident turn nothing is learned.
+        self.assertEqual(self._hears(sid, ANNA_FAR), "Anna")
+        sid.end_conversation()
+        self.assertEqual(sid._samples.get("Anna", []), [])
+        # A turn heard before the confident one counts once it comes.
+        self.assertEqual(self._hears(sid, ANNA_FAR), "Anna")
+        self.assertEqual(self._hears(sid, ANNA), "Anna")
+        self.assertEqual(len(sid._samples["Anna"]), 2)
+        sid.end_conversation()
+        self.assertEqual(self._hears(sid, ANNA_FARTHER), "Anna")  # 0.45 enrolled, 0.80 adapted
+        # Saved, and only used when adapt is on.
+        self.assertEqual(self._hears(self._adaptive(), ANNA_FARTHER), "Anna")
+        self.assertEqual(self._hears(speaker_id.SpeakerId(self.scfg), ANNA_FARTHER),
+                         "Sconosciuto")
+        # Enrolling again starts over.
+        sid.save_profile("Anna", [ANNA])
+        self.assertEqual(self._hears(self._adaptive(), ANNA_FARTHER), "Sconosciuto")
+
+    def test_samples_must_be_long_and_close_enough(self):
+        sid = self._adaptive()
+        sid.save_profile("Anna", [ANNA])
+        self.assertEqual(self._hears(sid, ANNA), "Anna")
+        self.assertEqual(self._hears(sid, ANNA_FAR, bytes(16000)), "Anna")  # 0.5 s
+        self.assertEqual(self._hears(sid, BRUNO, PCM_1S), "Anna")  # carried, 0.00
+        self.assertEqual(len(sid._samples["Anna"]), 1)
+
+    def test_adapted_voiceprint_that_drifts_is_dropped(self):
+        sid = self._adaptive(min_anchor_similarity=0.95, min_score=0.0)
+        sid.save_profile("Anna", [ANNA])
+        self.assertEqual(self._hears(sid, ANNA), "Anna")
+        self.assertEqual(self._hears(sid, BRUNO, PCM_1S), "Anna")  # carried: a wrong sample
+        self.assertEqual(sid._samples["Anna"], [])
+        self.assertNotIn("Anna", sid._adapted)
+        self.assertEqual(self._adaptive()._samples["Anna"], [])
 
     def test_profiles_of_another_model_are_ignored(self):
         self.sid.save_profile("Anna", [ANNA])
@@ -197,6 +274,21 @@ class BridgeTest(_Tmp):
         self.assertEqual(self.sent, ["[Sta parlando: Sconosciuto] Che ore sono?",
                                      "[Sta parlando: Anna] Metti la musica.",
                                      "[Sta parlando: Sconosciuto] Spegni la luce."])
+
+    def test_idle_and_mute_end_the_conversation_memory(self):
+        self.b._speaker_id.save_profile("Anna", [ANNA])
+        for state in (S.IDLE_LISTENING, S.MUTED):
+            self.b._speaker_id.embed = lambda *_a: ANNA
+            self._turn("Metti la musica.")
+            self.stt.transcribe.return_value = "Ok."
+            self.b._speaker_id.embed = lambda *_a: BRUNO
+            self.b._run_turn(self.b._current_gen(), PCM_1S, 16000, 0.0, {}, mock.Mock())
+            self.b._set_state(S.PROCESSING, auto_idled=True)  # still the same conversation
+            self.b._set_state(state)
+            self.b._run_turn(self.b._current_gen(), PCM_1S, 16000, 0.0, {}, mock.Mock())
+        self.assertEqual(self.sent, ["[Sta parlando: Anna] Metti la musica.",
+                                     "[Sta parlando: Anna] Ok.",
+                                     "[Sta parlando: Sconosciuto] Ok."] * 2)
 
     def test_wizard_runs_outside_the_agent(self):
         self.b._speaker_id.embed = lambda *_a: ANNA
