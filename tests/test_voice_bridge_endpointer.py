@@ -662,6 +662,30 @@ class DuckingTest(unittest.TestCase):
         finally:
             _stop_endpointer(bridge, t)
 
+    def test_speech_ducks_deeper_until_the_commit(self):
+        # `speech_ducking_percent`: the conversation is at the normal level
+        # (here the listening hold), the user's voice pushes the music
+        # further down, and the commit brings it back.
+        bridge, events = self._bridge(
+            min_speech_ms=120,
+            deezer_connect={"speech_ducking_percent": 30, "duck_while_listening": True})
+        bridge.deezer.duck.side_effect = lambda *a: events.append(f"duck{a[0] if a else ''}")
+        _recording(bridge)
+        self.assertEqual(events, ["duck"])
+        t = _start_endpointer(bridge)
+        try:
+            gen = bridge._current_gen()
+            _push(bridge, gen, [_silence_chunk()] * 3 + [_speech_chunk()])
+            time.sleep(0.2)
+            self.assertEqual(events, ["duck"], "one chunk may still be a click")
+            _push(bridge, gen, [_speech_chunk()] * 3 + [_silence_chunk()])
+            self.assertTrue(_wait_until(lambda: events == ["duck", "duck30"]))
+            _push(bridge, gen, [_silence_chunk()] * 4)
+            bridge.utterance_q.get(timeout=2.0)
+            self.assertTrue(_wait_until(lambda: events == ["duck", "duck30", "duck"]))
+        finally:
+            _stop_endpointer(bridge, t)
+
     def test_dropped_burst_unducks(self):
         bridge, events = self._bridge(min_speech_ms=192)
         _recording(bridge)

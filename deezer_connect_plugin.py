@@ -32,8 +32,10 @@ class DeezerConnectPlugin:
     """Ducks deezer-connect's volume while the user or the bridge talks.
 
     State machine is trivial: `_original_volume` is the volume we read
-    before ducking, or `None` when not currently ducked. `duck()` is a
-    no-op if we're already ducked; `unduck()` is a no-op if we're not.
+    before ducking, or `None` when not currently ducked. `duck()` while
+    already ducked only moves to another level of that same volume
+    (`duck(30)` while the user talks, `duck()` back to `ducking_percent`);
+    `unduck()` is a no-op if we're not ducked.
     The single lock makes start/stop pairs safe under rapid back-to-back
     playback cycles (each player loop iteration is one duck/unduck).
 
@@ -106,11 +108,16 @@ class DeezerConnectPlugin:
             return None
 
     # -- ducking API ----------------------------------------------------
-    def duck(self) -> None:
+    def duck(self, percent: float | None = None) -> None:
+        """Lower the volume to `percent` of what it was before ducking
+        (`ducking_percent` when not given)."""
         if not self.enabled:
             return
+        factor = (self.ducking_factor if percent is None
+                  else max(0.0, min(100.0, float(percent))) / 100.0)
         with self._lock:
             if self._original_volume is not None:
+                self._set_level(factor)
                 return
             status = self._request("GET", "/api/player/status")
             if not status:
@@ -130,8 +137,9 @@ class DeezerConnectPlugin:
                 self._original_volume = self._last_original
                 log.info("deezer-connect: already ducked at %d, re-arm restore → %s",
                          vol, self._last_original)
+                self._set_level(factor)
                 return
-            ducked = max(0, min(100, int(round(vol * self.ducking_factor))))
+            ducked = max(0, min(100, int(round(vol * factor))))
             if ducked == vol:
                 return
             if self._request("POST", "/api/player/volume", {"volume": ducked}) is None:
@@ -140,6 +148,17 @@ class DeezerConnectPlugin:
             self._last_original = vol
             self._last_ducked_to = ducked
             log.info("deezer-connect: ducked %d → %d", vol, ducked)
+
+    def _set_level(self, factor: float) -> None:
+        """Already ducked (lock held): move to `factor` of the original."""
+        target = max(0, min(100, int(round(self._original_volume * factor))))
+        if target == self._last_ducked_to:
+            return
+        if self._request("POST", "/api/player/volume", {"volume": target}) is None:
+            return
+        log.info("deezer-connect: ducked %d → %d (of %d)",
+                 self._last_ducked_to, target, self._original_volume)
+        self._last_ducked_to = target
 
     def unduck(self) -> None:
         if not self.enabled:

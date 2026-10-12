@@ -6,9 +6,10 @@ idle the recorder keeps the mic open and hands chunks to `VoiceBridge._wake_loop
 which runs them through:
 
   - `SpeechGate` — pure-Python energy gate. Whistle never sees idle audio: a
-    segment opens when a chunk's true RMS crosses `rms_threshold`, closes after
+    segment opens when a chunk crosses the conversation's own
+    `vad_rms_threshold` (same metric, `endpointer.chunk_energy`), closes after
     `hang_ms` under it (or at `max_segment_ms`), and is dropped unless at least
-    `min_loud_ms` of it was above threshold. Continuous streaming through
+    `min_speech_ms` of it was above threshold. Continuous streaming through
     Whistle cost ~230% CPU on the Pi 3B+ and fell behind real time; gated, it's
     ~3–6%. It also keeps Whistle away from room noise, which it otherwise
     hallucinates into "Thank you." / "Vielen Dank.".
@@ -27,8 +28,11 @@ later boots make no API calls. Phrases may carry eleven_v3 tone tags like
 with the rate, language and voice settings. Changing any of them re-downloads
 the affected clips and prunes the ones no voice uses any more.
 
-Unlike `vad_rms_threshold`, `rms_threshold` here is TRUE RMS of S16 samples
-(speech at the Jabra measured ~14k–27k peak, room noise <3k).
+Until 2026-10-11 the gate had thresholds of its own (`rms_threshold`, true RMS
+5000, about twelve times the conversation's in amplitude, and `min_loud_ms`
+300): a wake word said from across the room could stay under them. The owner
+asked for one set of thresholds; the price is that anything the endpointer
+would call speech — music at full volume included — now goes through Whistle.
 """
 
 from __future__ import annotations
@@ -48,13 +52,13 @@ import time
 import wave
 from collections import deque
 
+import endpointer
+
 log = logging.getLogger("voice-bridge")
 
 DEFAULTS = {
     "phrases": ["hey binary"],
     "language": "en",
-    "rms_threshold": 5000,
-    "min_loud_ms": 300,
     "hang_ms": 300,
     "pre_roll_ms": 300,
     "max_segment_ms": 3000,
@@ -178,21 +182,16 @@ class SegmentCapture:
             return None
 
 
-def _rms(pcm: bytes) -> float:
-    samples = array.array("h", pcm)
-    if not samples:
-        return 0.0
-    return math.sqrt(math.sumprod(samples, samples) / len(samples))
-
-
 class SpeechGate:
-    """Cuts loud segments out of a stream of S16LE mono chunks."""
+    """Cuts loud segments out of a stream of S16LE mono chunks, with the
+    thresholds of the conversation (`cfg`: `vad_rms_threshold`,
+    `min_speech_ms`) and the segment shape of `wcfg`."""
 
-    def __init__(self, sample_rate: int, chunk_size: int, wcfg: dict) -> None:
-        chunk_ms = chunk_size / sample_rate * 1000.0
-        self.threshold = float(wcfg["rms_threshold"])
+    def __init__(self, cfg: dict, wcfg: dict) -> None:
+        chunk_ms = cfg["chunk_size"] / cfg["sample_rate"] * 1000.0
+        self.threshold = float(cfg["vad_rms_threshold"])
         self.hang = max(1, round(wcfg["hang_ms"] / chunk_ms))
-        self.min_loud = max(1, round(wcfg["min_loud_ms"] / chunk_ms))
+        self.min_loud = max(1, round(cfg.get("min_speech_ms", 0) / chunk_ms))
         self.max_chunks = max(1, round(wcfg["max_segment_ms"] / chunk_ms))
         self._pre: deque[bytes] = deque(maxlen=max(0, round(wcfg["pre_roll_ms"] / chunk_ms)))
         self.reset()
@@ -205,7 +204,7 @@ class SpeechGate:
 
     def feed(self, chunk: bytes) -> bytes | None:
         """Returns a finished segment's PCM (pre-roll included), else None."""
-        loud = _rms(chunk) > self.threshold
+        loud = endpointer.chunk_energy(chunk) >= self.threshold
         if not self._seg:
             if loud:
                 self._seg = [*self._pre, chunk]

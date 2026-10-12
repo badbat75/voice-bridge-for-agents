@@ -30,6 +30,14 @@ TOO_LONG = "utterance too long"
 DISCARDED = "speech discarded"
 
 
+def chunk_energy(data: bytes) -> float:
+    """The level `vad_rms_threshold` is compared with: `sum(s²) / sqrt(N)` of
+    an S16LE chunk (see the module docstring — not true RMS, and it depends
+    on the chunk length)."""
+    samples = array.array("h", data[:len(data) & ~1])
+    return math.sumprod(samples, samples) / len(samples) ** 0.5 if samples else 0.0
+
+
 class Endpointer:
     """Turns a stream of mic chunks into committed utterances.
 
@@ -65,6 +73,12 @@ class Endpointer:
         self._speech_chunks = 0
         self._levels: list[float] = []  # per-chunk energy of the current utterance
 
+    @property
+    def past_burst(self) -> bool:
+        """Inside an utterance that has outlasted `min_speech_ms`: a voice
+        (or music), no longer a click."""
+        return self.in_speech and self._speech_chunks >= max(1, self._min_speech_chunks)
+
     # -- control ---------------------------------------------------------
     def reset(self) -> None:
         """Forget everything (a resume bumped the generation)."""
@@ -87,10 +101,9 @@ class Endpointer:
 
     # -- per chunk -------------------------------------------------------
     def feed(self, data: bytes) -> "tuple[str, bytes | None] | None":
-        samples = array.array("h", data)
-        if not samples:
+        if len(data) < 2:
             return None
-        rms = math.sumprod(samples, samples) / len(samples) ** 0.5
+        rms = chunk_energy(data)
 
         if rms >= self._threshold:
             return self._loud(data, rms)

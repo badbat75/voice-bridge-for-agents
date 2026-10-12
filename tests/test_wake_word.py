@@ -6,7 +6,7 @@ Three groups, all hardware-free and network-free (Whistle is never loaded):
 
   1. `SpeechGate`   — silence never opens a segment; a loud burst followed by
                       `hang_ms` of quiet yields one segment that includes the
-                      pre-roll; a click shorter than `min_loud_ms` is dropped;
+                      pre-roll; a click shorter than `min_speech_ms` is dropped;
                       a long burst is cut at `max_segment_ms`.
 
   2. `matches`      — the wake phrase is found through punctuation and case
@@ -63,8 +63,11 @@ QUIET, LOUD = _chunk(100), _chunk(10000)
 
 
 def _gate(**overrides) -> wake_word.SpeechGate:
+    # The conversation's thresholds: QUIET is 4e5, LOUD 4e9 on its metric.
+    cfg = {"sample_rate": _SR, "chunk_size": _CHUNK,
+           "vad_rms_threshold": 1e6, "min_speech_ms": 300}
     wcfg = {**wake_word.DEFAULTS, **overrides}
-    return wake_word.SpeechGate(_SR, _CHUNK, wcfg)
+    return wake_word.SpeechGate(cfg, wcfg)
 
 
 def _feed(gate, chunks) -> list[bytes]:
@@ -84,7 +87,7 @@ class SpeechGateTest(unittest.TestCase):
         self.assertEqual(len(segs), 1)
         self.assertEqual(len(segs[0]), (3 + 5 + 3) * _CHUNK * 2)
 
-    def test_click_shorter_than_min_loud_is_dropped(self):
+    def test_click_shorter_than_min_speech_is_dropped(self):
         self.assertEqual(_feed(_gate(), [QUIET] * 5 + [LOUD] * 2 + [QUIET] * 5), [])
 
     def test_long_burst_cut_at_max_segment(self):
@@ -277,6 +280,7 @@ def _bridge(activation: str):
     vb = _load_voice_bridge()
     cfg = {
         "sample_rate": _SR, "chunk_size": 1024, "tts_sample_rate": 24000,
+        "vad_rms_threshold": 1e6,
         "output_device": "null", "hid_mute_enabled": True,
         "activation": activation,
         "wake_word": {"acks": ["Dimmi."], "sleep_acks": ["A dopo."]},

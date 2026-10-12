@@ -288,9 +288,16 @@ class VoiceBridge:
         self._duck_while_listening = bool(
             (cfg.get("deezer_connect") or {}).get("duck_while_listening"))
         self._listening_duck = False
-        # Ducking holds — see `_duck_acquire`.
+        # `deezer_connect.speech_ducking_percent`: a deeper level while the
+        # user is talking (None = the same level as everything else).
+        self._speech_duck_percent = (cfg.get("deezer_connect") or {}).get(
+            "speech_ducking_percent")
+        # Ducking holds — see `_duck_acquire`. `_duck_level`: 0 not ducked,
+        # 1 at `ducking_percent`, 2 at `speech_ducking_percent`.
         self._duck_lock = threading.Lock()
         self._duck_holds = 0
+        self._deep_holds = 0
+        self._duck_level = 0
         # Set by `start()`: volume calls go to the `vb-duck` thread.
         self._duck_q: "queue.Queue | None" = None
         self._duck_thread: threading.Thread | None = None
@@ -494,23 +501,47 @@ class VoiceBridge:
     # on 1→0. Mute/idle state doesn't affect ducking, unless
     # `duck_while_listening` adds its conversation-long hold (below).
     #
+    # `speech_ducking_percent` adds a second, deeper level, held by the
+    # endpointer while an utterance that outlasted `min_speech_ms` is being
+    # heard: with the conversation at 60% the music can still be loud enough
+    # to be committed as speech, so whatever the mic picks up pushes it
+    # further down, and the commit brings it back to the normal level.
+    #
     # The volume I/O (HTTP to the deezer-connect BFF, up to 2 × timeout)
     # runs on the `vb-duck` thread once `start()` has launched it, so the
     # endpointer and the player never wait on the network. Commands keep
     # their order through one FIFO; before `start()` (tests) they run inline.
-    def _duck_acquire(self, reason: str) -> None:
+    def _duck_acquire(self, reason: str, *, deep: bool = False) -> None:
         with self._duck_lock:
-            self._duck_holds += 1
-            if self._duck_holds == 1:
-                log.info("Ducking on (%s)", reason)
-                self._duck_send(self.deezer.duck)
+            if deep:
+                self._deep_holds += 1
+            else:
+                self._duck_holds += 1
+            self._duck_apply(reason)
 
-    def _duck_release(self, reason: str) -> None:
+    def _duck_release(self, reason: str, *, deep: bool = False) -> None:
         with self._duck_lock:
-            self._duck_holds = max(0, self._duck_holds - 1)
-            if self._duck_holds == 0:
-                log.info("Ducking off (%s)", reason)
-                self._duck_send(self.deezer.unduck)
+            if deep:
+                self._deep_holds = max(0, self._deep_holds - 1)
+            else:
+                self._duck_holds = max(0, self._duck_holds - 1)
+            self._duck_apply(reason)
+
+    def _duck_apply(self, reason: str) -> None:
+        """Send the volume call the holds now ask for (lock held)."""
+        level = 2 if self._deep_holds else 1 if self._duck_holds else 0
+        if level == self._duck_level:
+            return
+        was, self._duck_level = self._duck_level, level
+        if level == 0:
+            log.info("Ducking off (%s)", reason)
+            self._duck_send(self.deezer.unduck)
+        elif level == 2:
+            log.info("Ducking deeper (%s, %s%%)", reason, self._speech_duck_percent)
+            self._duck_send(functools.partial(self.deezer.duck, self._speech_duck_percent))
+        else:
+            log.info("Ducking on (%s)" if was == 0 else "Ducking back up (%s)", reason)
+            self._duck_send(self.deezer.duck)
 
     def _duck_send(self, fn) -> None:
         """Run a volume call on the duck thread (inline when not started).
@@ -1117,10 +1148,10 @@ class VoiceBridge:
             log.exception("Wake word: Whistle failed to load — falling back to the HID button")
             self._disable_wake()
             return
-        log.info("Wake word: listening for %s (lang=%s, rms>%g)",
+        gate = wake_word.SpeechGate(self.cfg, self._wake_cfg)
+        log.info("Wake word: listening for %s (lang=%s, level≥%g for %dms)",
                  self._wake_cfg["phrases"], self._wake_cfg["language"],
-                 self._wake_cfg["rms_threshold"])
-        gate = wake_word.SpeechGate(self.cfg["sample_rate"], self.cfg["chunk_size"], self._wake_cfg)
+                 self.cfg["vad_rms_threshold"], self.cfg.get("min_speech_ms", 0))
         capture = wake_word.SegmentCapture(
             self._wake_cfg["capture"], self.cfg["sample_rate"],
             os.path.dirname(os.path.abspath(__file__)))
@@ -1183,14 +1214,19 @@ class VoiceBridge:
         seen_gen = self._current_gen()
         # Music is ducked while the endpointer is inside an utterance: from
         # the first above-threshold chunk until it is committed or dropped.
-        ducked = False
+        # `deep`: the deeper level, once the utterance is more than a burst.
+        ducked = deep = False
 
         def follow_ducking(reason: str) -> None:
-            nonlocal ducked
+            nonlocal ducked, deep
             if ep.in_speech != ducked:
                 ducked = ep.in_speech
                 (self._user_speaking.set if ducked else self._user_speaking.clear)()
                 (self._duck_acquire if ducked else self._duck_release)(reason)
+            want = self._speech_duck_percent is not None and ep.past_burst
+            if want != deep:
+                deep = want
+                (self._duck_acquire if deep else self._duck_release)(reason, deep=True)
 
         def committed(pcm: bytes, gen: int) -> None:
             if self._enqueue_utterance(gen, pcm, sr):
@@ -1614,7 +1650,7 @@ class VoiceBridge:
         # Let queued volume calls finish, then go back to inline calls.
         with self._duck_lock:
             q, self._duck_q = self._duck_q, None
-            self._duck_holds = 0
+            self._duck_holds = self._deep_holds = self._duck_level = 0
             self._listening_duck = False
         if q is not None:
             q.put(None)

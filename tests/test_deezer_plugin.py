@@ -197,6 +197,29 @@ class EnabledPluginTests(unittest.TestCase):
         finally:
             bff.stop()
 
+    def test_second_level_and_back(self):
+        # duck() while ducked moves to another level of the SAME baseline:
+        # 100 → 60 (conversation) → 30 (user talking) → 60 → 100.
+        bff = _FakeBff(volume=100)
+        url = bff.start()
+        try:
+            plug = self._plugin(url, ducking_percent=60)
+            plug.duck()
+            self.assertEqual(bff.volume, 60)
+            plug.duck(30)
+            self.assertEqual(bff.volume, 30)
+            plug.duck(30)
+            plug.duck()
+            self.assertEqual(bff.volume, 60)
+            plug.unduck()
+            self.assertEqual(bff.volume, 100)
+            plug.duck(30)  # straight to the deeper level
+            self.assertEqual(bff.volume, 30)
+            plug.unduck()
+            self.assertEqual(bff.volume, 100)
+        finally:
+            bff.stop()
+
     def test_unduck_without_duck_is_noop(self):
         bff = _FakeBff(volume=80)
         url = bff.start()

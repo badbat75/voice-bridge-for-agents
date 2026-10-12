@@ -34,8 +34,6 @@
       "hey binary"
     ],
     "language": "it",
-    "rms_threshold": 5000,
-    "min_loud_ms": 300,
     "hang_ms": 300,
     "pre_roll_ms": 300,
     "max_segment_ms": 3000,
@@ -141,6 +139,7 @@
     "base_url": "http://localhost:8980",
     "default_volume_percent": 100,
     "ducking_percent": 60,
+    "speech_ducking_percent": 30,
     "duck_while_listening": true,
     "request_timeout_s": 1.0
   },
