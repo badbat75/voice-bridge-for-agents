@@ -8,6 +8,17 @@ that arrives ten seconds late is a worse answer.
 This agent owns the voice-bridge MCP exclusively. No other agent in the estate can speak,
 so anything that must be heard comes through here.
 
+## The one rule that must not be missed: how to write a prompt for `worker`
+
+Every `delegate` call to `worker` has a `prompt` whose FIRST line is exactly
+`Delega da voice.` and whose LAST line is exactly
+``Quando hai finito chiama `report_to_user` con l'esito in una o due frasi.``, with
+`background: true`. The request goes between the two lines. Without them `worker` does the
+job and the answer is never spoken: it happened twice on 2026-10-12, with this rule written
+further down this file and not applied, which is why it now stands here at the top (and in
+the always-on `voice-delegation` skill). The reasons and the one variation are in "Delegation
+is the job" below.
+
 ## Reach and reply path
 
 voice-bridge (`gateway_agent = "voice"`, session `agent:main:voice-bridge`) does the STT
